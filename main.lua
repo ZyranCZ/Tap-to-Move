@@ -1,14 +1,15 @@
--- Tap to Move v1.3.12
+-- Tap to Move v1.3.18
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
--- Design rule: this mod never teleports or writes player coordinates.  It
--- plans a route, then drives the real Game Boy D-pad through mod.input.  The
--- engine therefore remains authoritative for collisions, ledges, encounters,
--- warps, scripts, trainers, movement speed and every other overworld rule.
+-- Design rule: this mod never writes player coordinates or invents warp
+-- destinations. It plans routes and drives the real Game Boy D-pad through
+-- mod.input. A narrowly validated directional-exit fallback may ask the live
+-- overworld to take its own exact warp record after input activation fails;
+-- Gen1Recomp still owns destination resolution, transition, scripts and state.
 
 local mod = ...
 
-local VERSION = "1.3.12"
+local VERSION = "1.3.18"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 800 -- delay before a held pointer starts continuous retargeting
@@ -159,14 +160,19 @@ mod.options:define({
   -- Mouse options stay at the very bottom: all are opt-in.
   { key = "mouse", label = "MOUSE WALK CONTROL",
     type = "toggle", default = false },
-  { key = "desktop_mouse_ab", label = "DESKTOP MOUSE A/B",
+  { key = "desktop_mouse_ab", label = "MOUSE LMB/RMB=A/B",
     type = "toggle", default = false },
-  { key = "mouse_wheel_control", label = "MOUSE WHEEL CONTROL",
+  { key = "mouse_wheel_control", label = "MOUSE WHEEL ▲/▼",
     type = "choice", default = "off",
     choices = {
       { "OFF", "off" }, { "ON", "on" }, { "ON FLIPPED", "on_flipped" },
     } },
-  { key = "mouse_side_buttons", label = "MOUSE SIDE BUTTONS",
+  { key = "mouse_wheel_tilt", label = "MOUSE WH.TILT L/R",
+    type = "choice", default = "off",
+    choices = {
+      { "OFF", "off" }, { "ON", "on" }, { "ON FLIPPED", "on_flipped" },
+    } },
+  { key = "mouse_side_buttons", label = "MOUSE SIDE ST/SEL",
     type = "choice", default = "off",
     choices = {
       { "OFF", "off" }, { "ON", "on" }, { "ON FLIPPED", "on_flipped" },
@@ -187,7 +193,6 @@ local state = {
   battleResume = nil,
   exitJourney = nil,
   previewCache = nil,
-  exteriorVoidCache = nil,
   gestureTouches = {},
   twoFingerGesture = nil,
   zoomGuardInstalled = false,
@@ -232,9 +237,13 @@ local state = {
     overviewCacheHits = 0,
     overviewCacheMisses = 0,
     exitFallbacks = 0,
-    exteriorVoidExitIntents = 0,
-    voxelExactVoidExitIntents = 0,
     carpetDownIntents = 0,
+    directionalWarpIntents = 0,
+    edgeWarpIntents = 0,
+    holeStepIntents = 0,
+    exitClickBiasedSelections = 0,
+    exitPrelandingCarries = 0,
+    exitWarpForcedCommits = 0,
     exitGoalCollisionOverrides = 0,
     retainedTargets = 0,
     nearestFallbacks = 0,
@@ -1192,6 +1201,53 @@ local function scheduleDynamicWait(nav, reason)
   setPhase(nav, "WAITING_DYNAMIC", reason or "dynamic_obstacle")
 end
 
+-- Directional edge/carpet warps are most faithful when the activation
+-- direction is ALREADY HELD while the final step lands on the warp source.
+-- Gen1Recomp's onStepComplete mirrors CheckWarpsNoCollision and can consume
+-- ExtraWarpCheck on that landing frame.  Routing to the source first and only
+-- then pressing UP/DOWN/LEFT/RIGHT misses that window on some wall openings.
+-- Build a terminal path whose predecessor is exactly opposite exitDir, then
+-- append the source as the final step.  The existing route follower keeps the
+-- same synthetic direction held across that landing frame.
+function ControlsFree.directionalExitTerminalPath(game, nav, cur, overview,
+    occupied, tempBlocked, blockedEdges, blockedCells, topology, waterMode)
+  if not (nav and nav.goalKind == "exit" and nav.exitIntent
+      and nav.exitDir and nav.targetX ~= nil and nav.targetY ~= nil) then
+    return nil
+  end
+  if cur.x == nav.targetX and cur.y == nav.targetY then return nil end
+  local d = DIR_BY_NAME[nav.exitDir]
+  if not d then return nil end
+  local ax, ay = nav.targetX - d.dx, nav.targetY - d.dy
+  if ax < 0 or ay < 0 or ax >= overview.width or ay >= overview.height then
+    return nil
+  end
+
+  -- Never let the path-to-approach accidentally walk through the warp source
+  -- when that source looks like ordinary '.' terrain in mapOverview.
+  local approachBlocked = copyFlat(blockedCells)
+  approachBlocked[key(nav.targetX, nav.targetY)] = true
+  local path = findPath(overview, cur.x, cur.y, ax, ay, waterMode,
+    occupied, tempBlocked, blockedEdges, approachBlocked,
+    topology.jumps, false)
+  if not path then return nil end
+
+  -- Validate the one final graph edge separately.  allowBlockedGoal is safe
+  -- here because the endpoint has already been validated as an actual exit
+  -- warp source; it remains forbidden as every intermediate node.
+  if not passable(overview, nav.targetX, nav.targetY,
+      nav.targetX, nav.targetY, waterMode,
+      occupied, tempBlocked, blockedEdges, blockedCells,
+      ax, ay, true) then
+    return nil
+  end
+  path[#path + 1] = {
+    x = nav.targetX, y = nav.targetY,
+    forced = "exit_terminal", dir = nav.exitDir,
+  }
+  return path
+end
+
 local function buildPath(game, nav, cur)
   local overview = mod.world and mod.world:mapOverview()
   if not overview or overview.mapId ~= nav.mapId then return nil, "map" end
@@ -1203,19 +1259,31 @@ local function buildPath(game, nav, cur)
   local blockedEdges = mergeBlockedEdges(nav.blockedEdges, topology.blockedEdges)
   local allowExitGoal = nav.goalKind == "exit" and nav.exitIntent ~= nil
     and nav.exitDir ~= nil
-  local path = findPath(overview, cur.x, cur.y,
-                        nav.targetX, nav.targetY, waterMode,
-                        occupied, nav.tempBlocked, blockedEdges, nav.blockedCells,
-                        topology.jumps, allowExitGoal)
+  local path = ControlsFree.directionalExitTerminalPath(game, nav, cur, overview,
+    occupied, nav.tempBlocked, blockedEdges, nav.blockedCells,
+    topology, waterMode)
+  if path then
+    nav.exitPrelandingCarry = true
+    state.stats.exitPrelandingCarries =
+      (state.stats.exitPrelandingCarries or 0) + 1
+  else
+    nav.exitPrelandingCarry = nil
+    path = findPath(overview, cur.x, cur.y,
+                          nav.targetX, nav.targetY, waterMode,
+                          occupied, nav.tempBlocked, blockedEdges, nav.blockedCells,
+                          topology.jumps, allowExitGoal)
+  end
   if not path then
     -- Only wait when removing CURRENTLY-MOVABLE actors makes a path possible.
     -- A wall or a stationary NPC therefore fails immediately rather than
     -- pretending it might disappear just because some unrelated NPC wanders
     -- elsewhere on the map.
-    local withoutDynamic = findPath(overview, cur.x, cur.y,
-                                    nav.targetX, nav.targetY, waterMode,
-                                    static, nil, blockedEdges, nav.blockedCells,
-                                    topology.jumps, allowExitGoal)
+    local withoutDynamic = ControlsFree.directionalExitTerminalPath(game, nav, cur, overview,
+      static, nil, blockedEdges, nav.blockedCells, topology, waterMode)
+      or findPath(overview, cur.x, cur.y,
+                  nav.targetX, nav.targetY, waterMode,
+                  static, nil, blockedEdges, nav.blockedCells,
+                  topology.jumps, allowExitGoal)
     if withoutDynamic then return nil, "dynamic" end
     return nil, "blocked"
   end
@@ -2225,6 +2293,9 @@ local function voxelRayTargetFromTap(game, x, y, scene)
   if not tGround then return { error="outside_world", cur=cur, overview=overview } end
   local gx,gz=ray.x+ray.dx*tGround,ray.z+ray.dz*tGround
   local entries=voxelCandidateMaps(game,overview)
+  local activeEntry = entries and entries[1]
+  local intentX = activeEntry and ((gx - activeEntry.ox) / TILE_SIZE) or nil
+  local intentY = activeEntry and ((gz - activeEntry.oy) / TILE_SIZE) or nil
 
   local visible
   for _,entry in ipairs(entries) do
@@ -2259,18 +2330,15 @@ local function voxelRayTargetFromTap(game, x, y, scene)
     visualTile = S and S.tileAt and S.tileAt[k] or nil
     visualClass = shape and shape.class or nil
   end
-  local exactVoid = visible == nil and groundHit ~= nil
-      and groundHit.entry and groundHit.entry.active
-      and visualClass == "void"
-
   -- Keep the last exact Voxel pick visible in DEBUG OVERLAY. VOXEL/RAY are
   -- counters, not tile ids; this line is the authoritative per-tap tile/class.
+  -- Tile/class data is diagnostic only: v1.3.14 deliberately stopped using
+  -- visual `void` classification as an EXIT-intent heuristic.
   state.lastVoxelPick = {
     tile = visualTile, class = visualClass,
     tx = visualTX, ty = visualTY,
     cellX = groundHit and groundHit.x or nil,
     cellY = groundHit and groundHit.y or nil,
-    exactVoid = exactVoid and true or false,
   }
 
   local outsideBehind = false
@@ -2291,7 +2359,8 @@ local function voxelRayTargetFromTap(game, x, y, scene)
   local hit=visible or groundHit
   if not hit then
     state.stats.voxelRayOutside=state.stats.voxelRayOutside+1
-    return { error="outside_world", cur=cur, overview=overview, ray=true }
+    return { error="outside_world", cur=cur, overview=overview, ray=true,
+             intentX=intentX, intentY=intentY }
   end
   state.stats.voxelTargets=state.stats.voxelTargets+1
   state.stats.voxelRayTargets=state.stats.voxelRayTargets+1
@@ -2302,7 +2371,7 @@ local function voxelRayTargetFromTap(game, x, y, scene)
              visibleKind = visible and visible.kind or nil,
              visualTile = visualTile, visualClass = visualClass,
              visualTX = visualTX, visualTY = visualTY,
-             exactVoid = exactVoid }
+             intentX=intentX, intentY=intentY }
   end
   local wx=hit.entry.ox+(hit.x+0.5)*TILE_SIZE
   local wy=hit.entry.oy+(hit.y+0.5)*TILE_SIZE
@@ -2311,7 +2380,8 @@ local function voxelRayTargetFromTap(game, x, y, scene)
     cross.targetX,cross.targetY=hit.x,hit.y
     return { x=hit.x,y=hit.y,cur=cur,overview=overview,cross=cross }
   end
-  return { error=saw and "connected_map" or "outside_map",cur=cur,overview=overview }
+  return { error=saw and "connected_map" or "outside_map",cur=cur,overview=overview,
+           intentX=intentX, intentY=intentY }
 end
 
 -- Hit-test the actual ground quads Dramatic Shape's current camera projects.
@@ -2485,12 +2555,13 @@ local function targetFromTap(game, x, y)
   local tapPX, tapPY = x * view.dpiX, y * view.dpiY
   local right = view.ox + view.worldW * view.scale
   local bottom = view.oy + view.worldH * view.scale
-  if tapPX < view.ox or tapPY < view.oy or tapPX >= right or tapPY >= bottom then
-    -- Preserve the active map snapshot for higher-level intent resolution:
-    -- an enclosed interior can interpret black/letterbox space as "exit".
-    return nil, nil, cur, overview, "outside_world"
-  end
+  local outsideCanvas = tapPX < view.ox or tapPY < view.oy
+    or tapPX >= right or tapPY >= bottom
 
+  -- Deliberately map even letterbox/outside-canvas clicks through the live
+  -- camera.  Those extrapolated map-cell coordinates are not movement targets;
+  -- they are only directional intent used to choose between multiple real
+  -- exits in an enclosed interior.
   local canvasX = (tapPX - view.ox) / view.scale
   local canvasY = (tapPY - view.oy) / view.scale
   local ppx, ppy = playerPixel(game, cur)
@@ -2504,8 +2575,13 @@ local function targetFromTap(game, x, y)
     or (ppy - (view.worldH / 2 - 8))
   local worldX = cameraX + canvasX
   local worldY = cameraY + canvasY
+  local intentMeta = { intentX = worldX / TILE_SIZE, intentY = worldY / TILE_SIZE }
   local tx = math.floor(worldX / TILE_SIZE)
   local ty = math.floor(worldY / TILE_SIZE)
+
+  if outsideCanvas then
+    return nil, nil, cur, overview, "outside_world", nil, intentMeta
+  end
 
   if tx < 0 or ty < 0 or tx >= overview.width or ty >= overview.height then
     local cross, sawNeighbour = visibleNeighborTarget(game, worldX, worldY, overview)
@@ -2515,10 +2591,11 @@ local function targetFromTap(game, x, y)
     -- Survey can show maps more than one connection away.  Recognize that the
     -- tap really hit rendered world, but refuse it until every intervening seam
     -- can be validated rather than treating it as an arbitrary border tap.
-    return nil, nil, cur, overview, sawNeighbour and "connected_map" or "outside_map"
+    return nil, nil, cur, overview, sawNeighbour and "connected_map" or "outside_map",
+      nil, intentMeta
   end
 
-  return tx, ty, cur, overview, nil, nil
+  return tx, ty, cur, overview, nil, nil, intentMeta
 end
 
 local function newNavigation(cur)
@@ -2565,13 +2642,20 @@ local function listHas(list, value)
   return false
 end
 
--- Mirror the engine's Warp.extraCheck direction rules without taking control
--- away from the engine itself. We only choose which D-pad direction to hold;
--- Warp.onEdge / Warp.onCollision remains the authority on whether the warp
--- actually fires.
+-- Resolve every direction that can activate a real warp SOURCE.
+-- IMPORTANT: Gen1Recomp has TWO independent directional mechanisms:
+--   1) Warp.onEdge: standing on a warp record at the map boundary and trying
+--      to step OUT OF BOUNDS. This does NOT consult warpCarpets at all.
+--   2) Warp.onCollision / ExtraWarpCheck: carpet/front-tile rules.
+--
+-- Older Tap to Move builds treated those as mutually exclusive. On a tileset
+-- that uses function2 carpet rules, a genuine top-edge warp such as
+-- CERULEAN_TRASHED_HOUSE (3,0) could therefore lose its required UP even
+-- though Warp.onEdge would accept it. Return the UNION instead: edge direction
+-- is always authoritative, with any valid carpet directions added afterwards.
 local function warpActivationDirections(game, map, x, y)
   if not map then return {} end
-  local dirs = {}
+  local dirs, seen = {}, {}
   local carpets = game and game.data and game.data.field
       and game.data.field.warpCarpets
   local useCarpet = false
@@ -2586,19 +2670,25 @@ local function warpActivationDirections(game, map, x, y)
     end
   end
 
-  local function facingEdge(dir)
-    return (dir == "up" and y == 0)
-        or (dir == "down" and y == map.heightCells - 1)
-        or (dir == "left" and x == 0)
-        or (dir == "right" and x == map.widthCells - 1)
+  local function add(dir)
+    if not seen[dir] then
+      seen[dir] = true
+      dirs[#dirs + 1] = dir
+    end
   end
 
-  for _, d in ipairs(DIRS) do
-    local dir = d.name
-    local ok = false
-    if not useCarpet then
-      ok = facingEdge(dir)
-    else
+  -- Warp.onEdge is independent from ExtraWarpCheck / warpCarpets.
+  if y == 0 then add("up") end
+  if map.heightCells and y == map.heightCells - 1 then add("down") end
+  if x == 0 then add("left") end
+  if map.widthCells and x == map.widthCells - 1 then add("right") end
+
+  -- function2 carpet maps/tilesets additionally activate when the tile in
+  -- FRONT of the source matches the directional carpet table. Do not erase an
+  -- already-valid edge direction just because this second mechanism exists.
+  if useCarpet then
+    for _, d in ipairs(DIRS) do
+      local dir = d.name
       local tx, ty = x + d.dx, y + d.dy
       local front
       if type(map.cellTile) == "function" then
@@ -2606,13 +2696,14 @@ local function warpActivationDirections(game, map, x, y)
         if worked then front = value end
       end
       local ss = carpets and carpets.ssAnneBow
+      local ok
       if ss and map.id == ss.map then
         ok = front == ss.tile
       else
         ok = listHas(carpets and carpets.tiles and carpets.tiles[dir], front)
       end
+      if ok then add(dir) end
     end
-    if ok then dirs[#dirs + 1] = dir end
   end
   return dirs
 end
@@ -2717,72 +2808,122 @@ local function warpIntentAt(game, map, cur, x, y)
   for _, w in ipairs(actualWarpCells(map)) do
     if w.x == x and w.y == y then
       local dirs = warpActivationDirections(game, map, x, y)
-      local warpTile = false
-      if type(map.isWarpTileCell) == "function" then
-        local ok, yes = pcall(map.isWarpTileCell, map, x, y)
-        warpTile = ok and yes == true
-      end
-      -- A DOWN-activated exit mat/carpet is deterministic user intent.  Even
-      -- if the visual/collision tile also reports as an arrival warp, keep a
-      -- follow-up DOWN armed as a safety net: a real arrival warp will change
-      -- maps before we can send it, while a carpet/edge mat that needs an
-      -- extra press will receive exactly the missing activation step.
-      local exitDir = listHas(dirs, "down") and "down" or nil
-      if not exitDir and (not warpTile or (cur and cur.x == x and cur.y == y)) then
+      -- A directional ExtraWarpCheck source needs one final D-pad press after
+      -- Tap to Move reaches the warp record.  v1.3.11 originally kept this
+      -- safety step unconditionally only for DOWN carpets; that accidentally
+      -- dropped UP/LEFT/RIGHT when the source collision tile ALSO looked like
+      -- a normal arrival warp.  If the engine exposes exactly one activation
+      -- direction, preserve it regardless of warpTile: a true arrival warp
+      -- changes maps before the follow-up can fire, while a directional source
+      -- receives exactly the missing press.  Ambiguous multi-direction sources
+      -- still do not get guessed (except the legacy DOWN carpet preference).
+      local exitDir = (#dirs == 1) and dirs[1] or nil
+      if not exitDir and listHas(dirs, "down") then exitDir = "down" end
+      if not exitDir and cur and cur.x == x and cur.y == y then
         exitDir = dirs[1]
       end
+      local edgeWarp = exitDir ~= nil and (
+        (exitDir == "up" and y == 0)
+        or (exitDir == "down" and map.heightCells and y == map.heightCells - 1)
+        or (exitDir == "left" and x == 0)
+        or (exitDir == "right" and map.widthCells and x == map.widthCells - 1))
       return {
         kind = "warp", x=x, y=y, def=w.def, warpDef=w.def,
         rank = warpExitRank(game, w.def), exitDir=exitDir,
-        carpetDown = exitDir == "down",
+        carpetDown = exitDir == "down", edgeWarp = edgeWarp,
       }
     end
   end
   return nil
 end
 
--- Deterministic rescue path for Gen I exit carpets/mats.  There are two
--- representations in the engine data:
---   1) the clicked gameplay cell itself is the warp record and DOWN activates
---      it (common bottom-edge exit mats), or
---   2) the clicked visual/gameplay carpet cell is one cell IN FRONT of the
---      warp record; standing on that source and pressing DOWN triggers
---      Warp.extraCheck for warpCarpets/function2 tilesets.
+-- Deterministic rescue for directional Gen I warp openings.  ExtraWarpCheck
+-- is not a DOWN-only carpet mechanic: a warp SOURCE may require UP/DOWN/LEFT/
+-- RIGHT toward a special tile in FRONT of the player.  The visible opening
+-- the user taps can therefore be one gameplay cell away from the actual warp
+-- record.  Resolve all four directions through the same engine-mirrored
+-- warpActivationDirections() rules instead of guessing a graphic tile id.
 --
--- Return the actual warp SOURCE cell plus a forced DOWN.  This deliberately
--- uses the same warpActivationDirections mirror as the rest of Tap to Move,
--- so it is keyed to Gen1Recomp's gameplay semantics rather than a fragile
--- tileset-local art number.
-function ControlsFree.carpetDownIntentAt(game, map, cur, x, y)
+-- Return the real warp SOURCE plus the direction that must be pressed after
+-- reaching it.  A normal arrival warp still works unchanged: the map changes
+-- before the follow-up direction can fire.
+function ControlsFree.directionalWarpIntentAt(game, map, cur, x, y)
   if not map or type(x) ~= "number" or type(y) ~= "number" then return nil end
 
   local direct = warpIntentAt(game, map, cur, x, y)
-  if direct and direct.exitDir == "down" then
-    direct.carpetDown = true
-    direct.clickedCarpetX, direct.clickedCarpetY = x, y
+  if direct and direct.exitDir then
+    direct.clickedDirectionalX, direct.clickedDirectionalY = x, y
+    direct.directionalFrontCell = false
+    if direct.exitDir == "down" then direct.carpetDown = true end
     return direct
   end
 
-  -- In function2 carpet maps the graphic the player points at can be the
-  -- FRONT cell, while the warp record lives immediately north of it.  Ask the
-  -- engine-mirrored direction test on that source; if DOWN is valid, this is
-  -- exactly the carpet semantics we want.
-  local sx, sy = x, y - 1
-  for _, w in ipairs(actualWarpCells(map)) do
-    if w.x == sx and w.y == sy then
-      local dirs = warpActivationDirections(game, map, sx, sy)
-      if listHas(dirs, "down") then
-        return {
-          kind = "warp", x = sx, y = sy, def = w.def, warpDef = w.def,
-          rank = warpExitRank(game, w.def), exitDir = "down",
-          carpetDown = true, clickedCarpetX = x, clickedCarpetY = y,
-          carpetFrontCell = true,
-        }
+  local warps = actualWarpCells(map)
+  for _, d in ipairs(DIRS) do
+    -- If moving d from SOURCE reaches the clicked visible opening, SOURCE is
+    -- one cell opposite that direction.
+    local sx, sy = x - d.dx, y - d.dy
+    for _, w in ipairs(warps) do
+      if w.x == sx and w.y == sy then
+        local dirs = warpActivationDirections(game, map, sx, sy)
+        if listHas(dirs, d.name) then
+          return {
+            kind = "warp", x = sx, y = sy, def = w.def, warpDef = w.def,
+            rank = warpExitRank(game, w.def), exitDir = d.name,
+            carpetDown = d.name == "down", edgeWarp = false,
+            clickedDirectionalX = x, clickedDirectionalY = y,
+            directionalFrontCell = true,
+          }
+        end
       end
     end
   end
   return nil
 end
+
+-- Scripted dungeon holes are a different transition class: they can be
+-- ordinary walkable collision cells with NO map warp record at all; the map's
+-- onStep script performs the transition after Red actually steps onto them
+-- (Victory Road / Seafoam / Pokémon Mansion-style dungeon warps).  When a
+-- Voxel structure hit lands on the solid cell immediately beside one of these
+-- holes, snap only if that solid tap has exactly one adjacent, genuinely
+-- walkable engine hole.  Ordinary floor taps are never redirected.
+function ControlsFree.holeStepIntentAt(map, overview, x, y)
+  if not map or type(x) ~= "number" or type(y) ~= "number" then return nil end
+  if type(map.warpPadOrHoleAt) ~= "function"
+      or type(map.isWalkableCell) ~= "function" then return nil end
+
+  local function isHole(cx, cy)
+    if type(map.inBounds) == "function" and not map:inBounds(cx, cy) then return false end
+    local okKind, kind = pcall(map.warpPadOrHoleAt, map, cx, cy)
+    if not okKind or kind ~= "hole" then return false end
+    local okWalk, walk = pcall(map.isWalkableCell, map, cx, cy)
+    return okWalk and walk == true
+  end
+
+  if isHole(x, y) then return { kind = "hole", x = x, y = y, proxied = false } end
+
+  -- Never steal a legitimate floor/water/warp selection merely because a
+  -- hole happens to be next to it.  The proxy is only for a non-movement
+  -- visual/solid hit, which is exactly the Voxel occlusion failure mode.
+  local ch = cellChar(overview, x, y)
+  if ch == "." or ch == "~" or ch == "+" then return nil end
+
+  local found = nil
+  for _, d in ipairs(DIRS) do
+    local hx, hy = x + d.dx, y + d.dy
+    if isHole(hx, hy) then
+      if found then return nil end -- ambiguous: do not guess between holes
+      found = { kind = "hole", x = hx, y = hy, proxied = true,
+                clickedX = x, clickedY = y }
+    end
+  end
+  return found
+end
+
+-- Backward-compatible export name for external diagnostics that may have used
+-- the v1.3.11 helper.  Its behavior is now the safer all-direction resolver.
+ControlsFree.carpetDownIntentAt = ControlsFree.directionalWarpIntentAt
 
 local function directConnectionExitIntents(game, overview, cur)
   local ow = game and game.overworld
@@ -2880,7 +3021,7 @@ end
 -- '+' cells from mapOverview: Gen I interior exit carpets are warp records on
 -- ordinary-looking floor cells and only fire when the player then walks off
 -- the edge / into the carpet direction.
-local function nearestExitTarget(game, overview, cur)
+local function nearestExitTarget(game, overview, cur, intentX, intentY)
   local ow = game and game.overworld
   local map = ow and ow.map
   if not map or not overview or not cur then return nil end
@@ -2914,30 +3055,37 @@ local function nearestExitTarget(game, overview, cur)
     local path = findPath(overview, cur.x, cur.y, dst.x, dst.y, waterMode,
       occupied, nil, topology.blockedEdges, blocked, topology.jumps, #dirs > 0)
     if not path then return end
-    local warpTile = false
-    if type(map.isWarpTileCell) == "function" then
-      local ok, yes = pcall(map.isWarpTileCell, map, dst.x, dst.y)
-      warpTile = ok and yes == true
-    end
-    -- DOWN-activated carpet/mat exits always keep the extra DOWN as a
-    -- deterministic safety step. If arrival itself warps, the map transition
-    -- retires navigation before this can fire; if it does not, the press is
-    -- exactly what the engine's edge/carpet rule requires.
-    local exitDir = listHas(dirs, "down") and "down" or nil
-    -- Other plain-floor exit carpets still need their normal follow-up
-    -- direction. A regular warp tile normally fires on arrival, except when
-    -- we already start on it (for example after loading in a doorway).
-    if not exitDir and (not warpTile or (cur.x == dst.x and cur.y == dst.y)) then
+    -- Preserve a unique directional activation for ANY side, not just DOWN.
+    -- This is the Smart Exit counterpart of warpIntentAt above: reaching an
+    -- UP/LEFT/RIGHT source is only half the action when ExtraWarpCheck expects
+    -- one more D-pad press.  If arrival itself warps, map.entered retires the
+    -- route before this follow-up can run, so retaining the unique direction
+    -- is safe.  Multi-direction sources remain conservative, with the legacy
+    -- DOWN carpet preference retained for compatibility.
+    local exitDir = (#dirs == 1) and dirs[1] or nil
+    if not exitDir and listHas(dirs, "down") then exitDir = "down" end
+    if not exitDir and cur.x == dst.x and cur.y == dst.y then
       exitDir = dirs[1]
     end
 
+    local clickDistance
+    if type(intentX) == "number" and type(intentY) == "number" then
+      local dx, dy = (dst.x + 0.5) - intentX, (dst.y + 0.5) - intentY
+      clickDistance = dx * dx + dy * dy
+    end
     candidates[#candidates + 1] = {
       kind = "warp", x = dst.x, y = dst.y,
       cost = #path, rank = warpExitRank(game, dst.def),
+      clickDistance = clickDistance,
       exitHops = warpExitHops(game, dst.def),
       dynamic = dynamicOnly,
       exitDir = exitDir,
       carpetDown = exitDir == "down",
+      edgeWarp = exitDir ~= nil and (
+        (exitDir == "up" and dst.y == 0)
+        or (exitDir == "down" and map.heightCells and dst.y == map.heightCells - 1)
+        or (exitDir == "left" and dst.x == 0)
+        or (exitDir == "right" and map.widthCells and dst.x == map.widthCells - 1)),
       warpDef = dst.def,
     }
   end
@@ -2956,6 +3104,11 @@ local function nearestExitTarget(game, overview, cur)
   end
 
   for _, c in ipairs(directConnectionExitIntents(game, overview, cur)) do
+    if type(intentX) == "number" and type(intentY) == "number"
+        and type(c.x) == "number" and type(c.y) == "number" then
+      local dx, dy = (c.x + 0.5) - intentX, (c.y + 0.5) - intentY
+      c.clickDistance = dx * dx + dy * dy
+    end
     candidates[#candidates + 1] = c
   end
 
@@ -2965,6 +3118,11 @@ local function nearestExitTarget(game, overview, cur)
     if ah ~= bh then return ah < bh end
     if (a.rank or 9) ~= (b.rank or 9) then
       return (a.rank or 9) < (b.rank or 9)
+    end
+    local ac, bc = a.clickDistance, b.clickDistance
+    if ac ~= nil or bc ~= nil then
+      ac, bc = ac or math.huge, bc or math.huge
+      if math.abs(ac - bc) > 0.0001 then return ac < bc end
     end
     if (a.cost or 999999) ~= (b.cost or 999999) then
       return (a.cost or 999999) < (b.cost or 999999)
@@ -3063,21 +3221,43 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
   local nearestFallback = false
   local semanticKind, semanticEntityId
 
-  -- v1.3.11 deterministic carpet rescue: before any "blank space" or Voxel
-  -- heuristic can reinterpret the tap, ask the actual warp data whether the
-  -- selected cell is a DOWN-activated exit mat/carpet.  Also accept the
-  -- function2 representation where the clicked carpet graphic is the cell
-  -- directly SOUTH of the warp record.  Route to the real source cell and
-  -- remember the forced DOWN for the arrival phase.
-  if tx and not cross and cur and overview and ControlsFree.carpetDownIntentAt then
+  -- Directional warp rescue: the visible opening can be the cell IN FRONT
+  -- of the real warp source and ExtraWarpCheck can require any of the four
+  -- directions, not only DOWN.  Resolve the opening through actual warp data
+  -- first, then route to the source and append the engine-required direction.
+  if tx and not cross and cur and overview and ControlsFree.directionalWarpIntentAt then
     local map = game and game.overworld and game.overworld.map
-    local carpetIntent = ControlsFree.carpetDownIntentAt(game, map, cur, tx, ty)
-    if carpetIntent then
+    local directionalIntent = ControlsFree.directionalWarpIntentAt(game, map, cur, tx, ty)
+    if directionalIntent then
       targetMeta = targetMeta or {}
-      targetMeta.carpetDownIntent = carpetIntent
-      targetMeta.carpetClickedX, targetMeta.carpetClickedY = tx, ty
-      tx, ty = carpetIntent.x, carpetIntent.y
-      state.stats.carpetDownIntents = (state.stats.carpetDownIntents or 0) + 1
+      targetMeta.directionalWarpIntent = directionalIntent
+      targetMeta.directionalClickedX, targetMeta.directionalClickedY = tx, ty
+      tx, ty = directionalIntent.x, directionalIntent.y
+      state.stats.directionalWarpIntents =
+        (state.stats.directionalWarpIntents or 0) + 1
+      if directionalIntent.edgeWarp then
+        state.stats.edgeWarpIntents = (state.stats.edgeWarpIntents or 0) + 1
+      end
+      if directionalIntent.exitDir == "down" then
+        state.stats.carpetDownIntents = (state.stats.carpetDownIntents or 0) + 1
+      end
+    end
+  end
+
+  -- Scripted dungeon holes are onStep transitions rather than map warp
+  -- records.  Preserve an exact hole tap, and recover the common Voxel case
+  -- where the rendered lip/wall is selected instead of the unique adjacent
+  -- walkable hole cell.
+  if tx and not cross and cur and overview
+      and not (targetMeta and targetMeta.directionalWarpIntent)
+      and ControlsFree.holeStepIntentAt then
+    local map = game and game.overworld and game.overworld.map
+    local holeIntent = ControlsFree.holeStepIntentAt(map, overview, tx, ty)
+    if holeIntent then
+      targetMeta = targetMeta or {}
+      targetMeta.holeStepIntent = holeIntent
+      tx, ty = holeIntent.x, holeIntent.y
+      state.stats.holeStepIntents = (state.stats.holeStepIntents or 0) + 1
     end
   end
 
@@ -3085,67 +3265,20 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
   -- ray's ground point is clearly beyond the current interior.
   if tx and targetMeta and targetMeta.outsideBehind
       and targetMeta.visibleKind == "structure" and cur and overview then
-    local currentDef = game and game.overworld and game.overworld.map
-        and game.overworld.map.def
-    -- `outsideBehind` is already the strong geometric test: the visible hit
-    -- belongs to the active map, but the SAME camera ray reaches the ground
-    -- at least half a gameplay cell beyond every rendered current/neighbour
-    -- map body. Do not additionally require mapOverview to call the hit cell
-    -- blocked. Dramatic Shape works at 8x8 visual-tile granularity and can
-    -- legitimately extrude an exterior wall over a 16x16 gameplay cell that
-    -- mapOverview represents as ordinary `.` floor. That extra 2D filter was
-    -- the v1.0.0 regression that turned a clear "tap outside this room" into
-    -- nearest-legal movement toward the wall instead of Smart Exit.
-    if not defLooksOutdoor(currentDef) then
-      tx, ty, cross, targetErr = nil, nil, nil, "outside_map"
-    end
-  end
-
-  -- v1.3.10: exact Voxel visual-tile semantics beat geometry guesses.
-  -- Dramatic Shape itself labels completely black/transparent tiles as
-  -- `void`. When the ray actually lands on one of those exact 8x8 tiles in
-  -- a normal room-style building, interpret that visible black tile as EXIT
-  -- intent. Do NOT hardcode a raw tile number: ids are tileset-local, while
-  -- the resolved `void` class is stable across HOUSE/MART/CENTER/etc.
-  -- Interaction/warp semantics on the owning gameplay cell still win.
-  if tx and not cross and cur and overview and targetMeta
-      and targetMeta.exactVoid == true then
-    local map = game and game.overworld and game.overworld.map
-    local def = map and map.def
-    if ControlsFree.mapDefIsBuildingInterior
-        and ControlsFree.mapDefIsBuildingInterior(def) then
-      local exactInteraction = option("interact", true) ~= false
-        and interactionAt(game, tx, ty) or nil
-      local exactWarp = warpIntentAt(game, map, cur, tx, ty)
-      if not exactInteraction and not exactWarp then
-        tx, ty, cross, targetErr = nil, nil, nil, "outside_map"
-        state.stats.voxelExactVoidExitIntents =
-          (state.stats.voxelExactVoidExitIntents or 0) + 1
-      end
-    end
-  end
-
-  -- Small room-style interiors often contain a large collision-solid shell
-  -- around the actually usable room. Visually this is just blank/empty space,
-  -- but the tap still resolves INSIDE the map rectangle, so the old Smart Exit
-  -- gate never saw outside_map and instead treated the blank shell as a generic
-  -- obstacle (nearest-legal movement). Reclassify only boundary-connected
-  -- blank cells as outside intent. Fixed interactions, NPCs and real warp cells
-  -- keep priority, so a wall-mounted sign/PC/door cannot be stolen by this
-  -- convenience path. This is deliberately room-building-only; caves, gates
-  -- and technical indoor map segments keep their existing solid-tile behavior.
-  if tx and not cross and cur and overview and ControlsFree.exteriorVoidCell
-      and ControlsFree.exteriorVoidCell(game, overview, tx, ty) then
-    local shellInteraction = option("interact", true) ~= false
+    local currentMap = game and game.overworld and game.overworld.map
+    local currentDef = currentMap and currentMap.def
+    -- `outsideBehind` is the one retained Voxel-only geometric fallback: the
+    -- SAME ray hits current-map exterior structure while its ground point lies
+    -- at least half a gameplay cell beyond the rendered map body. Unlike the
+    -- retired void/shell guesses, this has direct camera geometry behind it.
+    -- Still, real semantics always win: never turn a tappable object/warp on
+    -- that gameplay cell into an EXIT request merely because perspective puts
+    -- the ray's ground point beyond the room.
+    local visibleInteraction = option("interact", true) ~= false
       and interactionAt(game, tx, ty) or nil
-    local shellWarp = warpIntentAt(
-      game, game and game.overworld and game.overworld.map, cur, tx, ty)
-    if not shellInteraction and not shellWarp then
+    local visibleWarp = warpIntentAt(game, currentMap, cur, tx, ty)
+    if not visibleInteraction and not visibleWarp and not defLooksOutdoor(currentDef) then
       tx, ty, cross, targetErr = nil, nil, nil, "outside_map"
-      targetMeta = targetMeta or {}
-      targetMeta.exteriorVoid = true
-      state.stats.exteriorVoidExitIntents =
-        (state.stats.exteriorVoidExitIntents or 0) + 1
     end
   end
 
@@ -3156,8 +3289,17 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
 
   if not tx and cur and overview
       and (targetErr == "outside_world" or targetErr == "outside_map") then
-    exitIntent = nearestExitTarget(game, overview, cur)
+    local intentX = targetMeta and targetMeta.intentX or nil
+    local intentY = targetMeta and targetMeta.intentY or nil
+    exitIntent = nearestExitTarget(game, overview, cur, intentX, intentY)
+    if exitIntent and type(intentX) == "number" and type(intentY) == "number" then
+      state.stats.exitClickBiasedSelections =
+        (state.stats.exitClickBiasedSelections or 0) + 1
+    end
     if exitIntent then
+      if exitIntent.edgeWarp then
+        state.stats.edgeWarpIntents = (state.stats.edgeWarpIntents or 0) + 1
+      end
       exitFallback = true
       targetErr = nil
       if exitIntent.kind == "connection" then
@@ -3276,9 +3418,20 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       end
     end
   else
+    -- A cell may intentionally be BOTH a background interaction and a real
+    -- directional warp (CERULEAN_TRASHED_HOUSE's wall hole is exactly that).
+    -- NPCs keep absolute interaction priority, but a confirmed directional
+    -- warp wins over a fixed bg/sign interaction when the user taps that cell:
+    -- tapping the hole means "go through it", not merely "read the hole".
+    local selectedWarpIntent = targetMeta and targetMeta.directionalWarpIntent
+      or warpIntentAt(game, game and game.overworld and game.overworld.map,
+                      cur, tx, ty)
     local rawInteraction = option("interact", true) ~= false
       and interactionAt(game, tx, ty) or nil
-    local interaction = rawInteraction
+    local directionalWarpOwnsCell = selectedWarpIntent ~= nil
+      and selectedWarpIntent.exitDir ~= nil
+      and not (rawInteraction and rawInteraction.kind == "entity")
+    local interaction = (not directionalWarpOwnsCell) and rawInteraction
       and ((not continuous) or rawInteraction.kind == "entity")
       and rawInteraction or nil
 
@@ -3309,9 +3462,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     else
       local ch = cellChar(overview, tx, ty)
       local waterMode = currentWaterMode(game, overview, cur)
-      local directWarpIntent = targetMeta and targetMeta.carpetDownIntent
-        or warpIntentAt(
-          game, game and game.overworld and game.overworld.map, cur, tx, ty)
+      local directWarpIntent = selectedWarpIntent
       local activeExitIntent = exitIntent or directWarpIntent
       local legalMovement = ch == "." or (ch == "~" and waterMode)
       local doorSelection = activeExitIntent ~= nil or ch == "+"
@@ -3795,6 +3946,42 @@ local function pressConnectionCross(game, nav, cur)
   return true
 end
 
+-- Last-resort commit for a directional exit that the normal synthetic D-pad
+-- press did not trigger.  This is intentionally narrow: the player must be
+-- standing on the exact active map warp record, the requested direction must
+-- still satisfy the engine-mirrored ExtraWarpCheck rule, and we invoke the
+-- overworld's own takeWarp() transition with that SAME record.  No coordinates
+-- are written and no destination is invented.
+function ControlsFree.commitValidatedExitWarp(game, nav, cur)
+  local ow = game and game.overworld
+  local map = ow and ow.map
+  if not (ow and map and nav and cur and nav.goalKind == "exit"
+      and nav.exitDir and cur.x == nav.targetX and cur.y == nav.targetY
+      and type(map.warpAtCell) == "function" and type(ow.takeWarp) == "function") then
+    return false
+  end
+  local w = map:warpAtCell(cur.x, cur.y)
+  if not (w and w.def) then return false end
+  local intended = nav.exitIntent and nav.exitIntent.warpDef
+  if intended and (w.def.destMap ~= intended.destMap
+      or w.def.destWarp ~= intended.destWarp) then
+    return false
+  end
+  local dirs = warpActivationDirections(game, map, cur.x, cur.y)
+  if not listHas(dirs, nav.exitDir) then return false end
+  releaseHold(nav)
+  local ok = pcall(ow.takeWarp, ow, w.def)
+  if ok then
+    nav.exitForcedCommit = true
+    nav.lastProgressTick = state.tick
+    state.stats.exitWarpForcedCommits =
+      (state.stats.exitWarpForcedCommits or 0) + 1
+    setPhase(nav, "EXITING_WARP", "forced_commit_" .. tostring(nav.exitDir))
+    return true
+  end
+  return false
+end
+
 local function navigationTick(game)
   state.tick = state.tick + 1
   state.game = game
@@ -3999,10 +4186,16 @@ local function navigationTick(game)
   end
 
   if nav.phase == "EXITING_WARP" then
-    -- Leave the direction held until the engine starts the warp/transition.
-    -- overworldGate/map.entered will retire the route and source-safe release
-    -- the token. A fuse protects malformed custom warp data from holding it.
-    if state.tick - (nav.lastProgressTick or state.tick) > 45 then
+    -- Give vanilla several fixed ticks to consume the synthetic direction.
+    -- Some Gen I wall openings only evaluate their special warp during the
+    -- landing-frame CheckWarpsNoCollision window; if that window was missed,
+    -- commit the exact validated warp record through the engine's own
+    -- takeWarp() transition rather than bonking forever.
+    local elapsed = state.tick - (nav.exitCommitTick or nav.lastProgressTick or state.tick)
+    if elapsed >= 6 and not nav.exitForcedCommit then
+      if ControlsFree.commitValidatedExitWarp(game, nav, cur) then return end
+    end
+    if elapsed > 45 then
       cancelRoute("exit_warp_timeout")
     end
     return
@@ -4038,6 +4231,8 @@ local function navigationTick(game)
       nav.holdDir = nav.exitDir
       nav.hold = mod.input:press(game, nav.exitDir)
       nav.lastProgressTick = state.tick
+      nav.exitCommitTick = state.tick
+      nav.exitForcedCommit = nil
       setPhase(nav, "EXITING_WARP", "exit_" .. nav.exitDir)
     else
       finishRoute()
@@ -6258,22 +6453,40 @@ mod.hooks:wrap("movement.collision", function(nextFn, allowed, ctx)
   return result
 end)
 
--- Gen1Recomp normally maps the mouse wheel to survey zoom. OFF preserves that
--- native behavior; ON/ON FLIPPED claim vertical wheel events and emit one real
--- GB D-pad tap instead. Hook the live Game method so launcher/editor scrolling
--- is untouched.
+-- Gen1Recomp normally maps the vertical mouse wheel to survey zoom. OFF
+-- preserves that native behavior. Horizontal wheel tilt arrives through the
+-- same LÖVE wheel callback as dx when the mouse + driver actually expose it.
+-- Keep the two axes independently configurable and choose the dominant axis
+-- for mixed/trackpad events so one gesture never emits two D-pad taps.
 function ControlsFree.installMouseWheelBridge(game)
   if state.mouseWheelBridgeInstalled or not game
       or type(game.wheelmoved) ~= "function" then
     return false
   end
   state.mouseWheelOriginal = game.wheelmoved
-  game.wheelmoved = function(self, dx, dy)
-    local mode = tostring(option("mouse_wheel_control", "off") or "off")
-    if option("enabled", true) ~= false and mode ~= "off"
-        and type(dy) == "number" and dy ~= 0 then
-      local mapped = dy > 0 and "up" or "down"
-      if mode == "on_flipped" then
+  game.wheelmoved = function(self, dx, dy, direction)
+    local wheelMode = tostring(option("mouse_wheel_control", "off") or "off")
+    local tiltMode = tostring(option("mouse_wheel_tilt", "off") or "off")
+    local enabled = option("enabled", true) ~= false
+    local nx = type(dx) == "number" and dx or 0
+    local ny = type(dy) == "number" and dy or 0
+    local ax, ay = math.abs(nx), math.abs(ny)
+
+    if enabled and ax > ay and nx ~= 0 and tiltMode ~= "off" then
+      local mapped = nx > 0 and "right" or "left"
+      if tiltMode == "on_flipped" then
+        mapped = mapped == "right" and "left" or "right"
+      end
+      mod.input:tap(self, mapped)
+      state.stats.mouseWheelTiltTaps = (state.stats.mouseWheelTiltTaps or 0) + 1
+      state.stats["mouseWheelTilt_" .. mapped] =
+        (state.stats["mouseWheelTilt_" .. mapped] or 0) + 1
+      return true
+    end
+
+    if enabled and ay >= ax and ny ~= 0 and wheelMode ~= "off" then
+      local mapped = ny > 0 and "up" or "down"
+      if wheelMode == "on_flipped" then
         mapped = mapped == "up" and "down" or "up"
       end
       mod.input:tap(self, mapped)
@@ -6282,7 +6495,8 @@ function ControlsFree.installMouseWheelBridge(game)
         (state.stats["mouseWheel_" .. mapped] or 0) + 1
       return true
     end
-    return state.mouseWheelOriginal(self, dx, dy)
+
+    return state.mouseWheelOriginal(self, dx, dy, direction)
   end
   state.mouseWheelBridgeInstalled = true
   return true
@@ -6343,61 +6557,6 @@ function ControlsFree.mapDefIsBuildingInterior(def)
   return BUILDING_INTERIOR_TILESETS[tostring(def.tileset or "")] == true
 end
 
--- Is this blocked overview cell part of the blank shell surrounding a normal
--- room-style building? WorldAPI intentionally exposes only a compact collision
--- alphabet, so the safest semantic split available to a mod is topological:
--- flood-fill blocked " " cells from the map boundary. Anything reached is the
--- exterior/void shell; isolated blocked islands remain furniture/interior walls
--- and continue to use nearest-legal movement. Cache by the exact overview rows
--- because map scripts/mods can replace blocks without changing mapId.
-function ControlsFree.exteriorVoidCell(game, overview, x, y)
-  if not overview or cellChar(overview, x, y) ~= " " then return false end
-  local map = game and game.overworld and game.overworld.map
-  if not map or not ControlsFree.mapDefIsBuildingInterior(map.def) then return false end
-  local w, h = tonumber(overview.width), tonumber(overview.height)
-  if not w or not h or w < 1 or h < 1 or type(overview.rows) ~= "table" then
-    return false
-  end
-
-  local signature = tostring(overview.mapId) .. ":" .. tostring(w) .. "x"
-    .. tostring(h) .. ":" .. table.concat(overview.rows, "\n")
-  local cache = state.exteriorVoidCache
-  if not cache or cache.signature ~= signature then
-    local cells, queue = {}, {}
-    local function add(cx, cy)
-      if cx < 0 or cy < 0 or cx >= w or cy >= h then return end
-      if cellChar(overview, cx, cy) ~= " " then return end
-      local k = key(cx, cy)
-      if cells[k] then return end
-      cells[k] = true
-      queue[#queue + 1] = k
-    end
-
-    for cx = 0, w - 1 do
-      add(cx, 0)
-      if h > 1 then add(cx, h - 1) end
-    end
-    for cy = 1, h - 2 do
-      add(0, cy)
-      if w > 1 then add(w - 1, cy) end
-    end
-
-    local head = 1
-    while head <= #queue do
-      local cx, cy = parseKey(queue[head])
-      head = head + 1
-      add(cx + 1, cy)
-      add(cx - 1, cy)
-      add(cx, cy + 1)
-      add(cx, cy - 1)
-    end
-
-    cache = { signature = signature, cells = cells }
-    state.exteriorVoidCache = cache
-  end
-  return cache.cells[key(x, y)] == true
-end
-
 -- A held screen-space destination is meaningful across route/town seams and
 -- across technical map segmentation. A real doorway from outside into a
 -- room-style building is different: the camera snaps to a new room while the
@@ -6414,7 +6573,6 @@ end
 
 mod.events:on("map.entered", function(ev)
   state.view = nil
-  state.exteriorVoidCache = nil
   invalidateLoadedMapOverviewCache()
   invalidateVoxelCandidateCache()
   if ev and ev.via ~= "connection" then invalidateLedgeTopologyCache() end
@@ -6801,12 +6959,19 @@ local function drawDebug()
     ("VOXEL %d  RAY %d  COLUMN %d"):format(
       state.stats.voxelTargets or 0, state.stats.voxelRayTargets or 0,
       state.stats.voxelColumnTargets or 0),
-    ("V-OUT %d  EXACT-VOID %d  CARPET-DOWN %d"):format(
+    ("V-OUT %d  EDGE-WARP %d  DIR-WARP %d"):format(
       state.stats.voxelRayOutside or 0,
-      state.stats.voxelExactVoidExitIntents or 0,
-      state.stats.carpetDownIntents or 0),
-    ("EXIT-GOAL PASS %d"):format(
+      state.stats.edgeWarpIntents or 0,
+      state.stats.directionalWarpIntents or 0),
+    ("HOLE %d  EXIT-GOAL PASS %d"):format(
+      state.stats.holeStepIntents or 0,
       state.stats.exitGoalCollisionOverrides or 0),
+    ("CARPET-DOWN %d  CLICK-EXIT %d"):format(
+      state.stats.carpetDownIntents or 0,
+      state.stats.exitClickBiasedSelections or 0),
+    ("PRELAND %d  WARP-COMMIT %d"):format(
+      state.stats.exitPrelandingCarries or 0,
+      state.stats.exitWarpForcedCommits or 0),
     ("V-TILE %s  %s  @%s,%s"):format(
       tostring(state.lastVoxelPick and state.lastVoxelPick.tile or "-"),
       tostring(state.lastVoxelPick and state.lastVoxelPick.class or "-"),
@@ -6878,6 +7043,7 @@ local function diagnostics()
       mouseWalk = option("mouse", false) == true,
       desktopMouseAB = option("desktop_mouse_ab", false) == true,
       mouseWheelControl = tostring(option("mouse_wheel_control", "off") or "off"),
+      mouseWheelTilt = tostring(option("mouse_wheel_tilt", "off") or "off"),
       mouseSideButtons = tostring(option("mouse_side_buttons", "off") or "off"),
       shakeB = option("shake_b", true) ~= false,
       sensorBackend = state.shake and state.shake.backend or nil,

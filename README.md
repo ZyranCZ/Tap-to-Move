@@ -1,12 +1,12 @@
 # Tap to Move
 
-> **v1.3.12:** Fixed the exit-carpet routing deadlock: validated directional exit warp sources (such as DOWN carpets/mats) may now be the final A* goal even when the compact overview marks them non-walkable, and Tap to Move can selectively pass the engine collision check for that exact non-walkable warp endpoint. Warp cells remain forbidden as ordinary intermediate route nodes.
+> **v1.3.18:** Fixed true map-edge warps such as the Cerulean robbed-house wall hole. Edge activation is now independent of carpet rules, so a warp on the top/bottom/left/right boundary always retains its outward D-pad step; direct taps on a directional wall opening also prefer traversal over the fixed background description on the same cell.
 
 **Tap to Move** adds modern touch navigation to **Pokémon Gen1Recomp**.
 
 Tap anywhere in the overworld and your character starts walking toward that point using collision-aware pathfinding. Hold your finger on the world to continuously steer as the camera moves.
 
-The mod does **not** teleport the player. It drives the real Gen1Recomp movement input, so normal collisions, encounters, warps, ledges, scripts, trainers and movement timing remain controlled by the game.
+The mod does **not** write player coordinates or invent destinations. It drives real Gen1Recomp movement input, so normal collisions, encounters, ledges, scripts, trainers and movement timing remain controlled by the game. For a validated directional exit that fails to consume synthetic input, the mod may invoke Gen1Recomp's own standard warp transition for that exact live warp record.
 
 ## Features
 
@@ -23,7 +23,7 @@ The mod does **not** teleport the player. It drives the real Gen1Recomp movement
 - **Contextual Tap to Interact** for NPCs, trainers, visible item balls, signs, PCs, counters and other supported fixed interaction surfaces.
 - **Ledge-aware routing**, including legal one-way jumps and ledges that cross directly into another connected map.
 - **Seamless connected-map movement** — routes can continue through normal Route/Town map connections without requiring another tap.
-- **Smart interior exits** — tapping outside an interior tells the mod to find a real path out. **Exit carpets/mats are also deterministic targets:** if the selected carpet is a real warp that activates by moving DOWN, Tap to Move routes to the warp source and appends the required DOWN press. In Dramatic Shape Voxel mode, exact `void` tiles and the older boundary-connected blank-shell logic remain additional fallbacks. In multi-floor/interconnected interiors Smart Exit can continue through internal stairs/warps until it reaches the outside.
+- **Smart interior exits** — tapping outside an interior tells the mod to find a real path out. When several equally valid exits exist, the exit closest to the off-map click is preferred before walking distance from the player. Directional openings use the game's real warp semantics: Tap to Move routes to the actual warp source and appends UP/DOWN/LEFT/RIGHT when required. Scripted dungeon holes are treated as on-step transition targets. In Dramatic Shape Voxel mode, a guarded outside-behind-wall ray can also express a genuine outside-map tap. In multi-floor/interconnected interiors Smart Exit can continue through internal stairs/warps until it reaches the outside.
 - **Path Preview** — optional SHORT or FULL breadcrumb visualization of the planned route.
 - **Dynamic replanning** when NPCs move into the route or runtime collision results differ from the initial plan.
 - **Manual controls always win** — D-pad/controller input immediately takes priority over Tap to Move. A touch that begins on any visible Gen1Recomp virtual control is owned exclusively by that control and cannot also become Tap to Move or a custom gesture.
@@ -32,7 +32,7 @@ The mod does **not** teleport the player. It drives the real Gen1Recomp movement
 - Optional **controls-free UI input** — on mobile, enable **DIALOG TOUCH CONTROL** to use A/B/D-pad touch gestures on any UI screen outside the bare overworld and battles.
 - Optional **controls-free battle input** — enable **BATTLE TOUCH CONTROL** for A/B/D-pad battle gestures without the 3D camera competing for the same drag.
 - **Shake to B** on supported phones — a deliberate back-and-forth shake can simulate B without an on-screen button.
-- **Optional desktop mouse shortcuts** — all mouse features default OFF. You can separately enable LMB world walking, LMB/RMB A/B shortcuts, wheel UP/DOWN navigation, and Mouse 5/Mouse 4 START/SELECT shortcuts.
+- **Optional desktop mouse shortcuts** — all mouse features default OFF. You can separately enable LMB world walking, LMB/RMB A/B shortcuts, wheel UP/DOWN navigation, optional wheel-tilt LEFT/RIGHT navigation, and Mouse 5/Mouse 4 START/SELECT shortcuts.
 
 ## Dramatic Shape / VOXEL support
 
@@ -170,9 +170,10 @@ All mouse features are **opt-in and default OFF**. Their settings are grouped at
 Available mouse features:
 
 - **MOUSE WALK CONTROL** — allows LMB to act as Tap to Move in the free overworld.
-- **DESKTOP MOUSE A/B** — when enabled, RMB = B everywhere and LMB = A on dialogue/menu/battle/other non-overworld screens.
-- **MOUSE WHEEL CONTROL** — OFF / ON / ON FLIPPED. ON maps wheel up → UP and wheel down → DOWN. ON FLIPPED swaps them. While ON, the mod consumes the vertical wheel event instead of Gen1Recomp's native survey-zoom wheel behavior.
-- **MOUSE SIDE BUTTONS** — OFF / ON / ON FLIPPED. ON maps Mouse 5 → START and Mouse 4 → SELECT. ON FLIPPED swaps those two mappings.
+- **MOUSE LMB/RMB=A/B** — when enabled, RMB = B everywhere and LMB = A on dialogue/menu/battle/other non-overworld screens.
+- **MOUSE WHEEL ▲/▼** — OFF / ON / ON FLIPPED. ON maps wheel up → UP and wheel down → DOWN. ON FLIPPED swaps them. While ON, the mod consumes the vertical wheel event instead of Gen1Recomp's native survey-zoom wheel behavior.
+- **MOUSE WH.TILT L/R** — OFF / ON / ON FLIPPED. On supported mice, ON maps wheel tilt left → LEFT and tilt right → RIGHT; ON FLIPPED swaps them. If the mouse/driver does not report horizontal wheel events, this setting simply has no effect.
+- **MOUSE SIDE ST/SEL** — OFF / ON / ON FLIPPED. ON maps Mouse 5 → START and Mouse 4 → SELECT. ON FLIPPED swaps those two mappings.
 
 Mouse features are independent. For example, wheel navigation can be enabled while mouse walking remains disabled.
 
@@ -266,20 +267,28 @@ Allow left mouse click to control Tap to Move in the free overworld.
 - **OFF — default**
 - **ON**
 
-### DESKTOP MOUSE A/B
+### MOUSE LMB/RMB=A/B
 Enable the existing desktop click shortcuts.
 
 - **OFF — default**
 - **ON:** RMB = **B**. LMB = **A** when a non-overworld screen is active; free-overworld LMB is controlled separately by **MOUSE WALK CONTROL**.
 
-### MOUSE WHEEL CONTROL
+### MOUSE WHEEL ▲/▼
 Map the vertical mouse wheel to D-pad taps.
 
 - **OFF — default:** Tap to Move does not remap the wheel; Gen1Recomp keeps its native wheel behavior (including overworld survey zoom).
 - **ON:** wheel up = **UP**, wheel down = **DOWN**.
 - **ON FLIPPED:** wheel up = **DOWN**, wheel down = **UP**.
 
-### MOUSE SIDE BUTTONS
+### MOUSE WH.TILT L/R
+Map horizontal wheel tilt to LEFT/RIGHT on mice that expose horizontal wheel events.
+
+- **OFF — default:** no horizontal-wheel remapping.
+- **ON:** tilt left = **LEFT**, tilt right = **RIGHT**.
+- **ON FLIPPED:** tilt left = **RIGHT**, tilt right = **LEFT**.
+- Hardware/driver support is required; many mouse wheels do not support tilt.
+
+### MOUSE SIDE ST/SEL
 Map the two common side buttons independently of mouse walking/click shortcuts.
 
 - **OFF — default**
@@ -313,7 +322,7 @@ For 3D overworld play, install/enable **Dramatic Shape Voxel Mod** as well. Tap 
 
 Tap to Move declares its official GitHub repository in `manifest.json`, so Gen1Recomp's native mod updater can check GitHub Releases for newer versions and install a ZIP release from the launcher.
 
-The update check is handled by Gen1Recomp itself; Tap to Move does not run a separate background network checker during gameplay. Release ZIP assets should keep a name beginning with `tap_to_move`, for example `tap_to_move_v1.3.12.zip`.
+The update check is handled by Gen1Recomp itself; Tap to Move does not run a separate background network checker during gameplay. Release ZIP assets should keep a name beginning with `tap_to_move`, for example `tap_to_move_v1.3.17.zip`.
 
 ## Compatibility philosophy
 
@@ -322,6 +331,53 @@ Tap to Move does not hard-lock itself to one specific Gen1Recomp version. It att
 The Dramatic Shape integration uses its exported companion-library interface where available rather than modifying Voxel rendering behavior.
 
 ## Version
+
+
+**1.3.18**
+
+- Fixed **true edge warps**: a real warp record on the top/bottom/left/right map boundary now always retains the outward **UP/DOWN/LEFT/RIGHT** activation used by Gen1Recomp `Warp.onEdge`, even when the same tileset also uses function2 carpet rules.
+- This specifically covers the Cerulean robbed-house rear hole at `(3,0)`: Smart Exit routes to the real warp source and commits **UP** instead of stopping on the warp cell.
+- Direct taps on a cell that is both a fixed background interaction and a confirmed directional warp now choose the warp traversal (NPCs still keep interaction priority).
+- Existing click-biased multi-exit selection from v1.3.17 is retained.
+
+**1.3.17**
+
+- Smart Exit now uses the off-map click position to choose between equally valid exits before considering walking distance from the player.
+- Directional wall openings use a constrained final approach so UP/DOWN/LEFT/RIGHT is already held as the player lands on the warp source.
+- If a validated directional warp still does not fire from input, Tap to Move invokes Gen1Recomp's normal `takeWarp` transition for that exact live warp record after a short grace period.
+
+**1.3.16**
+
+- Fixed the asymmetry where only **DOWN** exit carpets always retained their final activation input. Unique **UP / LEFT / RIGHT** `ExtraWarpCheck` directions are now retained too, even when the source cell also looks like a normal warp tile.
+- Smart Exit now routes to the real warp source and then sends the required final direction for any unique directional exit.
+- Direct clicks on the warp source inherit the same rule; clicks on the visible adjacent opening still resolve source + direction as before.
+- Ambiguous multi-direction warp sources are not guessed; the existing DOWN-carpet compatibility preference remains.
+- The final exit-goal A*/collision exception remains limited to the exact validated warp source.
+
+**1.3.15**
+
+- Generalized directional special-warp targeting from DOWN-only carpets to **UP / DOWN / LEFT / RIGHT** using Gen1Recomp's actual `ExtraWarpCheck` semantics.
+- Tapping the visible front/opening cell can now resolve to the adjacent real warp source, route there, then append the required direction. This covers rear/top/side openings and other function2-style special entrances without hardcoded tile ids.
+- Added explicit support for scripted dungeon **hole** cells (`warpPadOrHoleAt == "hole"`): exact hole taps route onto the walkable on-step trigger, and a solid Voxel hit can snap to a unique adjacent engine-recognized hole. Ordinary floor taps are never redirected and ambiguous adjacent holes are never guessed.
+- Existing exit-goal A*/collision safeguards remain scoped to real warp records only; scripted holes do not receive collision overrides.
+
+**1.3.14**
+
+- Removed the **exact Voxel `void` → EXIT** heuristic. Voxel tile/class data remains diagnostic only.
+- Removed the **boundary-connected blank-shell → EXIT** flood-fill heuristic.
+- Kept the Voxel **outside-behind-wall** fallback, but real interactions and warp semantics on the hit cell now have priority.
+- Smart Exit remains driven by actual warp/carpet records, genuine outside-map intent, and multi-leg exit routing.
+- Renamed the bottom mouse rows for the compact 160px Mods screen: **MOUSE LMB/RMB=A/B**, **MOUSE WHEEL ▲/▼**, **MOUSE WH.TILT L/R**, **MOUSE SIDE ST/SEL**.
+- ▲/▼ are native Gen I font glyphs; the vanilla charmap does not provide a matching left/right arrow pair, so horizontal rows use L/R.
+
+**1.3.13**
+
+- Added **MOUSE WHEEL TILT** at the bottom of the Mods menu, default **OFF**.
+- **ON:** horizontal wheel tilt left/right sends **LEFT/RIGHT**.
+- **ON FLIPPED:** swaps LEFT/RIGHT.
+- Vertical **MOUSE WHEEL CONTROL** remains independent and unchanged.
+- Mixed horizontal/vertical wheel events use the dominant axis so a single wheel/trackpad event cannot emit two D-pad taps.
+- If the mouse or driver does not expose horizontal wheel movement, the option has no effect.
 
 **1.3.12**
 
