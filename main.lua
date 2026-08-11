@@ -1,4 +1,4 @@
--- Tap to Move v1.4.0
+-- Tap to Move v1.5.0
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,33 +9,21 @@
 
 local mod = ...
 
-local VERSION = "1.4.0"
+local VERSION = "1.5.0"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 150 -- 1X base; scaled by live overworld logic speed
 local DEFAULT_PERFORMANCE_INPUT_FREQUENCY = "balance"
-local DEFAULT_VOXEL_PATH_RATE = "0.25"
 
--- Performance preset = how often the expensive held-pointer INPUT work is
--- allowed to run. LOW prioritizes steering responsiveness; ULTRA prioritizes
--- frame time. Voxel Path Preview reprojection has its own independent tuning
--- row below so the user can test very low visual refresh rates without making
--- steering itself sluggish.
+-- Hold retarget preset = how often the expensive held-pointer retarget work
+-- is allowed to run. Voxel Path Preview reprojection is independently fixed
+-- at the deliberately conservative 0.25/s rate.
 local PERFORMANCE_INPUT_PROFILES = {
   low =     { label = "LOW",     holdMs = 200 }, -- 5 Hz
   medium =  { label = "MEDIUM",  holdMs = 300 }, -- 3.3 Hz
   balance = { label = "BALANCE", holdMs = 400 }, -- 2.5 Hz
   high =    { label = "HIGH",    holdMs = 600 }, -- 1.7 Hz
   ultra =   { label = "ULTRA",   holdMs = 800 }, -- 1.25 Hz
-}
-
--- Fixed-tick intervals for Voxel Path Preview screen-space reprojection.
--- The cached dots still draw every HUD frame; only the expensive live 3D
--- projection is throttled. Values intentionally extend well below one of the
--- old presets so real-device testing can find where visible lag begins.
-local VOXEL_PATH_RATE_TICKS = {
-  ["10"] = 6, ["5"] = 12, ["2"] = 30, ["1"] = 60,
-  ["0.25"] = 240,
 }
 
 -- Optional two-finger shortcuts. Gen1Recomp/LÖVE can surface pinch/spread
@@ -64,6 +52,20 @@ local DIALOG_SWIPE_TRIGGER_UNITS = 30
 -- accelerometer-as-joystick disabled, so the mod talks to SDL2's independent
 -- sensor subsystem through FFI instead. iOS/LÖVE 12 can use love.sensor.
 local ControlsFree = {
+  -- Performance/search tuning lives on this namespace table instead of as
+  -- extra chunk locals. FULL exactly preserves the pre-budget search scope.
+  pathBudgetProfiles = {
+    very_low = { label = "VERY LOW", nodes = 128, seams = 2, exits = 2 },
+    medium   = { label = "MEDIUM",   nodes = 256, seams = 4, exits = 4 },
+    full     = { label = "FULL",     nodes = nil, seams = nil, exits = nil },
+  },
+  DEFAULT_PATH_BUDGET = "full",
+  -- Voxel Path Preview live reprojection is intentionally fixed at 0.25/s.
+  VOXEL_PATH_REFRESH_TICKS = 240,
+  engineWarpModule = false,
+  occupancyCache = nil,
+  warpCellsCache = setmetatable({}, { __mode = "k" }),
+
   -- Renderer-agnostic direct steering constants. Kept on this table rather
   -- than as extra chunk locals because this very large mod deliberately stays
   -- below Lua 5.1's 200-local limit for one compiled function.
@@ -82,15 +84,6 @@ local ControlsFree = {
   NATIVE_CONTROLS_TOGGLE_MARGIN = 10,
   NATIVE_CONTROLS_TOGGLE_SLOP = 8,
   SIMPLE_DIR_COMPASS = { up="north", down="south", left="west", right="east" },
-  SHAKE_ACCEL_THRESHOLD = 5.5,       -- m/s^2 after gravity removal
-  SHAKE_GYRO_THRESHOLD = 3.2,        -- rad/s
-  SHAKE_RESET_RATIO = 0.45,          -- motion must relax before next impulse
-  SHAKE_REVERSAL_DOT = -0.20,        -- opposite-enough vector direction
-  SHAKE_MIN_IMPULSE_TICKS = 2,
-  SHAKE_MAX_IMPULSE_TICKS = 30,      -- 0.5 s at 60 Hz
-  SHAKE_COOLDOWN_TICKS = 45,         -- 0.75 s; one B per shake
-  SHAKE_WARMUP_TICKS = 10,
-  SHAKE_GRAVITY_ALPHA = 0.08,
   TOUCH_HOLD_B_TICKS = FIXED_TICKS_PER_SECOND, -- exactly 1.0 s
   TOUCH_HOLD_B_MOVE_SLOP_UNITS = 22,
   -- When PINCH OR SPREAD is selected, the first world touch is reserved for a
@@ -144,19 +137,21 @@ mod.options:define({
   { key = "hold_steer", label = "HOLD TO STEER", type = "toggle", default = true },
   { key = "hold_steer_delay_ms", label = "HOLD STEER DELAY", type = "number",
     default = DEFAULT_HOLD_STEER_DELAY_MS, min = 150, max = 500, step = 50 },
-  { key = "performance_input_frequency", label = "PERFORMANCE INPUT FREQUENCY",
+  -- Keep the legacy key so existing option values survive the rename.
+  -- This setting only throttles Hold-to-Steer retarget/path recalculation.
+  { key = "performance_input_frequency", label = "HOLD RETARGET RATE",
     type = "choice", default = DEFAULT_PERFORMANCE_INPUT_FREQUENCY,
     choices = {
-      { "LOW", "low" }, { "MEDIUM", "medium" }, { "BALANCE", "balance" },
-      { "HIGH", "high" }, { "ULTRA", "ultra" },
+      { "5/S", "low" }, { "3.3/S", "medium" }, { "2.5/S", "balance" },
+      { "1.7/S", "high" }, { "1.25/S", "ultra" },
     } },
-  { key = "voxel_path_rate", label = "VOXEL PATH RATE",
-    type = "choice", default = DEFAULT_VOXEL_PATH_RATE,
+  { key = "pathfinding_budget", label = "PERFORMANCE BUDGET",
+    type = "choice", default = ControlsFree.DEFAULT_PATH_BUDGET,
     choices = {
-      { "0.25/S", "0.25" }, { "1/S", "1" }, { "2/S", "2" },
-      { "5/S", "5" }, { "10/S", "10" },
-    } },
-  { key = "dialog_touch_control", label = "DIALOG TOUCH CONTROL",
+      { "VERY LOW", "very_low" },
+      { "MEDIUM", "medium" },
+      { "FULL", "full" },
+    } },  { key = "dialog_touch_control", label = "DIALOG TOUCH CONTROL",
     type = "toggle", default = false },
   { key = "battle_touch_control", label = "BATTLE TOUCH CONTROL",
     type = "toggle", default = false },
@@ -167,8 +162,6 @@ mod.options:define({
       { "HOLD PLAYER SPRITE", "hold_player_sprite" },
       { "PINCH OR SPREAD", "pinch_or_spread" },
     } },
-  { key = "shake_b", label = "SHAKE -> B",
-    type = "toggle", default = true },
   { key = "feedback", label = "TAP FEEDBACK", type = "toggle", default = true },
   { key = "path_preview", label = "PATH PREVIEW", type = "choice", default = "off",
     choices = { { "OFF", "off" }, { "SHORT", "short" }, { "FULL", "full" } } },
@@ -267,6 +260,19 @@ local state = {
     routesStarted = 0,
     routesArrived = 0,
     replans = 0,
+    pathSearches = 0,
+    pathExpanded = 0,
+    pathBudgetHits = 0,
+    pathMaxExpanded = 0,
+    seamCandidatesConsidered = 0,
+    seamCandidatesSkipped = 0,
+    occupancyCacheHits = 0,
+    occupancyCacheMisses = 0,
+    warpCacheHits = 0,
+    warpCacheMisses = 0,
+    exitCandidatesCheap = 0,
+    exitCandidatesPathScored = 0,
+    exitCandidatesDeferred = 0,
     dynamicWaits = 0,
     collisions = 0,
     invalidTaps = 0,
@@ -332,6 +338,15 @@ local state = {
     voxelRayOutside = 0,
     voxelSemanticRecoveries = 0,
     voxelNativeHiddenPathTargets = 0,
+    hiddenTreasureTargets = 0,
+    hiddenTreasureTriggers = 0,
+    seamlessSurfPlans = 0,
+    seamlessSurfMounts = 0,
+    seamlessSurfFaceTurns = 0,
+    seamlessSurfDenied = 0,
+    cutTargets = 0,
+    cutDirectTriggers = 0,
+    cutDenied = 0,
     battleResumes = 0,
     battleResumeDrops = 0,
     twoFingerGestures = 0,
@@ -364,9 +379,6 @@ local state = {
     startMenuInsideATaps = 0,
     desktopATaps = 0,
     desktopBTaps = 0,
-    shakeBTriggers = 0,
-    sensorInitAttempts = 0,
-    sensorUnavailable = 0,
     cancellations = 0,
   },
 }
@@ -389,6 +401,44 @@ local function msToTicks(ms, fallback)
   if not value then value = fallback end
   value = math.max(1, value)
   return math.max(1, math.floor(value * FIXED_TICKS_PER_SECOND / 1000 + 0.5))
+end
+
+function ControlsFree.pathBudgetProfile()
+  local name = tostring(option("pathfinding_budget",
+    ControlsFree.DEFAULT_PATH_BUDGET) or ControlsFree.DEFAULT_PATH_BUDGET):lower()
+
+  -- v1.4.5-v1.4.7 exposed LOW and HIGH. Keep old saves deterministic after
+  -- simplifying the public ladder to VERY LOW / MEDIUM / FULL.
+  if name == "low" then
+    name = "very_low"
+  elseif name == "high" then
+    name = "medium"
+  end
+
+  local profile = ControlsFree.pathBudgetProfiles[name]
+  if not profile then
+    name = ControlsFree.DEFAULT_PATH_BUDGET
+    profile = ControlsFree.pathBudgetProfiles[name]
+  end
+  return profile, name
+end
+
+function ControlsFree.pathExpansionLimit(overview)
+  local full = math.max(1, (tonumber(overview and overview.width) or 0)
+                           * (tonumber(overview and overview.height) or 0) * 2)
+  local profile = ControlsFree.pathBudgetProfile()
+  local nodes = profile and tonumber(profile.nodes) or nil
+  return nodes and math.min(full, math.max(1, nodes)) or full
+end
+
+function ControlsFree.recordPathSearch(expanded, maxExpanded, budgetHit)
+  expanded = tonumber(expanded) or 0
+  state.stats.pathSearches = (state.stats.pathSearches or 0) + 1
+  state.stats.pathExpanded = (state.stats.pathExpanded or 0) + expanded
+  state.stats.pathMaxExpanded = math.max(state.stats.pathMaxExpanded or 0, expanded)
+  if budgetHit then
+    state.stats.pathBudgetHits = (state.stats.pathBudgetHits or 0) + 1
+  end
 end
 
 function ControlsFree.holdSteerBaseDelayMs()
@@ -439,10 +489,7 @@ local function holdRefreshTicks()
 end
 
 local function previewRefreshTicks()
-  local rate = tostring(option("voxel_path_rate", DEFAULT_VOXEL_PATH_RATE)
-                         or DEFAULT_VOXEL_PATH_RATE)
-  return VOXEL_PATH_RATE_TICKS[rate]
-      or VOXEL_PATH_RATE_TICKS[DEFAULT_VOXEL_PATH_RATE]
+  return ControlsFree.VOXEL_PATH_REFRESH_TICKS
 end
 
 local function key(x, y)
@@ -691,8 +738,15 @@ end
 -- Returns three sets: all occupied cells, cells occupied by actors that can
 -- move away (wandering or currently moving), and static blocking entities.
 local function liveOccupancy(game)
-  local all, dynamic, static = {}, {}, {}
   local ow = game and game.overworld
+  local cache = ControlsFree.occupancyCache
+  if cache and cache.tick == state.tick and cache.ow == ow
+      and cache.npcs == (ow and ow.npcs) then
+    state.stats.occupancyCacheHits = (state.stats.occupancyCacheHits or 0) + 1
+    return cache.all, cache.dynamic, cache.static
+  end
+
+  local all, dynamic, static = {}, {}, {}
   for _, entity in ipairs((ow and ow.npcs) or {}) do
     if not entity.passable then
       local isDynamic = entity.wanders == true or entity.moving == true
@@ -708,6 +762,13 @@ local function liveOccupancy(game)
       add(entity.targetX, entity.targetY)
     end
   end
+
+  ControlsFree.occupancyCache = {
+    tick = state.tick, ow = ow, npcs = ow and ow.npcs,
+    all = all, dynamic = dynamic, static = static,
+  }
+  state.stats.occupancyCacheMisses =
+    (state.stats.occupancyCacheMisses or 0) + 1
   return all, dynamic, static
 end
 
@@ -823,6 +884,39 @@ local function entityInteraction(entity, x, y)
   }
 end
 
+-- Secret treasure remains invisible to generic semantic scans. It becomes an
+-- interaction only when the player explicitly taps ITS exact world cell.
+-- This mirrors OverworldState:tryHiddenObject without calling it remotely:
+-- normal A at arrival is still what actually awards the item/coins and marks
+-- save.hiddenTaken.
+local function hiddenTreasureInteractionAt(game, mapId, x, y)
+  local field = game and game.data and game.data.field
+  local save = game and game.save
+  if not (field and save and mapId and type(x) == "number" and type(y) == "number") then
+    return nil
+  end
+  local takenKey = mapId .. "_" .. x .. "_" .. y
+  if save.hiddenTaken and save.hiddenTaken[takenKey] then return nil end
+
+  local function exact(bucket, kind)
+    local rows = type(bucket) == "table" and bucket[mapId] or nil
+    if type(rows) ~= "table" then return nil end
+    for _, row in ipairs(rows) do
+      if tonumber(row.x) == x and tonumber(row.y) == y then
+        return {
+          kind = kind,
+          x = x, y = y, mapId = mapId,
+          clickedX = x, clickedY = y,
+          hiddenTreasure = true,
+        }
+      end
+    end
+  end
+
+  return exact(field.hiddenItems, "hidden_item")
+      or exact(field.hiddenCoins, "hidden_coins")
+end
+
 local function interactionAt(game, x, y)
   local ow = game and game.overworld
   if not ow then return nil end
@@ -923,6 +1017,84 @@ local function cleanupTempBlocks(nav, dynamicNow)
       nav.tempBlocked[k] = nil
     end
   end
+end
+
+-- CUT route support -----------------------------------------------------------
+-- Cache only geometry, never eligibility. partyKnows("CUT") remains the live
+-- authority for Cascade Badge + party move + fieldmove.eligibility hooks.
+ControlsFree.cutGeometryCache = ControlsFree.cutGeometryCache
+  or setmetatable({}, { __mode = "k" })
+
+function ControlsFree.cutEligible(game)
+  local ow = game and game.overworld
+  return ow and type(ow.partyKnows) == "function"
+      and ow:partyKnows("CUT") ~= nil
+end
+
+function ControlsFree.cuttableCells(game, map, overview)
+  if not (ControlsFree.cutEligible(game) and map and overview
+      and map.def and type(map.cellTile) == "function"
+      and type(map.blockAt) == "function"
+      and type(map.isWalkableCell) == "function") then
+    return nil
+  end
+  local ts = map.def.tileset
+  if ts ~= "OVERWORLD" and ts ~= "GYM" then return nil end
+
+  local ow = game and game.overworld
+  local cuts = ow and ow.cutBlocks and ow.cutBlocks[map.id] or nil
+  local cutCount = type(cuts) == "table" and #cuts or 0
+  local swaps = game and game.data and game.data.field
+      and game.data.field.cutTreeSwaps
+  if type(swaps) ~= "table" then return nil end
+
+  local cached = ControlsFree.cutGeometryCache[map]
+  if cached and cached.cutCount == cutCount and cached.swaps == swaps
+      and cached.width == overview.width and cached.height == overview.height then
+    return cached.cells
+  end
+
+  local before = {}
+  for _, sw in ipairs(swaps) do
+    if sw.before ~= nil then before[sw.before] = true end
+  end
+
+  local cells = {}
+  local wantedTile = ts == "OVERWORLD" and 0x3d or 0x50
+  for y = 0, overview.height - 1 do
+    for x = 0, overview.width - 1 do
+      local okTile, tile = pcall(map.cellTile, map, x, y)
+      if okTile and tile == wantedTile then
+        local okWalk, walkable = pcall(map.isWalkableCell, map, x, y)
+        local okBlock, block = pcall(map.blockAt, map,
+          math.floor(x / 2), math.floor(y / 2))
+        if okWalk and okBlock and not walkable and before[block] then
+          cells[key(x, y)] = true
+        end
+      end
+    end
+  end
+
+  ControlsFree.cutGeometryCache[map] = {
+    cutCount = cutCount, swaps = swaps,
+    width = overview.width, height = overview.height, cells = cells,
+  }
+  return cells
+end
+
+function ControlsFree.cuttableAt(game, map, overview, x, y)
+  local cells = ControlsFree.cuttableCells(game, map, overview)
+  return cells and cells[key(x, y)] == true or false
+end
+
+function ControlsFree.cutInteractionAt(game, map, overview, x, y)
+  if not ControlsFree.cuttableAt(game, map, overview, x, y) then return nil end
+  return {
+    kind = "cut_tree", x = x, y = y,
+    mapId = map and map.id,
+    clickedX = x, clickedY = y,
+    cutTarget = true,
+  }
 end
 
 local function passable(overview, x, y, goalX, goalY, waterMode,
@@ -1056,8 +1228,7 @@ local function findPath(overview, sx, sy, gx, gy, waterMode,
 
   -- A map overview is finite, but a conservative expansion cap protects a
   -- malformed custom map from turning one tap into an unbounded search.
-  local maxExpanded = math.max(1, (tonumber(overview.width) or 0)
-                                   * (tonumber(overview.height) or 0) * 2)
+  local maxExpanded = ControlsFree.pathExpansionLimit(overview)
   local expanded = 0
 
   while #open > 0 and expanded < maxExpanded do
@@ -1066,6 +1237,7 @@ local function findPath(overview, sx, sy, gx, gy, waterMode,
       expanded = expanded + 1
       if cur.k == goalKey then
         local path = reconstruct(cameFrom, cameVia, goalKey)
+        ControlsFree.recordPathSearch(expanded, maxExpanded, false)
         return path
       end
 
@@ -1117,6 +1289,8 @@ local function findPath(overview, sx, sy, gx, gy, waterMode,
     end
   end
 
+  ControlsFree.recordPathSearch(
+    expanded, maxExpanded, expanded >= maxExpanded and #open > 0)
   return nil
 end
 
@@ -1156,8 +1330,7 @@ local function findClosestReachablePath(overview, sx, sy, desiredX, desiredY,
   heapPush(open, { x=sx, y=sy, g=0, h=0, f=0, k=startKey, seq=seq })
 
   local bestKey, bestDist, bestCost, bestSeq
-  local maxExpanded = math.max(1, (tonumber(overview.width) or 0)
-                                   * (tonumber(overview.height) or 0) * 2)
+  local maxExpanded = ControlsFree.pathExpansionLimit(overview)
   local expanded = 0
 
   while #open > 0 and expanded < maxExpanded do
@@ -1210,6 +1383,8 @@ local function findClosestReachablePath(overview, sx, sy, desiredX, desiredY,
     end
   end
 
+  ControlsFree.recordPathSearch(
+    expanded, maxExpanded, expanded >= maxExpanded and #open > 0)
   if not bestKey then return nil end
   local bx, by = parseKey(bestKey)
   return reconstruct(cameFrom, cameVia, bestKey), bx, by, bestDist
@@ -1326,6 +1501,158 @@ local function currentWaterMode(game, overview, cur)
   return cellChar(overview, cur.x, cur.y) == "~"
 end
 
+-- Whether a NEW water leg may be planned from the player's current live state.
+-- Delegate eligibility to Gen1Recomp: partyKnows("SURF") owns the badge +
+-- learned-move check (and fieldmove.eligibility hooks), while the overworld
+-- owns forced-bike and Seafoam-current restrictions.
+function ControlsFree.seamlessSurfEligible(game)
+  local ow = game and game.overworld
+  local p = ow and ow.player
+  if not (ow and p) then return false end
+  if p.surfing then return true end
+  if type(ow.partyKnows) ~= "function" or not ow:partyKnows("SURF") then
+    return false
+  end
+  if game.save and game.save.forcedBike then return false end
+  if type(ow.surfBlockedHere) == "function" and ow:surfBlockedHere() then
+    return false
+  end
+  return true
+end
+
+function ControlsFree.routeWaterMode(game, overview, cur)
+  return currentWaterMode(game, overview, cur)
+      or ControlsFree.seamlessSurfEligible(game)
+end
+
+-- Mount Surf without the party-menu text/white-flash ceremony. This is called
+-- only after the next planned cell is water and the normal direction-facing
+-- sequence has settled. The engine's own side-effect-free field-move check is
+-- asked one last time, then we apply the same persistent Surf state that
+-- OverworldState:trySurf applies before its automatic first step.
+function ControlsFree.mountSurfSeamlessly(game)
+  local ow = game and game.overworld
+  local p = ow and ow.player
+  if not (ow and p) then return false, "no_overworld" end
+  if p.surfing then return true end
+  if not ControlsFree.seamlessSurfEligible(game) then
+    return false, "ineligible"
+  end
+
+  if type(ow.useSurfFieldMove) == "function" then
+    local ok, status = pcall(ow.useSurfFieldMove, ow)
+    if not ok then return false, "check_error" end
+    if status ~= "ok" then return false, tostring(status or "rejected") end
+  end
+
+  p.surfing = true
+  if game.save then game.save.onBike = false end
+  if type(ow.syncSurfingPikachu) == "function" then
+    pcall(ow.syncSurfingPikachu, ow)
+  end
+  local okMusic, Music = pcall(require, "src.core.Music")
+  if okMusic and Music then
+    if ow.map and type(Music.playMap) == "function" then
+      pcall(Music.playMap, game.data, ow.map.id, false, true)
+    elseif type(Music.setSurfing) == "function" then
+      pcall(Music.setSurfing, game.data, true)
+    end
+  end
+  state.stats.seamlessSurfMounts =
+    (state.stats.seamlessSurfMounts or 0) + 1
+  return true
+end
+
+-- PC-style facing discipline for the first land -> water edge:
+-- neutral poll -> turn -> verify -> settle -> mount. No D-pad is left held
+-- while the player is still on land, so the engine never gets a chance to
+-- bonk into water and teach the route a false blocked edge.
+function ControlsFree.prepareSeamlessSurfStep(game, nav, dir)
+  local ow = game and game.overworld
+  local p = ow and ow.player
+  if not (p and nav and dir) then return "failed", "no_player" end
+  if p.surfing then
+    nav.surfFaceNeutralTick, nav.surfFacePressTick = nil, nil
+    return "ready"
+  end
+  if not ControlsFree.seamlessSurfEligible(game) then
+    state.stats.seamlessSurfDenied =
+      (state.stats.seamlessSurfDenied or 0) + 1
+    return "failed", "ineligible"
+  end
+
+  if p.facing ~= dir then
+    if nav.phase == "FACING_SURF" and nav.surfFacePressTick then
+      if state.tick - nav.surfFacePressTick <= 2 then return "waiting" end
+      releaseHold(nav)
+      nav.surfFacePressTick = nil
+      nav.surfFaceNeutralTick = state.tick
+      nav.surfFaceRetries = (nav.surfFaceRetries or 0) + 1
+      if nav.surfFaceRetries > 2 then return "failed", "face_failed" end
+      setPhase(nav, "WAITING_SURF_FACE_NEUTRAL", "retry_surf_face")
+      return "waiting"
+    end
+
+    if nav.phase == "WAITING_SURF_FACE_NEUTRAL"
+        and nav.surfFaceNeutralTick
+        and nav.surfFaceNeutralTick < state.tick then
+      releaseHold(nav)
+      nav.holdDir = dir
+      nav.hold = mod.input:press(game, dir)
+      nav.surfFacePressTick = state.tick
+      state.stats.seamlessSurfFaceTurns =
+        (state.stats.seamlessSurfFaceTurns or 0) + 1
+      setPhase(nav, "FACING_SURF", "turn_to_surf_" .. dir)
+      return "waiting"
+    end
+
+    releaseHold(nav)
+    nav.surfFaceNeutralTick = state.tick
+    nav.surfFacePressTick = nil
+    nav.surfFaceRetries = nav.surfFaceRetries or 0
+    setPhase(nav, "WAITING_SURF_FACE_NEUTRAL", "neutral_before_surf_" .. dir)
+    return "waiting"
+  end
+
+  if nav.phase == "FACING_SURF" then
+    releaseHold(nav)
+    nav.surfFacePressTick = nil
+    nav.surfFaceVerifiedTick = state.tick
+    setPhase(nav, "WAITING_SURF_FACE_SETTLE", "surf_facing_verified")
+    return "waiting"
+  end
+
+  if nav.phase == "WAITING_SURF_FACE_SETTLE" then
+    releaseHold(nav)
+    if p.facing ~= dir then
+      nav.surfFaceNeutralTick = state.tick
+      setPhase(nav, "WAITING_SURF_FACE_NEUTRAL", "surf_facing_changed")
+      return "waiting"
+    end
+    if tonumber(p.turnTimer or 0) > 0 then return "waiting" end
+    if nav.surfFaceVerifiedTick and nav.surfFaceVerifiedTick >= state.tick then
+      return "waiting"
+    end
+  elseif tonumber(p.turnTimer or 0) > 0 then
+    releaseHold(nav)
+    nav.surfFaceVerifiedTick = state.tick
+    setPhase(nav, "WAITING_SURF_FACE_SETTLE", "settle_before_surf")
+    return "waiting"
+  end
+
+  releaseHold(nav)
+  local ok, why = ControlsFree.mountSurfSeamlessly(game)
+  if not ok then
+    state.stats.seamlessSurfDenied =
+      (state.stats.seamlessSurfDenied or 0) + 1
+    return "failed", why
+  end
+  nav.surfFaceNeutralTick, nav.surfFacePressTick = nil, nil
+  nav.surfFaceVerifiedTick, nav.surfFaceRetries = nil, nil
+  setPhase(nav, "WALKING", "surf_mounted")
+  return "ready"
+end
+
 local function scheduleDynamicWait(nav, reason)
   releaseHold(nav)
   if not nav.dynamicWaitStarted then
@@ -1389,8 +1716,9 @@ local function buildPath(game, nav, cur)
 
   local occupied, dynamic, static = liveOccupancy(game)
   cleanupTempBlocks(nav, dynamic)
-  local waterMode = currentWaterMode(game, overview, cur)
-  local topology = ledgeTopology(game, game.overworld and game.overworld.map, overview)
+  local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
+  local activeMap = game.overworld and game.overworld.map
+  local topology = ledgeTopology(game, activeMap, overview)
   local blockedEdges = mergeBlockedEdges(nav.blockedEdges, topology.blockedEdges)
   local allowExitGoal = nav.goalKind == "exit" and nav.exitIntent ~= nil
     and nav.exitDir ~= nil
@@ -1424,6 +1752,16 @@ local function buildPath(game, nav, cur)
   end
 
   nav.path = path
+  if game and game.overworld and game.overworld.player
+      and not game.overworld.player.surfing then
+    for _, node in ipairs(path or {}) do
+      if cellChar(overview, node.x, node.y) == "~" then
+        state.stats.seamlessSurfPlans =
+          (state.stats.seamlessSurfPlans or 0) + 1
+        break
+      end
+    end
+  end
   nav.index = 1
   nav.lastX, nav.lastY = cur.x, cur.y
   nav.lastProgressTick = state.tick
@@ -1441,8 +1779,9 @@ local function buildNearestLegalPath(game, nav, cur, desiredX, desiredY)
 
   local occupied, dynamic, static = liveOccupancy(game)
   cleanupTempBlocks(nav, dynamic)
-  local waterMode = currentWaterMode(game, overview, cur)
-  local topology = ledgeTopology(game, game.overworld and game.overworld.map, overview)
+  local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
+  local activeMap = game.overworld and game.overworld.map
+  local topology = ledgeTopology(game, activeMap, overview)
   local blockedEdges = mergeBlockedEdges(nav.blockedEdges, topology.blockedEdges)
 
   local path, tx, ty = findClosestReachablePath(
@@ -1481,7 +1820,7 @@ local function bestInteractionApproach(game, nav, cur, overview, occupied, topol
   local interaction = nav.interaction
   local ix, iy, entity, err = interactionTarget(game, interaction)
   if not ix then return nil, err or "gone" end
-  local waterMode = currentWaterMode(game, overview, cur)
+  local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
   local best
 
   -- The player-avatar rescue is intentionally NOT a navigation request.  The
@@ -1515,10 +1854,17 @@ local function bestInteractionApproach(game, nav, cur, overview, occupied, topol
     end
     if not candidateTerrainOK(overview, cx, cy, waterMode) then return end
     local blockedEdges = mergeBlockedEdges(nav.blockedEdges, topology and topology.blockedEdges)
+    local approachBlocked = nav.blockedCells
+    if interaction.cutTarget then
+      approachBlocked = copyFlat(nav.blockedCells)
+      approachBlocked[key(ix, iy)] = true
+    end
     local path = findPath(overview, cur.x, cur.y, cx, cy, waterMode,
-                          occupied, nav.tempBlocked, blockedEdges, nav.blockedCells,
+                          occupied, nav.tempBlocked, blockedEdges, approachBlocked,
                           topology and topology.jumps)
-    if not path then return end
+    state.stats.exitCandidatesPathScored =
+      (state.stats.exitCandidatesPathScored or 0) + 1
+    if not path then return false end
     local cand = { x = cx, y = cy, faceDir = faceDir, counter = counter,
                    path = path, cost = #path, rank = rank }
     if not best or cand.cost < best.cost
@@ -1615,16 +1961,58 @@ local function seamSourceCells(cross, overview)
   return out
 end
 
+function ControlsFree.budgetedSeamSourceCells(cross, overview, cur, targetX, targetY)
+  local cells = seamSourceCells(cross, overview)
+  local profile = ControlsFree.pathBudgetProfile()
+  local limit = profile and tonumber(profile.seams) or nil
+  if not limit or #cells <= limit then
+    state.stats.seamCandidatesConsidered =
+      (state.stats.seamCandidatesConsidered or 0) + #cells
+    return cells
+  end
+
+  for i, cell in ipairs(cells) do
+    local lx, ly = seamLanding(cross, cell.x, cell.y)
+    local sourceDist = cur
+      and (math.abs(cell.x - cur.x) + math.abs(cell.y - cur.y)) or 0
+    local destDist = (type(targetX) == "number" and type(targetY) == "number")
+      and (math.abs(lx - targetX) + math.abs(ly - targetY)) or 0
+    cell._budgetScore = sourceDist + destDist
+    cell._budgetOrder = i
+  end
+  table.sort(cells, function(a, b)
+    if a._budgetScore ~= b._budgetScore then
+      return a._budgetScore < b._budgetScore
+    end
+    return a._budgetOrder < b._budgetOrder
+  end)
+
+  local out = {}
+  for i = 1, math.min(limit, #cells) do
+    local cell = cells[i]
+    cell._budgetScore, cell._budgetOrder = nil, nil
+    out[#out + 1] = cell
+  end
+  state.stats.seamCandidatesConsidered =
+    (state.stats.seamCandidatesConsidered or 0) + #out
+  state.stats.seamCandidatesSkipped =
+    (state.stats.seamCandidatesSkipped or 0) + (#cells - #out)
+  return out
+end
+
 local function chooseCrossSeam(game, nav, cur, occupancy)
   local cross = nav.cross
   local overview = mod.world and mod.world:mapOverview()
   if not cross or not overview or overview.mapId ~= cross.sourceMapId then return nil end
-  local waterMode = currentWaterMode(game, overview, cur)
-  local sourceTopology = ledgeTopology(game, game.overworld and game.overworld.map, overview)
+  local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
+  local sourceMap = game.overworld and game.overworld.map
+  local sourceTopology = ledgeTopology(game, sourceMap, overview)
   local sourceBlockedEdges = mergeBlockedEdges(nav.blockedEdges, sourceTopology.blockedEdges)
   local destTopology = ledgeTopology(game, cross.destMap, cross.destOverview)
   local best
-  for _, src in ipairs(seamSourceCells(cross, overview)) do
+  local seamCells = ControlsFree.budgetedSeamSourceCells(
+    cross, overview, cur, cross.targetX, cross.targetY)
+  for _, src in ipairs(seamCells) do
     local sx, sy = src.x, src.y
     local sch = cellChar(overview, sx, sy)
     -- Standing on a warp square just to leave through a connection creates
@@ -1705,7 +2093,7 @@ local function nearestReachableCrossTarget(game, cur, cross, desiredX, desiredY,
   local dest = cross and cross.destOverview
   local source = mod.world and mod.world:mapOverview()
   if not dest or not source then return nil end
-  local waterMode = currentWaterMode(game, source, cur)
+  local waterMode = ControlsFree.routeWaterMode(game, source, cur)
   local all, _, static = liveOccupancy(game)
   local maxR = (tonumber(dest.width) or 0) + (tonumber(dest.height) or 0)
 
@@ -3114,9 +3502,51 @@ end
 -- CERULEAN_TRASHED_HOUSE (3,0) could therefore lose its required UP even
 -- though Warp.onEdge would accept it. Return the UNION instead: edge direction
 -- is always authoritative, with any valid carpet directions added afterwards.
+function ControlsFree.engineWarpExtraCheck(game, map, x, y, dir)
+  if ControlsFree.engineWarpModule == false then
+    local ok, Warp = pcall(require, "src.world.Warp")
+    ControlsFree.engineWarpModule = ok and Warp or nil
+  end
+  local Warp = ControlsFree.engineWarpModule
+  if type(Warp) ~= "table" or type(Warp.extraCheck) ~= "function" then
+    return nil
+  end
+  local carpets = game and game.data and game.data.field
+      and game.data.field.warpCarpets
+  local ok, result = pcall(Warp.extraCheck, map, carpets, x, y, dir)
+  if not ok then return nil end
+  return result == true
+end
+
 local function warpActivationDirections(game, map, x, y)
   if not map then return {} end
   local dirs, seen = {}, {}
+
+  local function add(dir)
+    if not seen[dir] then
+      seen[dir] = true
+      dirs[#dirs + 1] = dir
+    end
+  end
+
+  -- Prefer the live engine's ExtraWarpCheck when exposed. If this host does
+  -- not provide src.world.Warp, retain the proven pre-v1.4.10 mirror below.
+  local engineAvailable = ControlsFree.engineWarpExtraCheck(
+    game, map, x, y, "up") ~= nil
+  if engineAvailable then
+    for _, d in ipairs(DIRS) do
+      if ControlsFree.engineWarpExtraCheck(game, map, x, y, d.name) then
+        add(d.name)
+      end
+    end
+    -- Warp.onEdge is independent of ExtraWarpCheck.
+    if y == 0 then add("up") end
+    if map.heightCells and y == map.heightCells - 1 then add("down") end
+    if x == 0 then add("left") end
+    if map.widthCells and x == map.widthCells - 1 then add("right") end
+    return dirs
+  end
+
   local carpets = game and game.data and game.data.field
       and game.data.field.warpCarpets
   local useCarpet = false
@@ -3131,22 +3561,11 @@ local function warpActivationDirections(game, map, x, y)
     end
   end
 
-  local function add(dir)
-    if not seen[dir] then
-      seen[dir] = true
-      dirs[#dirs + 1] = dir
-    end
-  end
-
-  -- Warp.onEdge is independent from ExtraWarpCheck / warpCarpets.
   if y == 0 then add("up") end
   if map.heightCells and y == map.heightCells - 1 then add("down") end
   if x == 0 then add("left") end
   if map.widthCells and x == map.widthCells - 1 then add("right") end
 
-  -- function2 carpet maps/tilesets additionally activate when the tile in
-  -- FRONT of the source matches the directional carpet table. Do not erase an
-  -- already-valid edge direction just because this second mechanism exists.
   if useCarpet then
     for _, d in ipairs(DIRS) do
       local dir = d.name
@@ -3250,8 +3669,16 @@ local function mapTransitionExitHops(game, destMapId)
 end
 
 local function actualWarpCells(map)
+  if not map then return {} end
+  local defs = map.def and map.def.warps or nil
+  local cache = ControlsFree.warpCellsCache[map]
+  if cache and cache.defs == defs and cache.count == #(defs or {}) then
+    state.stats.warpCacheHits = (state.stats.warpCacheHits or 0) + 1
+    return cache.cells
+  end
+
   local out, seen = {}, {}
-  for i, w in ipairs((map and map.def and map.def.warps) or {}) do
+  for i, w in ipairs(defs or {}) do
     local x, y = tonumber(w.x), tonumber(w.y)
     if x and y then
       x, y = math.floor(x), math.floor(y)
@@ -3262,6 +3689,10 @@ local function actualWarpCells(map)
       end
     end
   end
+  ControlsFree.warpCellsCache[map] = {
+    defs = defs, count = #(defs or {}), cells = out,
+  }
+  state.stats.warpCacheMisses = (state.stats.warpCacheMisses or 0) + 1
   return out
 end
 
@@ -3395,7 +3826,7 @@ local function directConnectionExitIntents(game, overview, cur)
   end
 
   local all, dynamic, static = liveOccupancy(game)
-  local waterMode = currentWaterMode(game, overview, cur)
+  local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
   local sourceTopology = ledgeTopology(game, current, overview)
   local warpKeys = {}
   for _, w in ipairs(actualWarpCells(current)) do warpKeys[key(w.x,w.y)] = true end
@@ -3440,7 +3871,8 @@ local function directConnectionExitIntents(game, overview, cur)
     -- Ordinary seamless seam: path to one source-edge cell, then one D-pad
     -- step out.  Skip any source cell that is itself an actual warp record,
     -- including plain-floor carpets not visible as '+' in mapOverview.
-    for _, src in ipairs(seamSourceCells(crossBase, overview)) do
+    for _, src in ipairs(
+        ControlsFree.budgetedSeamSourceCells(crossBase, overview, cur)) do
       local sch = cellChar(overview, src.x, src.y)
       if sch and sch ~= "+" and not warpKeys[key(src.x,src.y)] then
         local lx, ly = seamLanding(crossBase, src.x, src.y)
@@ -3482,6 +3914,47 @@ end
 -- '+' cells from mapOverview: Gen I interior exit carpets are warp records on
 -- ordinary-looking floor cells and only fire when the player then walks off
 -- the edge / into the carpet direction.
+function ControlsFree.smartExitCandidateLimit()
+  local profile = ControlsFree.pathBudgetProfile()
+  return profile and tonumber(profile.exits) or nil
+end
+
+function ControlsFree.rankSmartExitWarpsCheap(game, map, warps, cur,
+    directionalGate, wantedExitDirs, intentX, intentY)
+  local ranked = {}
+  for _, dst in ipairs(warps or {}) do
+    local dirs = preDirs or warpActivationDirections(game, map, dst.x, dst.y)
+    local directedExit = directionalGate
+      and ControlsFree.firstMatchingDirection(dirs, wantedExitDirs) or nil
+    if not directionalGate or directedExit then
+      local clickDistance = 0
+      if type(intentX) == "number" and type(intentY) == "number" then
+        local dx, dy = (dst.x + 0.5) - intentX, (dst.y + 0.5) - intentY
+        clickDistance = dx * dx + dy * dy
+      end
+      local playerDistance = cur
+        and (math.abs(dst.x - cur.x) + math.abs(dst.y - cur.y)) or 0
+      ranked[#ranked + 1] = {
+        dst = dst, dirs = dirs, directedExit = directedExit,
+        clickDistance = clickDistance, playerDistance = playerDistance,
+      }
+    end
+  end
+  table.sort(ranked, function(a,b)
+    if math.abs(a.clickDistance - b.clickDistance) > 0.0001 then
+      return a.clickDistance < b.clickDistance
+    end
+    if a.playerDistance ~= b.playerDistance then
+      return a.playerDistance < b.playerDistance
+    end
+    if a.dst.y ~= b.dst.y then return a.dst.y < b.dst.y end
+    return a.dst.x < b.dst.x
+  end)
+  state.stats.exitCandidatesCheap =
+    (state.stats.exitCandidatesCheap or 0) + #ranked
+  return ranked
+end
+
 local function nearestExitTarget(game, overview, cur, intentX, intentY)
   local ow = game and game.overworld
   local map = ow and ow.map
@@ -3499,16 +3972,17 @@ local function nearestExitTarget(game, overview, cur, intentX, intentY)
   local candidates = {}
   local warps = actualWarpCells(map)
   local all, dynamic, static = liveOccupancy(game)
-  local waterMode = currentWaterMode(game, overview, cur)
+  local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
   local topology = ledgeTopology(game, map, overview)
 
   local warpKeys = {}
   for _, w in ipairs(warps) do warpKeys[key(w.x,w.y)] = true end
 
-  local function pathToWarp(dst, occupied, dynamicOnly)
+  local function pathToWarp(dst, occupied, dynamicOnly,
+      preDirs, preDirectedExit, preClickDistance)
     if dst.x < 0 or dst.y < 0
         or dst.x >= overview.width or dst.y >= overview.height then
-      return
+      return false
     end
     local blocked = {}
     -- A real warp record may live on a plain '.' carpet cell, which means the
@@ -3523,9 +3997,11 @@ local function nearestExitTarget(game, overview, cur, intentX, intentY)
     -- candidate for a click above/right/left of the room, even if it is the
     -- nearest warp to the player. This happens BEFORE path scoring so an
     -- opposite-side exit can never win later through walking cost or rank.
-    local directedExit = directionalGate
-      and ControlsFree.firstMatchingDirection(dirs, wantedExitDirs) or nil
-    if directionalGate and not directedExit then return end
+    local directedExit = preDirectedExit
+    if directionalGate and directedExit == nil then
+      directedExit = ControlsFree.firstMatchingDirection(dirs, wantedExitDirs)
+    end
+    if directionalGate and not directedExit then return false end
 
     -- Only directional warp sources (edge/carpet semantics) may need the
     -- special non-walkable endpoint exception. Ordinary arrival warps must
@@ -3545,8 +4021,9 @@ local function nearestExitTarget(game, overview, cur, intentX, intentY)
       exitDir = dirs[1]
     end
 
-    local clickDistance
-    if type(intentX) == "number" and type(intentY) == "number" then
+    local clickDistance = preClickDistance
+    if clickDistance == nil and type(intentX) == "number"
+        and type(intentY) == "number" then
       local dx, dy = (dst.x + 0.5) - intentX, (dst.y + 0.5) - intentY
       clickDistance = dx * dx + dy * dy
     end
@@ -3565,9 +4042,38 @@ local function nearestExitTarget(game, overview, cur, intentX, intentY)
         or (exitDir == "right" and map.widthCells and dst.x == map.widthCells - 1)),
       warpDef = dst.def,
     }
+    return true
   end
 
-  for _, dst in ipairs(warps) do pathToWarp(dst, all, false) end
+  if directionalGate then
+    local rankedWarps = ControlsFree.rankSmartExitWarpsCheap(
+      game, map, warps, cur, true, wantedExitDirs, intentX, intentY)
+    local limit = ControlsFree.smartExitCandidateLimit()
+    local firstCount = limit and math.min(limit, #rankedWarps) or #rankedWarps
+    for i = 1, firstCount do
+      local item = rankedWarps[i]
+      pathToWarp(item.dst, all, false,
+        item.dirs, item.directedExit, item.clickDistance)
+    end
+    -- If the cheap front slice contained no reachable warp, progressively
+    -- fall through to the remaining candidates. This preserves reachability
+    -- while keeping the common successful case bounded.
+    if #candidates == 0 and firstCount < #rankedWarps then
+      state.stats.exitCandidatesDeferred =
+        (state.stats.exitCandidatesDeferred or 0) + (#rankedWarps - firstCount)
+      for i = firstCount + 1, #rankedWarps do
+        local item = rankedWarps[i]
+        if pathToWarp(item.dst, all, false,
+            item.dirs, item.directedExit, item.clickDistance) then
+          break
+        end
+      end
+    end
+  else
+    -- Automated multi-floor exit journeys keep exhaustive scoring because no
+    -- pointer direction exists to safely prune candidates.
+    for _, dst in ipairs(warps) do pathToWarp(dst, all, false) end
+  end
 
   local hasImmediateWarp = false
   for _, c in ipairs(candidates) do
@@ -3577,7 +4083,28 @@ local function nearestExitTarget(game, overview, cur, intentX, intentY)
     end
   end
   if not hasImmediateWarp then
-    for _, dst in ipairs(warps) do pathToWarp(dst, static, true) end
+    if directionalGate then
+      local rankedWarps = ControlsFree.rankSmartExitWarpsCheap(
+        game, map, warps, cur, true, wantedExitDirs, intentX, intentY)
+      local limit = ControlsFree.smartExitCandidateLimit()
+      local count = limit and math.min(limit, #rankedWarps) or #rankedWarps
+      for i = 1, count do
+        local item = rankedWarps[i]
+        pathToWarp(item.dst, static, true,
+          item.dirs, item.directedExit, item.clickDistance)
+      end
+      if #candidates == 0 and count < #rankedWarps then
+        for i = count + 1, #rankedWarps do
+          local item = rankedWarps[i]
+          if pathToWarp(item.dst, static, true,
+              item.dirs, item.directedExit, item.clickDistance) then
+            break
+          end
+        end
+      end
+    else
+      for _, dst in ipairs(warps) do pathToWarp(dst, static, true) end
+    end
   end
 
   for _, c in ipairs(directConnectionExitIntents(game, overview, cur)) do
@@ -3692,6 +4219,8 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       local currentMap = game and game.overworld and game.overworld.map
       if not semanticBehind and tx and ty then
         semanticBehind = interactionAt(game, tx, ty) ~= nil
+          or hiddenTreasureInteractionAt(game, cur and cur.mapId, tx, ty) ~= nil
+          or ControlsFree.cutInteractionAt(game, currentMap, overview, tx, ty) ~= nil
           or warpIntentAt(game, currentMap, cur, tx, ty) ~= nil
         if not semanticBehind and ControlsFree.directionalWarpIntentAt then
           semanticBehind =
@@ -3874,7 +4403,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     end
 
     local targetChar = cellChar(cross.destOverview, tx, ty)
-    local waterMode = currentWaterMode(game, overview, cur)
+    local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
     local legalMovement = targetChar == "."
       or (targetChar == "~" and waterMode)
     local crossWarpIntent = warpIntentAt(game, cross.destMap, nil, tx, ty)
@@ -3954,8 +4483,20 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       or warpIntentAt(game, game and game.overworld and game.overworld.map,
                       cur, tx, ty)
     local forcedInteraction = targetMeta and targetMeta.forcedInteraction or nil
-    local rawInteraction = forcedInteraction or (option("interact", true) ~= false
-      and interactionAt(game, tx, ty) or nil)
+    local exactHiddenTreasure = option("interact", true) ~= false
+      and hiddenTreasureInteractionAt(game, cur.mapId, tx, ty) or nil
+    local cutInteraction = option("interact", true) ~= false
+      and ControlsFree.cutInteractionAt(
+        game, game.overworld and game.overworld.map, overview, tx, ty) or nil
+    local rawInteraction = forcedInteraction or exactHiddenTreasure or cutInteraction
+      or (option("interact", true) ~= false and interactionAt(game, tx, ty) or nil)
+    if cutInteraction and rawInteraction == cutInteraction then
+      state.stats.cutTargets = (state.stats.cutTargets or 0) + 1
+    end
+    if exactHiddenTreasure and rawInteraction == exactHiddenTreasure then
+      state.stats.hiddenTreasureTargets =
+        (state.stats.hiddenTreasureTargets or 0) + 1
+    end
     local directionalWarpOwnsCell = selectedWarpIntent ~= nil
       and selectedWarpIntent.exitDir ~= nil
       and forcedInteraction == nil
@@ -3990,7 +4531,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       buildStatus, buildWhy = rebuildNavigation(game, candidate, cur)
     else
       local ch = cellChar(overview, tx, ty)
-      local waterMode = currentWaterMode(game, overview, cur)
+      local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
       local directWarpIntent = selectedWarpIntent
       local activeExitIntent = exitIntent or directWarpIntent
       local legalMovement = ch == "." or (ch == "~" and waterMode)
@@ -4411,7 +4952,37 @@ local function interactionAtDestination(game, nav, cur)
   end
 
   releaseHold(nav)
+  if interaction.cutTarget then
+    local ow = game and game.overworld
+    local okCheck, status = false, nil
+    if ow and type(ow.useCutFieldMove) == "function" then
+      okCheck, status = pcall(ow.useCutFieldMove, ow)
+    end
+    -- Avoid any custom "success" shortcut: tryCut owns the real Gen I text,
+    -- block swap, animation and SFX. The only acceptable preflight is "ok".
+    if status ~= "ok" or not ow or type(ow.tryCut) ~= "function" then
+      state.stats.cutDenied = (state.stats.cutDenied or 0) + 1
+      cancelRoute("cut_direct_rejected_" .. tostring(status or "no_api"))
+      return true
+    end
+    local okCut, started = pcall(ow.tryCut, ow, ix, iy)
+    if not okCut or started ~= true then
+      state.stats.cutDenied = (state.stats.cutDenied or 0) + 1
+      cancelRoute("cut_direct_failed")
+      return true
+    end
+    nav.interaction = nil
+    nav.cutWait = { x = ix, y = iy, direct = true, startedTick = state.tick }
+    state.stats.cutDirectTriggers = (state.stats.cutDirectTriggers or 0) + 1
+    setPhase(nav, "WAITING_CUT_FLOW", "cut_direct_tree")
+    return true
+  end
+
   mod.input:tap(game, "a")
+  if interaction.hiddenTreasure then
+    state.stats.hiddenTreasureTriggers =
+      (state.stats.hiddenTreasureTriggers or 0) + 1
+  end
   state.pendingInteraction = {
     tick = state.tick,
     mapId = nav.mapId,
@@ -4480,7 +5051,7 @@ local function tryBattleResume(game)
   end
 
   local ch = cellChar(overview, resume.x, resume.y)
-  local waterMode = currentWaterMode(game, overview, cur)
+  local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
   if ch ~= "." and ch ~= "+" and not (ch == "~" and waterMode) then
     dropBattleResume("target_invalid")
     return false
@@ -4614,6 +5185,7 @@ local function navigationTick(game)
 
   local free, gateReason = overworldGate(game)
   if not free then
+    if nav.phase == "WAITING_CUT_FLOW" then return end
     cancelRoute("interrupt_" .. tostring(gateReason))
     return
   end
@@ -4621,6 +5193,65 @@ local function navigationTick(game)
   local cur = mod.world and mod.world:current()
   if not cur or cur.mapId ~= nav.mapId then
     cancelRoute("map_changed")
+    return
+  end
+
+  -- A connected-map seam may itself be the first land -> water edge.
+  -- Mount before the crossing input, using the destination overview's real
+  -- entry cell rather than guessing from the source shore tile.
+  if nav.cross and not nav.cross.crossed
+      and cur.x == nav.targetX and cur.y == nav.targetY
+      and nav.cross.destOverview and nav.cross.entryX and nav.cross.entryY
+      and cellChar(nav.cross.destOverview, nav.cross.entryX, nav.cross.entryY) == "~"
+      and game.overworld and game.overworld.player
+      and not game.overworld.player.surfing then
+    local surfState, surfWhy =
+      ControlsFree.prepareSeamlessSurfStep(game, nav, nav.cross.dir)
+    if surfState == "waiting" then return end
+    if surfState == "failed" then
+      cancelRoute("surf_cross_" .. tostring(surfWhy))
+      return
+    end
+  end
+
+  if nav.phase == "WAITING_CUT_FLOW" then
+    releaseHold(nav)
+    local ow = game and game.overworld
+    local wait = nav.cutWait
+    if not (ow and wait) then
+      cancelRoute("cut_wait_missing")
+      return
+    end
+    if ow.cutAnim then return end
+    if state.tick - (wait.startedTick or state.tick) > 600 then
+      cancelRoute("cut_flow_timeout")
+      return
+    end
+
+    local map = ow.map
+    local walkable = map and type(map.isWalkableCell) == "function"
+      and map:isWalkableCell(wait.x, wait.y) == true
+    if not walkable then return end
+
+    ControlsFree.cutGeometryCache[map] = nil
+    nav.cutWait = nil
+    if wait.direct then
+      finishRoute()
+      return
+    end
+
+    nav.path, nav.index = nil, 1
+    nav.lastX, nav.lastY = cur.x, cur.y
+    nav.lastProgressTick = state.tick
+    local ok, why = rebuildNavigation(game, nav, cur)
+    if not ok then
+      if why == "dynamic" then
+        scheduleDynamicWait(nav, "dynamic_after_cut")
+        return
+      end
+      cancelRoute("post_cut_plan_failed_" .. tostring(why))
+      return
+    end
     return
   end
 
@@ -4866,6 +5497,33 @@ local function navigationTick(game)
   if not dir then
     cancelRoute("non_adjacent_plan")
     return
+  end
+
+  local activeOverview = mod.world and mod.world:mapOverview()
+  local activeMap = game and game.overworld and game.overworld.map
+  local player = game and game.overworld and game.overworld.player
+
+  -- Seamless Surf must never claim an edge that already belongs to an
+  -- exit/warp journey. Some carpet exits can expose terrain classifications
+  -- that look water-like to the compact overview, but exit semantics must win.
+  local nextWarpIntent = activeMap
+    and warpIntentAt(game, activeMap, cur, nextNode.x, nextNode.y) or nil
+  local surfOwnsNextEdge = nav.goalKind ~= "exit"
+    and nav.exitIntent == nil
+    and nav.cross == nil
+    and nextWarpIntent == nil
+
+  if surfOwnsNextEdge and activeOverview and player and not player.surfing
+      and cellChar(activeOverview, nextNode.x, nextNode.y) == "~" then
+    local surfState, surfWhy =
+      ControlsFree.prepareSeamlessSurfStep(game, nav, dir)
+    if surfState == "waiting" then return end
+    if surfState == "failed" then
+      cancelRoute("surf_step_" .. tostring(surfWhy))
+      return
+    end
+    -- Mounted successfully. Continue below on the SAME planned edge; the
+    -- actual water entry is still ordinary synthetic D-pad movement.
   end
 
   if nav.hold and nav.holdDir == dir then
@@ -6468,228 +7126,6 @@ function ControlsFree.installTouchDialogueBridge(game)
   return true
 end
 
-function ControlsFree.shakeState()
-  if state.shake then return state.shake end
-  state.shake = {
-    backend = nil, attempted = false, unavailableCounted = false,
-    accel = nil, gyro = nil, gravity = nil, warmup = 0,
-    impulseArmed = true, lastImpulse = nil, cooldownUntil = 0,
-    lastStrength = 0,
-  }
-  return state.shake
-end
-
-function ControlsFree.initLoveSensorBackend(sh)
-  local sensor = love and love.sensor
-  if type(sensor) ~= "table" or type(sensor.hasSensor) ~= "function"
-      or type(sensor.setEnabled) ~= "function"
-      or type(sensor.getData) ~= "function" then
-    return false
-  end
-  local function enable(kind)
-    local okHas, has = pcall(sensor.hasSensor, kind)
-    if not okHas or not has then return false end
-    local okEnable = pcall(sensor.setEnabled, kind, true)
-    return okEnable
-  end
-  local accel = enable("accelerometer")
-  local gyro = enable("gyroscope")
-  if not accel and not gyro then return false end
-  sh.backend = "love.sensor"
-  sh.loveSensor = sensor
-  sh.accelAvailable = accel
-  sh.gyroAvailable = gyro
-  return true
-end
-
--- LÖVE 11.5 has no love.sensor module. Gen1Recomp also intentionally sets
--- t.accelerometerjoystick=false on Android, so reopening the old joystick
--- path would resurrect the tilt-to-walk bug. SDL2 already ships a separate
--- sensor subsystem; initialize only that subsystem and read it directly.
-function ControlsFree.initSdlSensorBackend(sh)
-  if ControlsFree.hostOS() ~= "Android" then return false end
-  local okFfi, ffi = pcall(require, "ffi")
-  if not okFfi or not ffi then return false end
-  pcall(ffi.cdef, [[
-    typedef struct TTM_SDL_Sensor TTM_SDL_Sensor;
-    int SDL_InitSubSystem(unsigned int flags);
-    int SDL_NumSensors(void);
-    int SDL_SensorGetDeviceType(int device_index);
-    TTM_SDL_Sensor *SDL_SensorOpen(int device_index);
-    int SDL_SensorGetData(TTM_SDL_Sensor *sensor, float *data, int num_values);
-    void SDL_SensorUpdate(void);
-    void SDL_SensorClose(TTM_SDL_Sensor *sensor);
-  ]])
-  local okInit, rc = pcall(function()
-    return tonumber(ffi.C.SDL_InitSubSystem(ControlsFree.SDL_INIT_SENSOR))
-  end)
-  if not okInit or not rc or rc < 0 then return false end
-
-  local okCount, count = pcall(function() return tonumber(ffi.C.SDL_NumSensors()) end)
-  if not okCount or not count or count <= 0 then return false end
-  local accel, gyro
-  for i = 0, count - 1 do
-    local okType, typ = pcall(function()
-      return tonumber(ffi.C.SDL_SensorGetDeviceType(i))
-    end)
-    if okType and typ == ControlsFree.SDL_SENSOR_ACCEL and accel == nil then
-      local okOpen, ptr = pcall(function() return ffi.C.SDL_SensorOpen(i) end)
-      if okOpen and ptr ~= nil then accel = ptr end
-    elseif okType and typ == ControlsFree.SDL_SENSOR_GYRO and gyro == nil then
-      local okOpen, ptr = pcall(function() return ffi.C.SDL_SensorOpen(i) end)
-      if okOpen and ptr ~= nil then gyro = ptr end
-    end
-  end
-  if accel == nil and gyro == nil then return false end
-  sh.backend = "SDL2 sensor FFI"
-  sh.ffi = ffi
-  sh.accel = accel
-  sh.gyro = gyro
-  sh.accelBuf = accel ~= nil and ffi.new("float[3]") or nil
-  sh.gyroBuf = gyro ~= nil and ffi.new("float[3]") or nil
-  sh.accelAvailable = accel ~= nil
-  sh.gyroAvailable = gyro ~= nil
-  return true
-end
-
-function ControlsFree.ensureMotionSensors()
-  local sh = ControlsFree.shakeState()
-  if sh.backend then return true end
-  if sh.attempted then return false end
-  sh.attempted = true
-  state.stats.sensorInitAttempts = (state.stats.sensorInitAttempts or 0) + 1
-  if ControlsFree.initLoveSensorBackend(sh) or ControlsFree.initSdlSensorBackend(sh) then
-    return true
-  end
-  if not sh.unavailableCounted then
-    sh.unavailableCounted = true
-    state.stats.sensorUnavailable = (state.stats.sensorUnavailable or 0) + 1
-  end
-  return false
-end
-
-function ControlsFree.readMotionSensors()
-  local sh = ControlsFree.shakeState()
-  if not sh.backend and not ControlsFree.ensureMotionSensors() then return nil, nil end
-  local accel, gyro
-  if sh.backend == "love.sensor" then
-    if sh.accelAvailable then
-      local ok, x, y, z = pcall(sh.loveSensor.getData, "accelerometer")
-      if ok and type(x) == "number" and type(y) == "number" and type(z) == "number" then
-        accel = { x, y, z }
-      end
-    end
-    if sh.gyroAvailable then
-      local ok, x, y, z = pcall(sh.loveSensor.getData, "gyroscope")
-      if ok and type(x) == "number" and type(y) == "number" and type(z) == "number" then
-        gyro = { x, y, z }
-      end
-    end
-  elseif sh.backend == "SDL2 sensor FFI" then
-    local ffi = sh.ffi
-    pcall(function() ffi.C.SDL_SensorUpdate() end)
-    if sh.accel ~= nil and sh.accelBuf then
-      local ok, rc = pcall(function()
-        return tonumber(ffi.C.SDL_SensorGetData(sh.accel, sh.accelBuf, 3))
-      end)
-      if ok and rc == 0 then
-        accel = { tonumber(sh.accelBuf[0]), tonumber(sh.accelBuf[1]),
-                  tonumber(sh.accelBuf[2]) }
-      end
-    end
-    if sh.gyro ~= nil and sh.gyroBuf then
-      local ok, rc = pcall(function()
-        return tonumber(ffi.C.SDL_SensorGetData(sh.gyro, sh.gyroBuf, 3))
-      end)
-      if ok and rc == 0 then
-        gyro = { tonumber(sh.gyroBuf[0]), tonumber(sh.gyroBuf[1]),
-                 tonumber(sh.gyroBuf[2]) }
-      end
-    end
-  end
-  return accel, gyro
-end
-
-function ControlsFree.vecMagnitude(v)
-  if not v then return 0 end
-  return math.sqrt(v[1] * v[1] + v[2] * v[2] + v[3] * v[3])
-end
-
-function ControlsFree.normalizedVec(v, mag)
-  if not v or not mag or mag <= 0 then return nil end
-  return { v[1] / mag, v[2] / mag, v[3] / mag }
-end
-
-function ControlsFree.vecDot(a, b)
-  if not a or not b then return 1 end
-  return a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
-end
-
-function ControlsFree.shakeInputTick(game)
-  if option("shake_b", true) == false or not ControlsFree.mobileHost() then return end
-  local accel, gyro = ControlsFree.readMotionSensors()
-  if not accel and not gyro then return end
-  local sh = ControlsFree.shakeState()
-
-  local linearAccel
-  if accel then
-    if not sh.gravity then
-      sh.gravity = { accel[1], accel[2], accel[3] }
-    else
-      local a = ControlsFree.SHAKE_GRAVITY_ALPHA
-      for i = 1, 3 do
-        sh.gravity[i] = sh.gravity[i] * (1 - a) + accel[i] * a
-      end
-    end
-    linearAccel = {
-      accel[1] - sh.gravity[1], accel[2] - sh.gravity[2],
-      accel[3] - sh.gravity[3],
-    }
-  end
-
-  sh.warmup = (sh.warmup or 0) + 1
-  local accelMag = ControlsFree.vecMagnitude(linearAccel)
-  local gyroMag = ControlsFree.vecMagnitude(gyro)
-  local accelScore = accelMag / ControlsFree.SHAKE_ACCEL_THRESHOLD
-  local gyroScore = gyroMag / ControlsFree.SHAKE_GYRO_THRESHOLD
-  local source, motion, mag, score
-  if gyroScore >= accelScore and gyro then
-    source, motion, mag, score = "gyro", gyro, gyroMag, gyroScore
-  else
-    source, motion, mag, score = "accel", linearAccel, accelMag, accelScore
-  end
-  sh.lastStrength = score or 0
-
-  if (score or 0) < ControlsFree.SHAKE_RESET_RATIO then sh.impulseArmed = true end
-  if sh.warmup < ControlsFree.SHAKE_WARMUP_TICKS then return end
-  if state.tick < (sh.cooldownUntil or 0) then return end
-
-  local last = sh.lastImpulse
-  if last and state.tick - last.tick > ControlsFree.SHAKE_MAX_IMPULSE_TICKS then
-    sh.lastImpulse = nil
-    last = nil
-  end
-  if (score or 0) < 1 or not sh.impulseArmed or not motion or mag <= 0 then return end
-  sh.impulseArmed = false
-  local impulse = {
-    tick = state.tick, source = source,
-    vector = ControlsFree.normalizedVec(motion, mag), strength = score,
-  }
-
-  if last and last.source == impulse.source then
-    local dt = impulse.tick - last.tick
-    if dt >= ControlsFree.SHAKE_MIN_IMPULSE_TICKS and dt <= ControlsFree.SHAKE_MAX_IMPULSE_TICKS
-        and ControlsFree.vecDot(last.vector, impulse.vector) <= ControlsFree.SHAKE_REVERSAL_DOT then
-      mod.input:tap(game, "b")
-      state.stats.shakeBTriggers = (state.stats.shakeBTriggers or 0) + 1
-      sh.cooldownUntil = state.tick + ControlsFree.SHAKE_COOLDOWN_TICKS
-      sh.lastImpulse = nil
-      return
-    end
-  end
-  sh.lastImpulse = impulse
-end
-
 local function pointerOverTouchControl(game, x, y)
   local tc = game and game.touchControls
   if not tc or type(tc.hitTest) ~= "function" then return false end
@@ -7650,9 +8086,6 @@ mod.hooks:wrap("input.step", function(nextFn, game, dt)
   if state.twoFingerGesture then
     restoreGestureZoom(game, state.twoFingerGesture)
   end
-  if option("enabled", true) ~= false then
-    ControlsFree.shakeInputTick(game)
-  end
   -- Clean up raw reservations if the mobile OS consumed/cancelled a physical
   -- touch without a normal release callback.
   ControlsFree.pruneSystemEdgeTouches()
@@ -8235,11 +8668,35 @@ local function drawDebug()
   local nav = state.nav
   local lines = {
     "TAP TO MOVE " .. VERSION,
-    ("HOLD BASE %dMS X%s = %dMS  PERF %s"):format(
+    ("HOLD BASE %dMS X%s = %dMS  RETARGET %s"):format(
       ControlsFree.holdSteerBaseDelayMs(), tostring(ControlsFree.overworldSpeedMultiplier(state.game)),
       ControlsFree.holdSteerDelayMs(state.game), (select(1, performanceInputProfile()).label)),
-    ("INPUT %dMS  PREVIEW /%d"):format(
+    ("RETARGET %dMS  PREVIEW /%d"):format(
       select(1, performanceInputProfile()).holdMs, previewRefreshTicks()),
+    (function()
+      local p, name = ControlsFree.pathBudgetProfile()
+      return ("PERF BUDGET %s N%s S%s"):format(
+        tostring(p.label or name),
+        p.nodes and tostring(p.nodes) or "FULL",
+        p.seams and tostring(p.seams) or "ALL")
+    end)(),
+    ("A* SEARCH/NODES/MAX/HIT %d/%d/%d/%d"):format(
+      state.stats.pathSearches or 0,
+      state.stats.pathExpanded or 0,
+      state.stats.pathMaxExpanded or 0,
+      state.stats.pathBudgetHits or 0),
+    ("SEAM USED/SKIP %d/%d"):format(
+      state.stats.seamCandidatesConsidered or 0,
+      state.stats.seamCandidatesSkipped or 0),
+    ("CACHE NPC H/M %d/%d  WARP H/M %d/%d"):format(
+      state.stats.occupancyCacheHits or 0,
+      state.stats.occupancyCacheMisses or 0,
+      state.stats.warpCacheHits or 0,
+      state.stats.warpCacheMisses or 0),
+    ("EXIT CHEAP/A*/DEFER %d/%d/%d"):format(
+      state.stats.exitCandidatesCheap or 0,
+      state.stats.exitCandidatesPathScored or 0,
+      state.stats.exitCandidatesDeferred or 0),
     "TICK " .. tostring(state.tick),
     ("VOXEL %d  RAY %d  COLUMN %d"):format(
       state.stats.voxelTargets or 0, state.stats.voxelRayTargets or 0,
@@ -8270,6 +8727,18 @@ local function drawDebug()
     ("AVATAR-HIT %d  HID-PATH %d"):format(
       state.stats.playerAvatarHitDetections or 0,
       state.stats.voxelNativeHiddenPathTargets or 0),
+    ("HIDDEN-TREASURE T/A %d/%d"):format(
+      state.stats.hiddenTreasureTargets or 0,
+      state.stats.hiddenTreasureTriggers or 0),
+    ("SURF PLAN/MOUNT/TURN/DENY %d/%d/%d/%d"):format(
+      state.stats.seamlessSurfPlans or 0,
+      state.stats.seamlessSurfMounts or 0,
+      state.stats.seamlessSurfFaceTurns or 0,
+      state.stats.seamlessSurfDenied or 0),
+    ("CUT TARGET/DIRECT/DENY %d/%d/%d"):format(
+      state.stats.cutTargets or 0,
+      state.stats.cutDirectTriggers or 0,
+      state.stats.cutDenied or 0),
     ("IFACE N/T/V %d/%d/%d"):format(
       state.stats.interactionFaceNeutralTicks or 0,
       state.stats.interactionFaceTurns or 0,
@@ -8349,11 +8818,18 @@ local function diagnostics()
     version = VERSION,
     tick = state.tick,
     active = nav ~= nil,
-    performance = { mode = perfName, label = perf.label, holdMs = perf.holdMs },
+    holdRetarget = { mode = perfName, label = perf.label, holdMs = perf.holdMs },
+    pathfindingBudget = (function()
+      local p, name = ControlsFree.pathBudgetProfile()
+      return {
+        mode = name, label = p.label, nodes = p.nodes,
+        seams = p.seams, exits = p.exits,
+      }
+    end)(),
     voxelPathRate = {
-      value = tostring(option("voxel_path_rate", DEFAULT_VOXEL_PATH_RATE)
-                       or DEFAULT_VOXEL_PATH_RATE),
+      value = "0.25",
       ticks = previewRefreshTicks(),
+      fixed = true,
     },
     simpleTouchMovement = ControlsFree.simpleTouchEnabled(),
     nativeControlsVisible = ControlsFree.nativeControlsVisible(state.game),
@@ -8374,9 +8850,6 @@ local function diagnostics()
       mouseWheelControl = tostring(option("mouse_wheel_control", "off") or "off"),
       mouseWheelTilt = tostring(option("mouse_wheel_tilt", "off") or "off"),
       mouseSideButtons = tostring(option("mouse_side_buttons", "off") or "off"),
-      shakeB = option("shake_b", true) ~= false,
-      sensorBackend = state.shake and state.shake.backend or nil,
-      sensorStrength = state.shake and state.shake.lastStrength or nil,
     },
     stats = copyFlat(state.stats),
     lastStop = state.lastStop and copyFlat(state.lastStop) or nil,
