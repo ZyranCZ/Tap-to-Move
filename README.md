@@ -1,5 +1,13 @@
 # Tap to Move
 
+> **v1.3.22:** Fixed avatar-click rescue in Dramatic Shape/Voxel mode. Player hit-testing now follows Dramatic Shape's actual live 16x16 leaning billboard instead of approximating the avatar as a vertical column. Avatar ownership is snapshotted on pointer-down, and a confirmed adjacent interaction is resolved before 3D raycasting/Smart Exit, so tapping the player beside a PC can reliably turn toward it and press A.
+>
+> **v1.3.21:** A short tap on the player now performs a one-tile interaction rescue scan in strict **UP → DOWN → RIGHT → LEFT** priority. If a genuine adjacent NPC/PC/sign/bookshelf/counter or other supported interaction exists, Tap to Move turns toward it and presses A; this bypasses unreliable 3D object picking while never probing empty cells. If no adjacent interaction exists, the previous front-cell avatar proxy remains available.
+>
+> **v1.3.20:** Smart Exit is now direction-gated. An off-map click above/below/left/right of an interior may only choose a real exit that leaves in the same direction; if no matching exit exists, Tap to Move does nothing instead of sending the player through an unrelated door. Hold-to-Steer retarget samples can no longer create a new Smart Exit solely because camera movement moves the map out from under a held pointer.
+
+> **v1.3.19:** Fixed wall-mounted fixed interactions in Dramatic Shape/Voxel mode, especially Pokémon Center PCs. If the primary 3D ground ray lands outside/behind the room or on non-semantic structure geometry, Tap to Move now performs a semantic-only projected hit recovery; a real PC/sign/bookshelf/counter/NPC can reclaim the tap before Smart Exit, while ordinary scenery cannot.
+
 > **v1.3.18:** Fixed true map-edge warps such as the Cerulean robbed-house wall hole. Edge activation is now independent of carpet rules, so a warp on the top/bottom/left/right boundary always retains its outward D-pad step; direct taps on a directional wall opening also prefer traversal over the fixed background description on the same cell.
 
 **Tap to Move** adds modern touch navigation to **Pokémon Gen1Recomp**.
@@ -23,7 +31,7 @@ The mod does **not** write player coordinates or invent destinations. It drives 
 - **Contextual Tap to Interact** for NPCs, trainers, visible item balls, signs, PCs, counters and other supported fixed interaction surfaces.
 - **Ledge-aware routing**, including legal one-way jumps and ledges that cross directly into another connected map.
 - **Seamless connected-map movement** — routes can continue through normal Route/Town map connections without requiring another tap.
-- **Smart interior exits** — tapping outside an interior tells the mod to find a real path out. When several equally valid exits exist, the exit closest to the off-map click is preferred before walking distance from the player. Directional openings use the game's real warp semantics: Tap to Move routes to the actual warp source and appends UP/DOWN/LEFT/RIGHT when required. Scripted dungeon holes are treated as on-step transition targets. In Dramatic Shape Voxel mode, a guarded outside-behind-wall ray can also express a genuine outside-map tap. In multi-floor/interconnected interiors Smart Exit can continue through internal stairs/warps until it reaches the outside.
+- **Smart interior exits** — tapping outside an interior tells the mod to find a real path out **only when the empty-space click points through the same side of the map as that exit** (UP/DOWN/LEFT/RIGHT). If no real exit matches that direction, no automatic exit is started. When several valid same-direction exits exist, the exit closest to the off-map click is preferred before walking distance from the player. Directional openings use the game's real warp semantics: Tap to Move routes to the actual warp source and appends UP/DOWN/LEFT/RIGHT when required. Scripted dungeon holes are treated as on-step transition targets. In Dramatic Shape Voxel mode, a guarded outside-behind-wall ray can also express a genuine outside-map tap. In multi-floor/interconnected interiors Smart Exit can continue through internal stairs/warps until it reaches the outside.
 - **Path Preview** — optional SHORT or FULL breadcrumb visualization of the planned route.
 - **Dynamic replanning** when NPCs move into the route or runtime collision results differ from the initial plan.
 - **Manual controls always win** — D-pad/controller input immediately takes priority over Tap to Move. A touch that begins on any visible Gen1Recomp virtual control is owned exclusively by that control and cannot also become Tap to Move or a custom gesture.
@@ -147,7 +155,7 @@ Select **START/SELECT TOUCH CONTROL → HOLD PLAYER SPRITE** to enable this gest
 
 If the finger moves far enough before the one-second threshold, the START candidate is cancelled and the gesture hands control back to normal Tap to Move / Hold to Steer.
 
-A **short tap on the player sprite** is no longer a dead/occluded target. If the player is currently facing an actual interaction surface directly in front of them — for example a door/warp, NPC, sign, PC or another supported fixed interaction — the tap is interpreted as selecting that front object. Empty floor is not implicitly selected, so tapping the player does not become a hidden one-step-forward command. With **HOLD PLAYER SPRITE** enabled, the mod waits for release: release before one second can use the front-object proxy; reaching one second still fires START and consumes the gesture exactly as before.
+A **short tap on the player sprite** is also an interaction rescue. Tap to Move first checks the four cells exactly one tile from the player in strict **UP → DOWN → RIGHT → LEFT** priority. The first genuine supported interaction it finds (for example an NPC, Pokémon Center PC, sign, bookshelf or counter interaction) is selected: the player turns toward it and presses **A**. Direction-gated hidden events are only selected from a side the game itself accepts, and empty cells are never probed with blind A presses. This deliberately bypasses 3D picking when a wall-mounted object is hard to hit. If none of the four adjacent cells contains an interaction, the older front-cell proxy remains available for a real door/warp or interaction directly in the player's current facing. With **HOLD PLAYER SPRITE** enabled, release before one second may use this rescue; reaching one second still fires START and consumes the gesture exactly as before.
 
 ### Bottom-edge system gesture protection
 
@@ -332,6 +340,29 @@ The Dramatic Shape integration uses its exported companion-library interface whe
 
 ## Version
 
+
+**1.3.21**
+
+- Short player-avatar taps now scan exactly one tile away for a real interaction in strict **UP → DOWN → RIGHT → LEFT** priority.
+- The selected adjacent interaction turns the player toward the object and uses the normal release-gated **A** interaction flow; no blind A presses are sent into empty cells.
+- Direction-restricted hidden interactions (including Pokémon Center PCs) are only accepted from a side the engine itself permits.
+- Counter proxies are only accepted when the player is on the side that actually faces through the counter toward the actor.
+- The avatar rescue clears stale Voxel/outside-map metadata so a recovered PC/NPC/sign cannot be stolen by Smart Exit.
+- If no adjacent interaction exists, the previous current-facing front-cell door/warp proxy is retained unchanged.
+
+**1.3.20**
+
+- Smart Exit now requires directional agreement between the off-map click and the real exit: UP↔UP, DOWN↔DOWN, LEFT↔LEFT, RIGHT↔RIGHT.
+- Opposite/sideways exits are excluded before walking-distance scoring, so a click near Nurse Joy or a right-wall PC cannot fall back to a bottom exit.
+- Diagonal outside clicks may consider only the two crossed sides, ordered by how far the pointer extends beyond each boundary.
+- Continuous Hold-to-Steer samples cannot create a new Smart Exit after camera motion moves the map away from a held pointer.
+- Debug overlay adds `EXIT-DIR A/R/H` counters for accepted/rejected/held-suppressed exit intents.
+
+**1.3.19**
+
+- Wall-mounted semantic interaction recovery for Voxel/Dramatic Shape taps (Pokémon Center PCs, signs, bookshelves, counters and other real interaction cells).
+- Semantic recovery runs before Smart Exit and can only select an actual engine interaction; generic wall/floor geometry is never promoted.
+- Debug overlay adds `SEM-HIT` to count recovered interaction taps.
 
 **1.3.18**
 

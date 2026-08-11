@@ -1,4 +1,4 @@
--- Tap to Move v1.3.18
+-- Tap to Move v1.3.20
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,7 +9,7 @@
 
 local mod = ...
 
-local VERSION = "1.3.18"
+local VERSION = "1.3.22"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 800 -- delay before a held pointer starts continuous retargeting
@@ -242,6 +242,9 @@ local state = {
     edgeWarpIntents = 0,
     holeStepIntents = 0,
     exitClickBiasedSelections = 0,
+    exitDirectionalAccepts = 0,
+    exitDirectionalRejects = 0,
+    exitContinuousSuppressions = 0,
     exitPrelandingCarries = 0,
     exitWarpForcedCommits = 0,
     exitGoalCollisionOverrides = 0,
@@ -256,6 +259,7 @@ local state = {
     voxelColumnTargets = 0,
     voxelRayTargets = 0,
     voxelRayOutside = 0,
+    voxelSemanticRecoveries = 0,
     battleResumes = 0,
     battleResumeDrops = 0,
     twoFingerGestures = 0,
@@ -279,6 +283,8 @@ local state = {
     battleCameraTouchesSuppressed = 0,
     playerHoldStartTriggers = 0,
     playerAvatarInteractionProxies = 0,
+    playerAvatarAdjacentInteractionProxies = 0,
+    playerAvatarHitDetections = 0,
     systemEdgeCandidates = 0,
     systemEdgeSwipesSuppressed = 0,
     systemEdgeTouchesPromoted = 0,
@@ -755,6 +761,38 @@ local function interactionAt(game, x, y)
           out.preferredFacing = d.name
           return out
         end
+      end
+    end
+  end
+  return nil
+end
+
+-- Short taps on the visible player have a second-chance interaction scan.
+-- This is deliberately independent of 3D picking: when a wall-mounted PC,
+-- sign, counter or actor is visually difficult to hit, the player can stand
+-- directly beside it and tap their own avatar.  Search exactly one cell away
+-- in the user-facing priority UP -> DOWN -> RIGHT -> LEFT.  A directional
+-- hidden event is only valid from the side the engine itself accepts; counter
+-- proxies likewise require the player to be on the side that faces through
+-- the counter toward the actor.
+function ControlsFree.avatarAdjacentInteraction(game, cur)
+  if not cur then return nil end
+  for _, dirName in ipairs({ "up", "down", "right", "left" }) do
+    local d = DIR_BY_NAME[dirName]
+    local ix, iy = cur.x + d.dx, cur.y + d.dy
+    local interaction = interactionAt(game, ix, iy)
+    if interaction then
+      local required = interaction.requiredFacing
+      local requiredOK = not (required and DIR_BY_NAME[required])
+          or required == dirName
+      local preferred = interaction.preferredFacing
+      local counterOK = not interaction.counterProxy
+          or not (preferred and DIR_BY_NAME[preferred])
+          or preferred == dirName
+      if requiredOK and counterOK then
+        interaction.avatarAdjacentProxy = true
+        interaction.avatarAdjacentDir = dirName
+        return interaction, ix, iy, dirName
       end
     end
   end
@@ -1348,6 +1386,30 @@ local function bestInteractionApproach(game, nav, cur, overview, occupied, topol
   if not ix then return nil, err or "gone" end
   local waterMode = currentWaterMode(game, overview, cur)
   local best
+
+  -- The player-avatar rescue is intentionally NOT a navigation request.  The
+  -- user is already exactly one tile from the selected semantic surface, so
+  -- stay on the current cell, turn toward it and let interactionAtDestination
+  -- press A.  This also works while the player happens to be standing on a
+  -- warp/mat cell, which generic interaction approach terrain filtering would
+  -- otherwise reject.  A direct NPC must still be on the cell that was seen;
+  -- a moving NPC falls back to the ordinary chase/replan path instead.
+  if interaction.avatarAdjacentProxy and interaction.avatarAdjacentDir then
+    local directDir = interaction.avatarAdjacentDir
+    local d = DIR_BY_NAME[directDir]
+    local clickedX, clickedY = tonumber(interaction.clickedX), tonumber(interaction.clickedY)
+    local oneTileAway = d and clickedX == cur.x + d.dx and clickedY == cur.y + d.dy
+    local directEntityStillThere = interaction.kind ~= "entity"
+        or interaction.counterProxy == true
+        or (ix == clickedX and iy == clickedY and not (entity and entity.moving))
+    if oneTileAway and directEntityStillThere then
+      return {
+        x = cur.x, y = cur.y, faceDir = directDir,
+        counter = interaction.counterProxy == true, path = {}, cost = 0, rank = -1000,
+        targetX = ix, targetY = iy, entity = entity,
+      }
+    end
+  end
 
   local function consider(cx, cy, faceDir, counter, rank)
     if interaction.requiredFacing and faceDir ~= interaction.requiredFacing then return end
@@ -2530,6 +2592,39 @@ local function targetFromTap(game, x, y)
   if scene then
     local ray = voxelRayTargetFromTap(game, x, y, scene)
     if ray then
+      -- Raised wall-mounted interaction surfaces are the one place where a
+      -- mathematically correct ground ray can still be semantically wrong.
+      -- The Pokémon Center PC is the canonical example: its hidden-event cell
+      -- sits on the far-right wall (x=13,y=3), so tapping the visible machine
+      -- can put the ray's ground intersection behind the compact interior and
+      -- report outside_map/outside_world. Before Smart Exit sees that result,
+      -- reuse the older projected-column picker ONLY as a semantic rescue.
+      -- It may replace the ray only when the recovered current-map cell is a
+      -- real engine interaction (PC/sign/bookshelf/counter/NPC/etc.). Ordinary
+      -- floor/wall cells can never win this fallback, so exit intent and normal
+      -- movement keep the ray path as their authority.
+      local rayInteraction = ray.x and ray.y
+        and interactionAt(game, ray.x, ray.y) or nil
+      local semanticRescueEligible = ray.error ~= nil
+        or ray.outsideBehind == true
+        or (ray.visibleKind == "structure" and rayInteraction == nil)
+      if semanticRescueEligible then
+        local sx, sy, scur, soverview, serr, scross =
+          voxelTargetFromTap(game, x, y, scene.voxel3d)
+        if sx and sy and not serr and not scross
+            and interactionAt(game, sx, sy) ~= nil then
+          state.stats.voxelSemanticRecoveries =
+            (state.stats.voxelSemanticRecoveries or 0) + 1
+          local meta = {
+            semanticRecovery = true,
+            intentX = ray.intentX, intentY = ray.intentY,
+            rayError = ray.error,
+            recoveredFromOutside = ray.error == "outside_world"
+              or ray.error == "outside_map",
+          }
+          return sx, sy, scur, soverview, nil, nil, meta
+        end
+      end
       if ray.error then
         return nil, nil, ray.cur, ray.overview, ray.error, nil, ray
       end
@@ -2537,7 +2632,8 @@ local function targetFromTap(game, x, y)
     end
     -- Older Dramatic Shape builds (or the very first frame before a VP has
     -- been established) retain the projection-based compatibility path.
-    -- Once a live VP exists, the ray path above is authoritative.
+    -- Once a live VP exists, the ray path above is authoritative except for
+    -- the explicit semantic rescue above.
     return voxelTargetFromTap(game, x, y, scene.voxel3d)
   end
 
@@ -2640,6 +2736,52 @@ local function listHas(list, value)
     if v == value then return true end
   end
   return false
+end
+
+-- Convert an off-map pointer position into the side(s) of the CURRENT map the
+-- user is actually aiming through. Smart Exit is intentionally conservative:
+-- a click above a room may only select an UP exit, a click to the right only a
+-- RIGHT exit, etc. Diagonal outside space may name two sides; the larger
+-- overflow is ordered first so a corner click still has a deterministic
+-- preference without ever falling back to the opposite side of the room.
+--
+-- Returning an empty list is meaningful: the pointer may be outside the
+-- framebuffer/3D ground ray while its extrapolated map intent is not actually
+-- beyond a map edge. In that case there is NO safe automatic exit direction.
+function ControlsFree.outsideIntentDirections(overview, intentX, intentY)
+  if not overview or type(intentX) ~= "number" or type(intentY) ~= "number"
+      or type(overview.width) ~= "number" or type(overview.height) ~= "number" then
+    return {}
+  end
+
+  local scored = {}
+  local function add(dir, amount)
+    scored[#scored + 1] = { dir = dir, amount = math.max(0, amount or 0) }
+  end
+  if intentY < 0 then add("up", -intentY) end
+  if intentY >= overview.height then
+    add("down", intentY - overview.height + 0.000001)
+  end
+  if intentX < 0 then add("left", -intentX) end
+  if intentX >= overview.width then
+    add("right", intentX - overview.width + 0.000001)
+  end
+
+  table.sort(scored, function(a, b)
+    if math.abs(a.amount - b.amount) > 0.000001 then return a.amount > b.amount end
+    local order = { up = 1, down = 2, left = 3, right = 4 }
+    return (order[a.dir] or 9) < (order[b.dir] or 9)
+  end)
+  local out = {}
+  for _, row in ipairs(scored) do out[#out + 1] = row.dir end
+  return out
+end
+
+function ControlsFree.firstMatchingDirection(available, wanted)
+  for _, dir in ipairs(wanted or {}) do
+    if listHas(available, dir) then return dir end
+  end
+  return nil
 end
 
 -- Resolve every direction that can activate a real warp SOURCE.
@@ -3026,6 +3168,15 @@ local function nearestExitTarget(game, overview, cur, intentX, intentY)
   local map = ow and ow.map
   if not map or not overview or not cur then return nil end
 
+  -- Supplying intent coordinates means this is the INITIAL off-map click, not
+  -- a later leg of an already-authorized multi-floor exit journey. In that
+  -- initial case every candidate must prove that it leaves in one of the
+  -- directions the pointer actually crossed. No direction = no Smart Exit.
+  local directionalGate = type(intentX) == "number" and type(intentY) == "number"
+  local wantedExitDirs = directionalGate
+    and ControlsFree.outsideIntentDirections(overview, intentX, intentY) or nil
+  if directionalGate and #wantedExitDirs == 0 then return nil end
+
   local candidates = {}
   local warps = actualWarpCells(map)
   local all, dynamic, static = liveOccupancy(game)
@@ -3049,22 +3200,29 @@ local function nearestExitTarget(game, overview, cur, intentX, intentY)
       if k ~= key(dst.x,dst.y) then blocked[k] = true end
     end
     local dirs = warpActivationDirections(game, map, dst.x, dst.y)
+    -- Initial Smart Exit requests are direction-gated. A DOWN carpet is not a
+    -- candidate for a click above/right/left of the room, even if it is the
+    -- nearest warp to the player. This happens BEFORE path scoring so an
+    -- opposite-side exit can never win later through walking cost or rank.
+    local directedExit = directionalGate
+      and ControlsFree.firstMatchingDirection(dirs, wantedExitDirs) or nil
+    if directionalGate and not directedExit then return end
+
     -- Only directional warp sources (edge/carpet semantics) may need the
     -- special non-walkable endpoint exception. Ordinary arrival warps must
     -- remain reachable through their normal terrain legality.
     local path = findPath(overview, cur.x, cur.y, dst.x, dst.y, waterMode,
       occupied, nil, topology.blockedEdges, blocked, topology.jumps, #dirs > 0)
     if not path then return end
-    -- Preserve a unique directional activation for ANY side, not just DOWN.
-    -- This is the Smart Exit counterpart of warpIntentAt above: reaching an
-    -- UP/LEFT/RIGHT source is only half the action when ExtraWarpCheck expects
-    -- one more D-pad press.  If arrival itself warps, map.entered retires the
-    -- route before this follow-up can run, so retaining the unique direction
-    -- is safe.  Multi-direction sources remain conservative, with the legacy
-    -- DOWN carpet preference retained for compatibility.
-    local exitDir = (#dirs == 1) and dirs[1] or nil
-    if not exitDir and listHas(dirs, "down") then exitDir = "down" end
-    if not exitDir and cur.x == dst.x and cur.y == dst.y then
+    -- When the outside click supplied a side, THAT side also resolves an
+    -- otherwise multi-direction warp deterministically. Subsequent journey
+    -- legs have no pointer coordinates and retain the older conservative
+    -- unique-direction / DOWN-carpet policy.
+    local exitDir = directedExit or ((#dirs == 1) and dirs[1] or nil)
+    if not directionalGate and not exitDir and listHas(dirs, "down") then
+      exitDir = "down"
+    end
+    if not directionalGate and not exitDir and cur.x == dst.x and cur.y == dst.y then
       exitDir = dirs[1]
     end
 
@@ -3104,12 +3262,16 @@ local function nearestExitTarget(game, overview, cur, intentX, intentY)
   end
 
   for _, c in ipairs(directConnectionExitIntents(game, overview, cur)) do
-    if type(intentX) == "number" and type(intentY) == "number"
-        and type(c.x) == "number" and type(c.y) == "number" then
-      local dx, dy = (c.x + 0.5) - intentX, (c.y + 0.5) - intentY
-      c.clickDistance = dx * dx + dy * dy
+    local connectionDir = c.cross and c.cross.dir or nil
+    if not directionalGate or listHas(wantedExitDirs, connectionDir) then
+      if type(intentX) == "number" and type(intentY) == "number"
+          and type(c.x) == "number" and type(c.y) == "number" then
+        local dx, dy = (c.x + 0.5) - intentX, (c.y + 0.5) - intentY
+        c.clickDistance = dx * dx + dy * dy
+      end
+      c.exitDir = connectionDir
+      candidates[#candidates + 1] = c
     end
-    candidates[#candidates + 1] = c
   end
 
   if #candidates == 0 then return nil end
@@ -3180,24 +3342,58 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
   -- replacement has a valid plan.
   state.battleResume = nil
 
-  local tx, ty, cur, overview, targetErr, cross, targetMeta =
-    targetFromTap(game, screenX, screenY)
+  local tx, ty, cur, overview, targetErr, cross, targetMeta
 
-  -- The player's sprite can visually cover the interaction surface directly in
-  -- front of them (most noticeably when standing one step below a door/sign/PC
-  -- or directly against an NPC). A short tap on the visible avatar therefore
-  -- acts as a proxy for that FRONT cell, but only when the front cell actually
-  -- has interaction/door semantics. Ordinary taps on the player do not become
-  -- an implicit one-step walk. HOLD PLAYER SPRITE is unaffected because its
-  -- stationary candidate is not routed until release, and a fired START marks
-  -- the gesture suppressed before this path can run.
+  -- v1.3.22: avatar rescue is resolved BEFORE any 3D raycast/pathfinding.
+  -- If the press truly began on the rendered player and there is a genuine
+  -- adjacent interaction exactly one cell away, that semantic intent is
+  -- authoritative.  Voxel picking, outside-map classification and Smart Exit
+  -- never get a chance to reinterpret this click.
+  local gp = gesture
+  local sx, sy = gp and gp.startX or screenX, gp and gp.startY or screenY
+  local pdx, pdy = screenX - sx, screenY - sy
+  local avatarTap = false
+  local avatarCur = mod.world and mod.world:current() or nil
+  local avatarOverview = mod.world and mod.world:mapOverview() or nil
   if option("interact", true) ~= false and not continuous and gestureId ~= nil
-      and ControlsFree.playerScreenHit and cur and overview then
-    local gp = pointerForGesture and pointerForGesture(gestureId) or nil
-    local sx, sy = gp and gp.startX or screenX, gp and gp.startY or screenY
-    local pdx, pdy = screenX - sx, screenY - sy
-    if pdx * pdx + pdy * pdy <= PLAYER_HOLD_MOVE_SLOP_UNITS * PLAYER_HOLD_MOVE_SLOP_UNITS
-        and ControlsFree.playerScreenHit(game, sx, sy) then
+      and avatarCur and avatarOverview and avatarCur.mapId == avatarOverview.mapId
+      and pdx * pdx + pdy * pdy
+          <= PLAYER_HOLD_MOVE_SLOP_UNITS * PLAYER_HOLD_MOVE_SLOP_UNITS then
+    local startedOnPlayer = gp and gp.startedOnPlayer == true
+    if not startedOnPlayer and ControlsFree.playerScreenHit then
+      startedOnPlayer = ControlsFree.playerScreenHit(game, sx, sy) == true
+    end
+    if startedOnPlayer then
+      avatarTap = true
+      state.stats.playerAvatarHitDetections =
+        (state.stats.playerAvatarHitDetections or 0) + 1
+      local adjacentInteraction, aix, aiy =
+        ControlsFree.avatarAdjacentInteraction(game, avatarCur)
+      if adjacentInteraction then
+        tx, ty, cur, overview = aix, aiy, avatarCur, avatarOverview
+        targetErr, cross = nil, nil
+        targetMeta = {
+          playerAvatarProxy = true,
+          playerAvatarAdjacentProxy = true,
+          forcedInteraction = adjacentInteraction,
+        }
+        state.stats.playerAvatarInteractionProxies =
+          (state.stats.playerAvatarInteractionProxies or 0) + 1
+        state.stats.playerAvatarAdjacentInteractionProxies =
+          (state.stats.playerAvatarAdjacentInteractionProxies or 0) + 1
+      end
+    end
+  end
+
+  if not (targetMeta and targetMeta.forcedInteraction) then
+    tx, ty, cur, overview, targetErr, cross, targetMeta =
+      targetFromTap(game, screenX, screenY)
+
+    -- Backward-compatible avatar fallback: when the avatar was genuinely hit
+    -- but none of the four adjacent semantic cells is interactable, preserve
+    -- the older current-facing front-cell door/warp proxy. Ordinary avatar
+    -- taps never become an implicit step onto empty floor.
+    if avatarTap and cur and overview then
       local player = game and game.overworld and game.overworld.player
       local dir = player and DIR_BY_NAME[player.facing] or nil
       if dir then
@@ -3216,6 +3412,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       end
     end
   end
+
   local exitFallback = false
   local exitIntent = nil
   local nearestFallback = false
@@ -3225,7 +3422,9 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
   -- of the real warp source and ExtraWarpCheck can require any of the four
   -- directions, not only DOWN.  Resolve the opening through actual warp data
   -- first, then route to the source and append the engine-required direction.
-  if tx and not cross and cur and overview and ControlsFree.directionalWarpIntentAt then
+  if tx and not cross and cur and overview
+      and not (targetMeta and targetMeta.forcedInteraction)
+      and ControlsFree.directionalWarpIntentAt then
     local map = game and game.overworld and game.overworld.map
     local directionalIntent = ControlsFree.directionalWarpIntentAt(game, map, cur, tx, ty)
     if directionalIntent then
@@ -3249,6 +3448,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
   -- where the rendered lip/wall is selected instead of the unique adjacent
   -- walkable hole cell.
   if tx and not cross and cur and overview
+      and not (targetMeta and targetMeta.forcedInteraction)
       and not (targetMeta and targetMeta.directionalWarpIntent)
       and ControlsFree.holeStepIntentAt then
     local map = game and game.overworld and game.overworld.map
@@ -3291,10 +3491,28 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       and (targetErr == "outside_world" or targetErr == "outside_map") then
     local intentX = targetMeta and targetMeta.intentX or nil
     local intentY = targetMeta and targetMeta.intentY or nil
-    exitIntent = nearestExitTarget(game, overview, cur, intentX, intentY)
-    if exitIntent and type(intentX) == "number" and type(intentY) == "number" then
-      state.stats.exitClickBiasedSelections =
-        (state.stats.exitClickBiasedSelections or 0) + 1
+
+    -- Hold-to-Steer continuously reprojects the SAME screen point while the
+    -- camera moves. It must never acquire a brand-new Smart Exit merely
+    -- because the room slid underneath a stationary finger/cursor. Only the
+    -- initial pointer intent may authorize leaving an interior.
+    if continuous then
+      state.stats.exitContinuousSuppressions =
+        (state.stats.exitContinuousSuppressions or 0) + 1
+    else
+      local wanted = ControlsFree.outsideIntentDirections(overview, intentX, intentY)
+      if #wanted > 0 then
+        exitIntent = nearestExitTarget(game, overview, cur, intentX, intentY)
+      end
+      if exitIntent then
+        state.stats.exitDirectionalAccepts =
+          (state.stats.exitDirectionalAccepts or 0) + 1
+        state.stats.exitClickBiasedSelections =
+          (state.stats.exitClickBiasedSelections or 0) + 1
+      else
+        state.stats.exitDirectionalRejects =
+          (state.stats.exitDirectionalRejects or 0) + 1
+      end
     end
     if exitIntent then
       if exitIntent.edgeWarp then
@@ -3426,10 +3644,12 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     local selectedWarpIntent = targetMeta and targetMeta.directionalWarpIntent
       or warpIntentAt(game, game and game.overworld and game.overworld.map,
                       cur, tx, ty)
-    local rawInteraction = option("interact", true) ~= false
-      and interactionAt(game, tx, ty) or nil
+    local forcedInteraction = targetMeta and targetMeta.forcedInteraction or nil
+    local rawInteraction = forcedInteraction or (option("interact", true) ~= false
+      and interactionAt(game, tx, ty) or nil)
     local directionalWarpOwnsCell = selectedWarpIntent ~= nil
       and selectedWarpIntent.exitDir ~= nil
+      and forcedInteraction == nil
       and not (rawInteraction and rawInteraction.kind == "entity")
     local interaction = (not directionalWarpOwnsCell) and rawInteraction
       and ((not continuous) or rawInteraction.kind == "entity")
@@ -5404,16 +5624,55 @@ function ControlsFree.playerScreenHit(game, x, y)
 
   local scene = voxelContext()
   if scene and scene.voxel3d then
-    local wx = (cur.x + 0.5) * TILE_SIZE
-    local wz = (cur.y + 0.5) * TILE_SIZE
-    local foot = projectedPoint(scene.voxel3d, wx, wz, 0.5)
-    local head = projectedPoint(scene.voxel3d, wx, wz, 28)
-    local fx, fy = voxelCanvasToWindow(scene.voxel3d, foot)
-    local hx, hy = voxelCanvasToWindow(scene.voxel3d, head)
-    if fx and hx then
-      -- 24 LOVE units is large enough for a thumb but still local to the
-      -- character.  Distance-to-segment naturally follows camera tilt/scale.
-      if pointSegmentDistance2(x, y, fx, fy, hx, hy) <= 24 * 24 then return true end
+    -- Dramatic Shape does NOT draw the player as a vertical column above the
+    -- cell centre. It draws the live 16x16 sprite as a billboard card whose
+    -- feet pivot at (player.px+8, player.py+8) and whose card leans back by
+    -- (VoxelState.angle - pi/2). Hit-test that actual projected card.
+    local player = game and game.overworld and game.overworld.player
+    local px, py = playerPixel(game, cur)
+    local ground = 0
+    local map = game and game.overworld and game.overworld.map
+    local tileShape = scene.tileShape
+    if map and tileShape and type(tileShape.forMap) == "function"
+        and type(map.cellTile) == "function" then
+      local okShapes, shapes = pcall(tileShape.forMap, map)
+      local okTile, tile = pcall(map.cellTile, map, cur.x, cur.y)
+      local shape = okShapes and okTile and type(shapes) == "table" and shapes[tile] or nil
+      if shape and shape.art ~= "stair" and tonumber(shape.h) and tonumber(shape.h) > 0 then
+        ground = tonumber(shape.h)
+      end
+    end
+
+    local angle = scene.voxelState and tonumber(scene.voxelState.angle) or 0
+    local lean = angle - math.pi / 2
+    local ca, sa = math.cos(lean), math.sin(lean)
+    local function cardPoint(lx, ly)
+      -- billboardMatrix = T(px+8,ground,py+8) * Rx(lean) * T(-8,0,0)
+      local wx = px + lx
+      local wy = ground + ly * ca
+      local wz = py + 8 + ly * sa
+      local proj = projectedPoint(scene.voxel3d, wx, wz, wy)
+      local sx, sy = voxelCanvasToWindow(scene.voxel3d, proj)
+      if not sx then return nil end
+      return { sx, sy }
+    end
+
+    local q = {
+      cardPoint(0, 0), cardPoint(16, 0),
+      cardPoint(16, 16), cardPoint(0, 16),
+    }
+    if q[1] and q[2] and q[3] and q[4] then
+      if pointInQuad(x, y, q) then return true end
+      -- A small thumb/mouse tolerance around the real card outline. This is
+      -- deliberately much tighter than a whole gameplay cell, so nearby floor
+      -- taps do not unexpectedly become avatar interactions.
+      local pad2 = 10 * 10
+      for i = 1, 4 do
+        local a, b = q[i], q[i % 4 + 1]
+        if pointSegmentDistance2(x, y, a[1], a[2], b[1], b[2]) <= pad2 then
+          return true
+        end
+      end
     end
   end
 
@@ -6214,6 +6473,10 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
         feedbackShown = owns,
         ignored = not owns,
         gestureId = owns and state.gestureSerial or nil,
+        -- Snapshot avatar ownership at pointer-DOWN. Camera motion and Voxel
+        -- reprojection later in the gesture must not change what was clicked.
+        startedOnPlayer = owns and ControlsFree.playerScreenHit
+          and ControlsFree.playerScreenHit(game, ev.x, ev.y) == true or false,
       }
       state.pointers[id] = p
       local playerHold = state.playerHoldTouches and state.playerHoldTouches[id]
@@ -6959,16 +7222,24 @@ local function drawDebug()
     ("VOXEL %d  RAY %d  COLUMN %d"):format(
       state.stats.voxelTargets or 0, state.stats.voxelRayTargets or 0,
       state.stats.voxelColumnTargets or 0),
-    ("V-OUT %d  EDGE-WARP %d  DIR-WARP %d"):format(
+    ("V-OUT %d  SEM-HIT %d  EDGE-WARP %d"):format(
       state.stats.voxelRayOutside or 0,
-      state.stats.edgeWarpIntents or 0,
-      state.stats.directionalWarpIntents or 0),
-    ("HOLE %d  EXIT-GOAL PASS %d"):format(
+      state.stats.voxelSemanticRecoveries or 0,
+      state.stats.edgeWarpIntents or 0),
+    ("DIR-WARP %d  HOLE %d  EXIT-GOAL %d"):format(
+      state.stats.directionalWarpIntents or 0,
       state.stats.holeStepIntents or 0,
       state.stats.exitGoalCollisionOverrides or 0),
     ("CARPET-DOWN %d  CLICK-EXIT %d"):format(
       state.stats.carpetDownIntents or 0,
       state.stats.exitClickBiasedSelections or 0),
+    ("AVATAR-HIT %d  ADJ %d"):format(
+      state.stats.playerAvatarHitDetections or 0,
+      state.stats.playerAvatarAdjacentInteractionProxies or 0),
+    ("EXIT-DIR A/R/H %d/%d/%d"):format(
+      state.stats.exitDirectionalAccepts or 0,
+      state.stats.exitDirectionalRejects or 0,
+      state.stats.exitContinuousSuppressions or 0),
     ("PRELAND %d  WARP-COMMIT %d"):format(
       state.stats.exitPrelandingCarries or 0,
       state.stats.exitWarpForcedCommits or 0),
