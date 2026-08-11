@@ -1,4 +1,4 @@
--- Tap to Move v1.0.0
+-- Tap to Move v1.0.1
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never teleports or writes player coordinates.  It
@@ -8,7 +8,7 @@
 
 local mod = ...
 
-local VERSION = "1.0.0"
+local VERSION = "1.0.1"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 800 -- delay before a held pointer starts continuous retargeting
@@ -2777,7 +2777,16 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       and targetMeta.visibleKind == "structure" and cur and overview then
     local currentDef = game and game.overworld and game.overworld.map
         and game.overworld.map.def
-    if not defLooksOutdoor(currentDef) and cellChar(overview, tx, ty) == " " then
+    -- `outsideBehind` is already the strong geometric test: the visible hit
+    -- belongs to the active map, but the SAME camera ray reaches the ground
+    -- at least half a gameplay cell beyond every rendered current/neighbour
+    -- map body. Do not additionally require mapOverview to call the hit cell
+    -- blocked. Dramatic Shape works at 8x8 visual-tile granularity and can
+    -- legitimately extrude an exterior wall over a 16x16 gameplay cell that
+    -- mapOverview represents as ordinary `.` floor. That extra 2D filter was
+    -- the v1.0.0 regression that turned a clear "tap outside this room" into
+    -- nearest-legal movement toward the wall instead of Smart Exit.
+    if not defLooksOutdoor(currentDef) then
       tx, ty, cross, targetErr = nil, nil, nil, "outside_map"
     end
   end

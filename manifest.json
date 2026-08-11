@@ -1,7 +1,7 @@
 {
   "id": "tap_to_move",
   "name": "Tap to Move",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "entry": "main.lua",
   "api": 2,
   "category": "GAMEPLAY",

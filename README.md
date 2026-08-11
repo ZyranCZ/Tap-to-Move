@@ -1,5 +1,7 @@
 # Tap to Move
 
+> **v1.0.1:** Fixes Voxel smart-exit detection when an exterior 3D wall is built over a gameplay cell that the 2D collision overview still reports as walkable.
+
 **Tap to Move** adds modern touch navigation to **Pokémon Gen1Recomp**.
 
 Tap anywhere in the overworld and your character immediately starts walking toward that point using collision-aware pathfinding. Hold your finger on the world to continuously steer as the camera moves.
