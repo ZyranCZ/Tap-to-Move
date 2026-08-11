@@ -1,4 +1,4 @@
--- Tap to Move v1.0.1
+-- Tap to Move v1.3.11
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never teleports or writes player coordinates.  It
@@ -8,7 +8,7 @@
 
 local mod = ...
 
-local VERSION = "1.0.1"
+local VERSION = "1.3.11"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 800 -- delay before a held pointer starts continuous retargeting
@@ -35,6 +35,64 @@ local PERFORMANCE_INPUT_PROFILES = {
 local VOXEL_PATH_RATE_TICKS = {
   ["10"] = 6, ["5"] = 12, ["2"] = 30, ["1"] = 60,
   ["0.25"] = 240,
+}
+
+-- Optional two-finger shortcuts. Gen1Recomp/LÖVE can surface pinch/spread
+-- as zoom input independently of the gameplay pointer stream, so the mod
+-- recognizes the two contacts itself and also guards Game:zoomStep while a
+-- gesture is reserved. A direction must move far enough from its initial
+-- separation to avoid firing when the second finger merely lands.
+local TWO_FINGER_TRIGGER_UNITS = 36
+local TWO_FINGER_TRIGGER_RATIO = 0.18
+local PINCH_ZOOM_GRACE_TICKS = 36 -- keep blocking delayed native zoom callbacks for ~0.6 s
+
+-- Controls-free one-finger gestures. Holding directly on the player for one
+-- second is an alternate START gesture. DIALOG TOUCH CONTROL is the catch-all
+-- classifier for non-overworld, non-battle UI: a short stationary release
+-- becomes A, a nearly stationary one-second hold becomes B, while a deliberate
+-- swipe becomes one D-pad tap. Exactly one semantic action owns each contact.
+local PLAYER_HOLD_START_TICKS = FIXED_TICKS_PER_SECOND -- exactly 1.0 s
+local PLAYER_HOLD_MOVE_SLOP_UNITS = 22
+local DIALOG_SWIPE_TRIGGER_UNITS = 30
+
+-- Controls-free dialogue / mobile shake input. A shake is deliberately
+-- recognized as an oscillation (two strong opposite impulses) rather than a
+-- single jolt, so putting the phone down or rotating it once does not normally
+-- press B. Accelerometer data is gravity-compensated; gyroscope data is used
+-- directly. Android Gen1Recomp currently runs LÖVE 11.5 with the legacy
+-- accelerometer-as-joystick disabled, so the mod talks to SDL2's independent
+-- sensor subsystem through FFI instead. iOS/LÖVE 12 can use love.sensor.
+local ControlsFree = {
+  SHAKE_ACCEL_THRESHOLD = 5.5,       -- m/s^2 after gravity removal
+  SHAKE_GYRO_THRESHOLD = 3.2,        -- rad/s
+  SHAKE_RESET_RATIO = 0.45,          -- motion must relax before next impulse
+  SHAKE_REVERSAL_DOT = -0.20,        -- opposite-enough vector direction
+  SHAKE_MIN_IMPULSE_TICKS = 2,
+  SHAKE_MAX_IMPULSE_TICKS = 30,      -- 0.5 s at 60 Hz
+  SHAKE_COOLDOWN_TICKS = 45,         -- 0.75 s; one B per shake
+  SHAKE_WARMUP_TICKS = 10,
+  SHAKE_GRAVITY_ALPHA = 0.08,
+  TOUCH_HOLD_B_TICKS = FIXED_TICKS_PER_SECOND, -- exactly 1.0 s
+  TOUCH_HOLD_B_MOVE_SLOP_UNITS = 22,
+  -- When PINCH OR SPREAD is selected, the first world touch is reserved for a
+  -- brief pairing window before Tap to Move sees it. Human two-finger gestures
+  -- rarely land on the exact same frame; without this grace the first finger
+  -- can start one walking step before the second finger turns the pair into
+  -- START/SELECT. Short ordinary taps are replayed immediately on release.
+  PINCH_FIRST_TOUCH_GRACE_TICKS = 12, -- 0.20 s at 60 Hz
+  -- Mobile OS navigation gestures commonly begin at the bottom edge. Reserve
+  -- that narrow strip only for bare-overworld WORLD touches until intent is
+  -- clear, so a Home/app-switch swipe cannot start a Tap-to-Move route. Native
+  -- virtual controls and UI/battle touch handling are never reserved here.
+  SYSTEM_EDGE_START_BAND_RATIO = 0.12,
+  SYSTEM_EDGE_START_BAND_MIN_UNITS = 32,
+  SYSTEM_EDGE_START_BAND_MAX_UNITS = 96,
+  SYSTEM_EDGE_UP_TRIGGER_UNITS = 30,
+  SYSTEM_EDGE_AXIS_RATIO = 1.15,
+  SYSTEM_EDGE_SIDE_ESCAPE_UNITS = 34,
+  SDL_INIT_SENSOR = 0x00008000,
+  SDL_SENSOR_ACCEL = 1,
+  SDL_SENSOR_GYRO = 2,
 }
 local VOXEL_COLUMN_HEIGHT = 48           -- semantic prism height in world px
 local VOXEL_COLUMN_MID_HEIGHT = 24
@@ -63,7 +121,6 @@ for _, d in ipairs(DIRS) do DIR_BY_NAME[d.name] = d end
 
 mod.options:define({
   { key = "enabled", label = "TAP TO MOVE", type = "toggle", default = true },
-  { key = "mouse", label = "MOUSE CONTROL", type = "toggle", default = true },
   { key = "interact", label = "TAP TO INTERACT", type = "toggle", default = true },
   { key = "hold_steer", label = "HOLD TO STEER", type = "toggle", default = true },
   { key = "tap_hold_ms", label = "HOLD STEER DELAY", type = "number",
@@ -80,11 +137,40 @@ mod.options:define({
       { "0.25/S", "0.25" }, { "1/S", "1" }, { "2/S", "2" },
       { "5/S", "5" }, { "10/S", "10" },
     } },
+  { key = "dialog_touch_control", label = "DIALOG TOUCH CONTROL",
+    type = "toggle", default = false },
+  { key = "battle_touch_control", label = "BATTLE TOUCH CONTROL",
+    type = "toggle", default = false },
+  { key = "start_select_touch_control", label = "START/SELECT TOUCH CONTROL",
+    type = "choice", default = "off",
+    choices = {
+      { "OFF", "off" },
+      { "HOLD PLAYER SPRITE", "hold_player_sprite" },
+      { "PINCH OR SPREAD", "pinch_or_spread" },
+    } },
+  { key = "shake_b", label = "SHAKE -> B",
+    type = "toggle", default = true },
   { key = "feedback", label = "TAP FEEDBACK", type = "toggle", default = true },
   { key = "path_preview", label = "PATH PREVIEW", type = "choice", default = "off",
     choices = { { "OFF", "off" }, { "SHORT", "short" }, { "FULL", "full" } } },
   { key = "battle_resume", label = "RESUME AFTER WILD", type = "toggle", default = false },
   { key = "debug", label = "DEBUG OVERLAY", type = "toggle", default = false },
+
+  -- Mouse options stay at the very bottom: all are opt-in.
+  { key = "mouse", label = "MOUSE WALK CONTROL",
+    type = "toggle", default = false },
+  { key = "desktop_mouse_ab", label = "DESKTOP MOUSE A/B",
+    type = "toggle", default = false },
+  { key = "mouse_wheel_control", label = "MOUSE WHEEL CONTROL",
+    type = "choice", default = "off",
+    choices = {
+      { "OFF", "off" }, { "ON", "on" }, { "ON FLIPPED", "on_flipped" },
+    } },
+  { key = "mouse_side_buttons", label = "MOUSE SIDE BUTTONS",
+    type = "choice", default = "off",
+    choices = {
+      { "OFF", "off" }, { "ON", "on" }, { "ON FLIPPED", "on_flipped" },
+    } },
 })
 
 local state = {
@@ -101,6 +187,27 @@ local state = {
   battleResume = nil,
   exitJourney = nil,
   previewCache = nil,
+  exteriorVoidCache = nil,
+  gestureTouches = {},
+  twoFingerGesture = nil,
+  zoomGuardInstalled = false,
+  zoomGuardOriginal = nil,
+  zoomModule = nil,
+  rawZoomTouches = {},
+  rawZoomGuardInstalled = false,
+  rawZoomGuardOriginal = nil,
+  nativeZoomSuppression = nil,
+  dialogTouches = {},
+  battleTouches = {},
+  battleCameraOwnedTouches = {},
+  playerHoldTouches = {},
+  systemEdgeTouches = {},
+  pinchGraceTouches = {},
+  rawTouchDispatchPress = nil,
+  rawTouchDispatchMove = nil,
+  rawTouchDispatchRelease = nil,
+  rawDispatchedTouches = {},
+  nativeControlOwnedTouches = {},
   stats = {
     routesStarted = 0,
     routesArrived = 0,
@@ -125,6 +232,9 @@ local state = {
     overviewCacheHits = 0,
     overviewCacheMisses = 0,
     exitFallbacks = 0,
+    exteriorVoidExitIntents = 0,
+    voxelExactVoidExitIntents = 0,
+    carpetDownIntents = 0,
     retainedTargets = 0,
     nearestFallbacks = 0,
     stickySemanticRetains = 0,
@@ -138,6 +248,38 @@ local state = {
     voxelRayOutside = 0,
     battleResumes = 0,
     battleResumeDrops = 0,
+    twoFingerGestures = 0,
+    gestureStartTriggers = 0,
+    gestureSelectTriggers = 0,
+    pinchZoomSuppressed = 0,
+    dialogATaps = 0,
+    dialogBHoldTriggers = 0,
+    dialogSwipes = 0,
+    dialogSwipeUp = 0,
+    dialogSwipeDown = 0,
+    dialogSwipeLeft = 0,
+    dialogSwipeRight = 0,
+    battleATaps = 0,
+    battleBHoldTriggers = 0,
+    battleSwipes = 0,
+    battleSwipeUp = 0,
+    battleSwipeDown = 0,
+    battleSwipeLeft = 0,
+    battleSwipeRight = 0,
+    battleCameraTouchesSuppressed = 0,
+    playerHoldStartTriggers = 0,
+    playerAvatarInteractionProxies = 0,
+    systemEdgeCandidates = 0,
+    systemEdgeSwipesSuppressed = 0,
+    systemEdgeTouchesPromoted = 0,
+    nativeControlTouchesBypassed = 0,
+    startMenuOutsideBTaps = 0,
+    startMenuInsideATaps = 0,
+    desktopATaps = 0,
+    desktopBTaps = 0,
+    shakeBTriggers = 0,
+    sensorInitAttempts = 0,
+    sensorUnavailable = 0,
     cancellations = 0,
   },
 }
@@ -147,6 +289,7 @@ local state = {
 local gestureIsDown
 local pointerForGesture
 local anyDirectionDown
+local restoreNativeZoomSuppression
 
 local function option(key, fallback)
   local value = mod.options:get(key)
@@ -2017,7 +2160,14 @@ local function voxelStructureHit(scene, entry, ray, maxT)
     t=t+dt
   end
   if not bestT then return nil end
-  return { t=bestT, entry=entry, x=math.floor(bestTX/2), y=math.floor(bestTY/2) }
+  local _, shape, S = voxelTileHeight(scene, entry, bestTX, bestTY)
+  local k = voxelStructureKey(bestTX, bestTY)
+  return {
+    t=bestT, entry=entry, x=math.floor(bestTX/2), y=math.floor(bestTY/2),
+    visualTX=bestTX, visualTY=bestTY,
+    visualTile=S and S.tileAt and S.tileAt[k] or nil,
+    visualClass=shape and shape.class or nil,
+  }
 end
 
 local function voxelEntityHit(game, entries, ray, maxT, voxel3d)
@@ -2074,6 +2224,42 @@ local function voxelRayTargetFromTap(game, x, y, scene)
   if ent and (not visible or ent.t<visible.t) then visible=ent end
 
   local groundHit = voxelMapAtWorld(entries,gx,gz)
+
+  -- Dramatic Shape already has a stronger answer than our 2D collision shell:
+  -- Structures.forMap resolves every rendered 8x8 visual tile and classifies
+  -- atlas-black/transparent interior darkness as shape.class == "void".
+  -- Capture the EXACT ground visual tile under this ray before folding it back
+  -- into Gen1's coarser 16x16 gameplay cell. A user can therefore tap the
+  -- black tile they actually see and we can distinguish it from furniture or
+  -- a wall that merely shares the same gameplay cell.
+  local visualTile, visualClass, visualTX, visualTY
+  if visible and visible.kind == "structure" then
+    visualTile, visualClass = visible.visualTile, visible.visualClass
+    visualTX, visualTY = visible.visualTX, visible.visualTY
+  elseif groundHit and groundHit.entry then
+    local e = groundHit.entry
+    visualTX = math.floor((gx - e.ox) / 8)
+    visualTY = math.floor((gz - e.oy) / 8)
+    local S = voxelStructuresFor(scene, e)
+    local k = voxelStructureKey(visualTX, visualTY)
+    local shape = S and S.shapeAt and S.shapeAt[k] or nil
+    visualTile = S and S.tileAt and S.tileAt[k] or nil
+    visualClass = shape and shape.class or nil
+  end
+  local exactVoid = visible == nil and groundHit ~= nil
+      and groundHit.entry and groundHit.entry.active
+      and visualClass == "void"
+
+  -- Keep the last exact Voxel pick visible in DEBUG OVERLAY. VOXEL/RAY are
+  -- counters, not tile ids; this line is the authoritative per-tap tile/class.
+  state.lastVoxelPick = {
+    tile = visualTile, class = visualClass,
+    tx = visualTX, ty = visualTY,
+    cellX = groundHit and groundHit.x or nil,
+    cellY = groundHit and groundHit.y or nil,
+    exactVoid = exactVoid and true or false,
+  }
+
   local outsideBehind = false
   if visible and visible.entry and visible.entry.active and not groundHit then
     local active = entries and entries[1]
@@ -2100,7 +2286,10 @@ local function voxelRayTargetFromTap(game, x, y, scene)
   if hit.entry.active then
     return { x=hit.x,y=hit.y,cur=cur,overview=overview,
              outsideBehind = outsideBehind,
-             visibleKind = visible and visible.kind or nil }
+             visibleKind = visible and visible.kind or nil,
+             visualTile = visualTile, visualClass = visualClass,
+             visualTX = visualTX, visualTY = visualTY,
+             exactVoid = exactVoid }
   end
   local wx=hit.entry.ox+(hit.x+0.5)*TILE_SIZE
   local wy=hit.entry.oy+(hit.y+0.5)*TILE_SIZE
@@ -2520,14 +2709,63 @@ local function warpIntentAt(game, map, cur, x, y)
         local ok, yes = pcall(map.isWarpTileCell, map, x, y)
         warpTile = ok and yes == true
       end
-      local exitDir = nil
-      if not warpTile or (cur and cur.x == x and cur.y == y) then
+      -- A DOWN-activated exit mat/carpet is deterministic user intent.  Even
+      -- if the visual/collision tile also reports as an arrival warp, keep a
+      -- follow-up DOWN armed as a safety net: a real arrival warp will change
+      -- maps before we can send it, while a carpet/edge mat that needs an
+      -- extra press will receive exactly the missing activation step.
+      local exitDir = listHas(dirs, "down") and "down" or nil
+      if not exitDir and (not warpTile or (cur and cur.x == x and cur.y == y)) then
         exitDir = dirs[1]
       end
       return {
         kind = "warp", x=x, y=y, def=w.def, warpDef=w.def,
         rank = warpExitRank(game, w.def), exitDir=exitDir,
+        carpetDown = exitDir == "down",
       }
+    end
+  end
+  return nil
+end
+
+-- Deterministic rescue path for Gen I exit carpets/mats.  There are two
+-- representations in the engine data:
+--   1) the clicked gameplay cell itself is the warp record and DOWN activates
+--      it (common bottom-edge exit mats), or
+--   2) the clicked visual/gameplay carpet cell is one cell IN FRONT of the
+--      warp record; standing on that source and pressing DOWN triggers
+--      Warp.extraCheck for warpCarpets/function2 tilesets.
+--
+-- Return the actual warp SOURCE cell plus a forced DOWN.  This deliberately
+-- uses the same warpActivationDirections mirror as the rest of Tap to Move,
+-- so it is keyed to Gen1Recomp's gameplay semantics rather than a fragile
+-- tileset-local art number.
+function ControlsFree.carpetDownIntentAt(game, map, cur, x, y)
+  if not map or type(x) ~= "number" or type(y) ~= "number" then return nil end
+
+  local direct = warpIntentAt(game, map, cur, x, y)
+  if direct and direct.exitDir == "down" then
+    direct.carpetDown = true
+    direct.clickedCarpetX, direct.clickedCarpetY = x, y
+    return direct
+  end
+
+  -- In function2 carpet maps the graphic the player points at can be the
+  -- FRONT cell, while the warp record lives immediately north of it.  Ask the
+  -- engine-mirrored direction test on that source; if DOWN is valid, this is
+  -- exactly the carpet semantics we want.
+  local sx, sy = x, y - 1
+  for _, w in ipairs(actualWarpCells(map)) do
+    if w.x == sx and w.y == sy then
+      local dirs = warpActivationDirections(game, map, sx, sy)
+      if listHas(dirs, "down") then
+        return {
+          kind = "warp", x = sx, y = sy, def = w.def, warpDef = w.def,
+          rank = warpExitRank(game, w.def), exitDir = "down",
+          carpetDown = true, clickedCarpetX = x, clickedCarpetY = y,
+          carpetFrontCell = true,
+        }
+      end
     end
   end
   return nil
@@ -2666,11 +2904,15 @@ local function nearestExitTarget(game, overview, cur)
       local ok, yes = pcall(map.isWarpTileCell, map, dst.x, dst.y)
       warpTile = ok and yes == true
     end
-    local exitDir = nil
-    -- Plain-floor exit carpets NEED a follow-up direction. A warp tile
-    -- normally fires on arrival, except when we already start on it (for
-    -- example after loading while standing in a doorway).
-    if not warpTile or (cur.x == dst.x and cur.y == dst.y) then
+    -- DOWN-activated carpet/mat exits always keep the extra DOWN as a
+    -- deterministic safety step. If arrival itself warps, the map transition
+    -- retires navigation before this can fire; if it does not, the press is
+    -- exactly what the engine's edge/carpet rule requires.
+    local exitDir = listHas(dirs, "down") and "down" or nil
+    -- Other plain-floor exit carpets still need their normal follow-up
+    -- direction. A regular warp tile normally fires on arrival, except when
+    -- we already start on it (for example after loading in a doorway).
+    if not exitDir and (not warpTile or (cur.x == dst.x and cur.y == dst.y)) then
       exitDir = dirs[1]
     end
 
@@ -2680,6 +2922,7 @@ local function nearestExitTarget(game, overview, cur)
       exitHops = warpExitHops(game, dst.def),
       dynamic = dynamicOnly,
       exitDir = exitDir,
+      carpetDown = exitDir == "down",
       warpDef = dst.def,
     }
   end
@@ -2766,10 +3009,62 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
 
   local tx, ty, cur, overview, targetErr, cross, targetMeta =
     targetFromTap(game, screenX, screenY)
+
+  -- The player's sprite can visually cover the interaction surface directly in
+  -- front of them (most noticeably when standing one step below a door/sign/PC
+  -- or directly against an NPC). A short tap on the visible avatar therefore
+  -- acts as a proxy for that FRONT cell, but only when the front cell actually
+  -- has interaction/door semantics. Ordinary taps on the player do not become
+  -- an implicit one-step walk. HOLD PLAYER SPRITE is unaffected because its
+  -- stationary candidate is not routed until release, and a fired START marks
+  -- the gesture suppressed before this path can run.
+  if option("interact", true) ~= false and not continuous and gestureId ~= nil
+      and ControlsFree.playerScreenHit and cur and overview then
+    local gp = pointerForGesture and pointerForGesture(gestureId) or nil
+    local sx, sy = gp and gp.startX or screenX, gp and gp.startY or screenY
+    local pdx, pdy = screenX - sx, screenY - sy
+    if pdx * pdx + pdy * pdy <= PLAYER_HOLD_MOVE_SLOP_UNITS * PLAYER_HOLD_MOVE_SLOP_UNITS
+        and ControlsFree.playerScreenHit(game, sx, sy) then
+      local player = game and game.overworld and game.overworld.player
+      local dir = player and DIR_BY_NAME[player.facing] or nil
+      if dir then
+        local fx, fy = cur.x + dir.dx, cur.y + dir.dy
+        local frontInteraction = interactionAt(game, fx, fy)
+        local frontWarp = warpIntentAt(
+          game, game and game.overworld and game.overworld.map, cur, fx, fy)
+        local frontChar = cellChar(overview, fx, fy)
+        if frontInteraction or frontWarp or frontChar == "+" then
+          tx, ty, targetErr, cross = fx, fy, nil, nil
+          targetMeta = targetMeta or {}
+          targetMeta.playerAvatarProxy = true
+          state.stats.playerAvatarInteractionProxies =
+            (state.stats.playerAvatarInteractionProxies or 0) + 1
+        end
+      end
+    end
+  end
   local exitFallback = false
   local exitIntent = nil
   local nearestFallback = false
   local semanticKind, semanticEntityId
+
+  -- v1.3.11 deterministic carpet rescue: before any "blank space" or Voxel
+  -- heuristic can reinterpret the tap, ask the actual warp data whether the
+  -- selected cell is a DOWN-activated exit mat/carpet.  Also accept the
+  -- function2 representation where the clicked carpet graphic is the cell
+  -- directly SOUTH of the warp record.  Route to the real source cell and
+  -- remember the forced DOWN for the arrival phase.
+  if tx and not cross and cur and overview and ControlsFree.carpetDownIntentAt then
+    local map = game and game.overworld and game.overworld.map
+    local carpetIntent = ControlsFree.carpetDownIntentAt(game, map, cur, tx, ty)
+    if carpetIntent then
+      targetMeta = targetMeta or {}
+      targetMeta.carpetDownIntent = carpetIntent
+      targetMeta.carpetClickedX, targetMeta.carpetClickedY = tx, ty
+      tx, ty = carpetIntent.x, carpetIntent.y
+      state.stats.carpetDownIntents = (state.stats.carpetDownIntents or 0) + 1
+    end
+  end
 
   -- In Voxel mode an exterior wall can be the first depth hit even though the
   -- ray's ground point is clearly beyond the current interior.
@@ -2788,6 +3083,54 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     -- nearest-legal movement toward the wall instead of Smart Exit.
     if not defLooksOutdoor(currentDef) then
       tx, ty, cross, targetErr = nil, nil, nil, "outside_map"
+    end
+  end
+
+  -- v1.3.10: exact Voxel visual-tile semantics beat geometry guesses.
+  -- Dramatic Shape itself labels completely black/transparent tiles as
+  -- `void`. When the ray actually lands on one of those exact 8x8 tiles in
+  -- a normal room-style building, interpret that visible black tile as EXIT
+  -- intent. Do NOT hardcode a raw tile number: ids are tileset-local, while
+  -- the resolved `void` class is stable across HOUSE/MART/CENTER/etc.
+  -- Interaction/warp semantics on the owning gameplay cell still win.
+  if tx and not cross and cur and overview and targetMeta
+      and targetMeta.exactVoid == true then
+    local map = game and game.overworld and game.overworld.map
+    local def = map and map.def
+    if ControlsFree.mapDefIsBuildingInterior
+        and ControlsFree.mapDefIsBuildingInterior(def) then
+      local exactInteraction = option("interact", true) ~= false
+        and interactionAt(game, tx, ty) or nil
+      local exactWarp = warpIntentAt(game, map, cur, tx, ty)
+      if not exactInteraction and not exactWarp then
+        tx, ty, cross, targetErr = nil, nil, nil, "outside_map"
+        state.stats.voxelExactVoidExitIntents =
+          (state.stats.voxelExactVoidExitIntents or 0) + 1
+      end
+    end
+  end
+
+  -- Small room-style interiors often contain a large collision-solid shell
+  -- around the actually usable room. Visually this is just blank/empty space,
+  -- but the tap still resolves INSIDE the map rectangle, so the old Smart Exit
+  -- gate never saw outside_map and instead treated the blank shell as a generic
+  -- obstacle (nearest-legal movement). Reclassify only boundary-connected
+  -- blank cells as outside intent. Fixed interactions, NPCs and real warp cells
+  -- keep priority, so a wall-mounted sign/PC/door cannot be stolen by this
+  -- convenience path. This is deliberately room-building-only; caves, gates
+  -- and technical indoor map segments keep their existing solid-tile behavior.
+  if tx and not cross and cur and overview and ControlsFree.exteriorVoidCell
+      and ControlsFree.exteriorVoidCell(game, overview, tx, ty) then
+    local shellInteraction = option("interact", true) ~= false
+      and interactionAt(game, tx, ty) or nil
+    local shellWarp = warpIntentAt(
+      game, game and game.overworld and game.overworld.map, cur, tx, ty)
+    if not shellInteraction and not shellWarp then
+      tx, ty, cross, targetErr = nil, nil, nil, "outside_map"
+      targetMeta = targetMeta or {}
+      targetMeta.exteriorVoid = true
+      state.stats.exteriorVoidExitIntents =
+        (state.stats.exteriorVoidExitIntents or 0) + 1
     end
   end
 
@@ -2951,8 +3294,9 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     else
       local ch = cellChar(overview, tx, ty)
       local waterMode = currentWaterMode(game, overview, cur)
-      local directWarpIntent = warpIntentAt(
-        game, game and game.overworld and game.overworld.map, cur, tx, ty)
+      local directWarpIntent = targetMeta and targetMeta.carpetDownIntent
+        or warpIntentAt(
+          game, game and game.overworld and game.overworld.map, cur, tx, ty)
       local activeExitIntent = exitIntent or directWarpIntent
       local legalMovement = ch == "." or (ch == "~" and waterMode)
       local doorSelection = activeExitIntent ~= nil or ch == "+"
@@ -3725,9 +4069,1754 @@ end
 
 -- Keep a read-only frame description for precise tap -> world-cell mapping.
 mod.hooks:wrap("render.compose", function(nextFn, renderer, ctx)
+  -- Some mobile pinch implementations deliver the survey-zoom mutation after
+  -- the touch callback which identified the gesture. Restore the reserved
+  -- pre-gesture zoom immediately before composing the frame as a second line
+  -- of defence, so a native pinch cannot visibly leak through for one frame.
+  if restoreNativeZoomSuppression and state.game then
+    restoreNativeZoomSuppression(state.game)
+  end
   captureView(ctx)
   return nextFn()
 end)
+
+local function startSelectTouchMode()
+  local value = tostring(option("start_select_touch_control", "off") or "off")
+  if value == "hold_player_sprite" or value == "pinch_or_spread" then
+    return value
+  end
+  return "off"
+end
+
+local function twoFingerFeatureEnabled()
+  return startSelectTouchMode() == "pinch_or_spread"
+end
+
+local function gestureDistance(a, b)
+  if not a or not b then return nil end
+  local dx, dy = (a.x or 0) - (b.x or 0), (a.y or 0) - (b.y or 0)
+  return math.sqrt(dx * dx + dy * dy)
+end
+
+-- Public input.pointer supplies the contacts and mod.input supplies the GB
+-- buttons. Zoom is touched only as a compatibility guard: mobile builds can
+-- synthesize pinch as zoom/wheel input outside the pointer hook, so a reserved
+-- two-finger gesture must be able to veto that one presentation shortcut.
+local function zoomModule()
+  if state.zoomModule ~= nil then
+    return state.zoomModule ~= false and state.zoomModule or nil
+  end
+  local ok, z = pcall(require, "src.render.Zoom")
+  state.zoomModule = ok and z or false
+  return ok and z or nil
+end
+
+local function nativeZoomSuppressionAlive()
+  local z = state.nativeZoomSuppression
+  if not z or not z.block then return false end
+  if z.rawActive then return true end
+  return state.tick <= (z.untilTick or -1)
+end
+
+local function captureNativeZoomSuppression(game, forceBlock)
+  local existing = state.nativeZoomSuppression
+  if existing and (existing.rawActive or state.tick <= (existing.untilTick or -1)) then
+    existing.rawActive = true
+    existing.untilTick = math.max(existing.untilTick or 0,
+                                  state.tick + PINCH_ZOOM_GRACE_TICKS)
+    if forceBlock ~= nil then existing.block = forceBlock and true or false end
+    return existing
+  end
+
+  local z = zoomModule()
+  local opts = game and game.save and game.save.options
+  local suppression = {
+    zoomOffset = z and z.offset or nil,
+    zoomOption = opts and opts.zoom or nil,
+    rawActive = true,
+    untilTick = state.tick + PINCH_ZOOM_GRACE_TICKS,
+    block = forceBlock and true or false,
+    dirty = false,
+  }
+  state.nativeZoomSuppression = suppression
+  return suppression
+end
+
+local function setNativeZoomSuppressionBlock(game, block)
+  local suppression = state.nativeZoomSuppression
+  if not suppression then
+    suppression = captureNativeZoomSuppression(game, block)
+  else
+    suppression.block = block and true or false
+  end
+  if suppression.block and restoreNativeZoomSuppression then
+    restoreNativeZoomSuppression(game)
+  end
+end
+
+restoreNativeZoomSuppression = function(game)
+  local suppression = state.nativeZoomSuppression
+  if not nativeZoomSuppressionAlive() then
+    if suppression and not suppression.rawActive
+        and state.tick > (suppression.untilTick or -1) then
+      state.nativeZoomSuppression = nil
+    end
+    return false
+  end
+
+  local changed = false
+  local z = zoomModule()
+  if z and suppression.zoomOffset ~= nil and z.offset ~= suppression.zoomOffset then
+    z.offset = suppression.zoomOffset
+    changed = true
+  end
+  local opts = game and game.save and game.save.options
+  if opts and suppression.zoomOption ~= nil and opts.zoom ~= suppression.zoomOption then
+    opts.zoom = suppression.zoomOption
+    changed = true
+  end
+  if changed then
+    suppression.dirty = true
+    state.stats.pinchZoomSuppressed =
+      (state.stats.pinchZoomSuppressed or 0) + 1
+  end
+  return changed
+end
+
+local function installZoomGestureGuard(game)
+  if state.zoomGuardInstalled or not game or type(game.zoomStep) ~= "function" then
+    return
+  end
+  local original = game.zoomStep
+  state.zoomGuardOriginal = original
+  game.zoomStep = function(self, delta)
+    if nativeZoomSuppressionAlive() then
+      state.stats.pinchZoomSuppressed =
+        (state.stats.pinchZoomSuppressed or 0) + 1
+      return
+    end
+    local gesture = state.twoFingerGesture
+    if gesture and gesture.blockZoom then
+      state.stats.pinchZoomSuppressed =
+        (state.stats.pinchZoomSuppressed or 0) + 1
+      return
+    end
+    return original(self, delta)
+  end
+  state.zoomGuardInstalled = true
+end
+
+local function captureGestureZoom(game, gesture)
+  if not gesture then return end
+  -- Raw touch tracking captures the baseline before TouchControls and before
+  -- input.pointer. Reuse that earlier baseline when available, otherwise fall
+  -- back to the historical per-gesture snapshot.
+  local suppression = state.nativeZoomSuppression
+  if suppression then
+    gesture.zoomOffset = suppression.zoomOffset
+    gesture.zoomOption = suppression.zoomOption
+    return
+  end
+  local z = zoomModule()
+  gesture.zoomOffset = z and z.offset or nil
+  gesture.zoomOption = game and game.save and game.save.options
+      and game.save.options.zoom or nil
+end
+
+local function restoreGestureZoom(game, gesture)
+  if not gesture or not gesture.blockZoom then return false end
+  local changed = false
+  -- Prefer the raw-touch baseline because it is captured before any native
+  -- touch consumer can mutate survey zoom.
+  if state.nativeZoomSuppression then
+    setNativeZoomSuppressionBlock(game, true)
+    changed = restoreNativeZoomSuppression(game) or changed
+  else
+    local z = zoomModule()
+    if z and gesture.zoomOffset ~= nil and z.offset ~= gesture.zoomOffset then
+      z.offset = gesture.zoomOffset
+      changed = true
+    end
+    local opts = game and game.save and game.save.options
+    if opts and gesture.zoomOption ~= nil and opts.zoom ~= gesture.zoomOption then
+      opts.zoom = gesture.zoomOption
+      changed = true
+    end
+  end
+  if changed then gesture.zoomDirty = true end
+  return changed
+end
+
+local function rawTouchCount()
+  local count = 0
+  for _ in pairs(state.rawZoomTouches or {}) do count = count + 1 end
+  return count
+end
+
+local function rawGestureIds()
+  local ids = {}
+  for id in pairs(state.rawZoomTouches or {}) do ids[#ids + 1] = id end
+  table.sort(ids, function(a, b) return tostring(a) < tostring(b) end)
+  return ids
+end
+
+local function suppressRawGesturePointer(id)
+  local p = id and state.pointers[id]
+  if not p then return end
+  p.gestureSuppressed = "two_finger_gesture"
+  p.manualSuppressed = true
+  p.ignored = true
+end
+
+-- Raw game touches are the authoritative mobile gesture stream.  They arrive
+-- before TouchControls gets first refusal, which matters because the second
+-- finger may land over a virtual control and therefore never reach
+-- input.pointer.  v1.2.2 already used this layer to suppress native zoom; from
+-- v1.2.3 the START/SELECT remaps use the same exact contact pair as well.
+local function beginRawTwoFingerGesture(game)
+  if state.twoFingerGesture or not twoFingerFeatureEnabled() then return false end
+  local ids = rawGestureIds()
+  if #ids < 2 then return false end
+  local a, b = state.rawZoomTouches[ids[1]], state.rawZoomTouches[ids[2]]
+  local dist = gestureDistance(a, b)
+  if not dist then return false end
+
+  local gesture = {
+    id1 = ids[1], id2 = ids[2], startDistance = dist, lastDistance = dist,
+    direction = nil, fired = false, ended = false, blockZoom = true,
+    raw = true,
+  }
+  state.twoFingerGesture = gesture
+  captureGestureZoom(game, gesture)
+  suppressRawGesturePointer(gesture.id1)
+  suppressRawGesturePointer(gesture.id2)
+  for _, gid in ipairs({ gesture.id1, gesture.id2 }) do
+    local dt = state.dialogTouches and state.dialogTouches[gid]
+    if dt then
+      if dt.bFired then gesture.actionSuppressed = true end
+      dt.suppressed = true
+    end
+    local bt = state.battleTouches and state.battleTouches[gid]
+    if bt then
+      if bt.bFired then gesture.actionSuppressed = true end
+      bt.suppressed = true
+    end
+    local ph = state.playerHoldTouches and state.playerHoldTouches[gid]
+    if ph then ph.cancelled = true; ph.cancelReason = "two_finger" end
+    -- A bottom-edge reservation may have swallowed the first finger before
+    -- input.pointer. Once a true two-finger gesture owns that contact, keep
+    -- the reservation swallowed through release so it cannot replay a stray
+    -- tap after START/SELECT fires.
+    local edge = state.systemEdgeTouches and state.systemEdgeTouches[gid]
+    if edge then edge.systemGesture = true; edge.twoFingerSuppressed = true end
+    -- The first overworld finger may still be inside the short pairing grace
+    -- window and therefore has not reached Tap to Move at all. Claim it now so
+    -- its later release can never replay a single-touch route underneath the
+    -- two-finger START/SELECT gesture.
+    local grace = state.pinchGraceTouches and state.pinchGraceTouches[gid]
+    if grace then
+      grace.suppressed = true
+      grace.suppressReason = "two_finger_gesture"
+    end
+  end
+  state.stats.pinchGracePairsClaimed =
+    (state.stats.pinchGracePairsClaimed or 0) + 1
+  if state.nav then cancelRoute("two_finger_gesture") end
+  state.stats.twoFingerGestures = (state.stats.twoFingerGestures or 0) + 1
+  return true
+end
+
+local function classifyRawTwoFingerGesture(game)
+  local gesture = state.twoFingerGesture
+  if not gesture or not gesture.raw or gesture.ended or gesture.direction then return end
+  local a = state.rawZoomTouches and state.rawZoomTouches[gesture.id1]
+  local b = state.rawZoomTouches and state.rawZoomTouches[gesture.id2]
+  local dist = gestureDistance(a, b)
+  if not dist then return end
+  gesture.lastDistance = dist
+  local threshold = math.max(TWO_FINGER_TRIGGER_UNITS,
+                             (gesture.startDistance or dist) * TWO_FINGER_TRIGGER_RATIO)
+  local delta = dist - (gesture.startDistance or dist)
+  if math.abs(delta) < threshold then
+    restoreGestureZoom(game, gesture)
+    return
+  end
+
+  local direction = delta > 0 and "spread" or "pinch"
+  gesture.direction = direction
+  -- PINCH OR SPREAD owns the complete two-finger gesture. While selected,
+  -- native pinch/spread zoom is disabled and the classified gesture is mapped
+  -- directly to the corresponding Game Boy button.
+  gesture.blockZoom = twoFingerFeatureEnabled()
+  if state.nativeZoomSuppression then
+    setNativeZoomSuppressionBlock(game, gesture.blockZoom)
+  end
+  if gesture.blockZoom then restoreGestureZoom(game, gesture) end
+
+  if not gesture.actionSuppressed
+      and twoFingerFeatureEnabled() and direction == "spread" then
+    mod.input:tap(game, "start")
+    gesture.fired = true
+    state.stats.gestureStartTriggers =
+      (state.stats.gestureStartTriggers or 0) + 1
+  elseif not gesture.actionSuppressed
+      and twoFingerFeatureEnabled() and direction == "pinch" then
+    mod.input:tap(game, "select")
+    gesture.fired = true
+    state.stats.gestureSelectTriggers =
+      (state.stats.gestureSelectTriggers or 0) + 1
+  end
+end
+
+local function finishRawTwoFingerGesture(game, id)
+  local gesture = state.twoFingerGesture
+  if not gesture or not gesture.raw
+      or (id ~= gesture.id1 and id ~= gesture.id2) then return end
+  gesture.ended = true
+  restoreGestureZoom(game, gesture)
+  -- Raw zoom suppression deliberately outlives the contact pair.  Do not clear
+  -- it here: delayed native pinch callbacks are still blocked by the grace
+  -- latch established in noteRawTouchReleased.
+  gesture.blockZoom = false
+end
+
+local function maybeClearRawTwoFingerGesture(game)
+  local gesture = state.twoFingerGesture
+  if not gesture or not gesture.raw then return end
+  if state.rawZoomTouches[gesture.id1] or state.rawZoomTouches[gesture.id2] then
+    return
+  end
+  local suppression = state.nativeZoomSuppression
+  if (gesture.zoomDirty or (suppression and suppression.dirty))
+      and game and type(game.writeOptions) == "function" then
+    pcall(function() game:writeOptions() end)
+    if suppression then suppression.dirty = false end
+  end
+  state.twoFingerGesture = nil
+end
+
+local function noteRawTouchPressed(game, id, x, y)
+  if id == nil or id == "mouse" then return end
+  state.rawZoomTouches = state.rawZoomTouches or {}
+  state.rawZoomTouches[id] = { x = x, y = y }
+  if rawTouchCount() >= 2 and twoFingerFeatureEnabled() then
+    installZoomGestureGuard(game)
+    -- Before the direction is classified we reserve zoom provisionally, which
+    -- matches the original behaviour of the remap recognizer. PINCH OR
+    -- SPREAD therefore blocks native zoom immediately from second-finger down.
+    captureNativeZoomSuppression(game, true)
+    restoreNativeZoomSuppression(game)
+    beginRawTwoFingerGesture(game)
+    local gesture = state.twoFingerGesture
+    if gesture and gesture.raw then
+      suppressRawGesturePointer(gesture.id1)
+      suppressRawGesturePointer(gesture.id2)
+    end
+  end
+end
+
+local function noteRawTouchMoved(game, id, x, y)
+  local t = state.rawZoomTouches and state.rawZoomTouches[id]
+  if not t then return end
+  t.x, t.y = x, y
+  local suppression = state.nativeZoomSuppression
+  if suppression and rawTouchCount() >= 2 then
+    suppression.rawActive = true
+    suppression.untilTick = state.tick + PINCH_ZOOM_GRACE_TICKS
+    restoreNativeZoomSuppression(game)
+  end
+  local gesture = state.twoFingerGesture
+  if gesture and gesture.raw then
+    suppressRawGesturePointer(gesture.id1)
+    suppressRawGesturePointer(gesture.id2)
+    classifyRawTwoFingerGesture(game)
+    restoreGestureZoom(game, gesture)
+  end
+end
+
+local function noteRawTouchReleased(game, id)
+  if not (state.rawZoomTouches and state.rawZoomTouches[id]) then return end
+  finishRawTwoFingerGesture(game, id)
+  state.rawZoomTouches[id] = nil
+  local suppression = state.nativeZoomSuppression
+  if suppression and rawTouchCount() < 2 then
+    suppression.rawActive = false
+    suppression.untilTick = state.tick + PINCH_ZOOM_GRACE_TICKS
+    restoreNativeZoomSuppression(game)
+  end
+  maybeClearRawTwoFingerGesture(game)
+end
+
+local function installRawPinchZoomGuard(game)
+  if state.rawZoomGuardInstalled or not game then return false end
+  if type(game.touchpressed) ~= "function" or type(game.touchmoved) ~= "function"
+      or type(game.touchreleased) ~= "function" then
+    return false
+  end
+
+  installZoomGestureGuard(game)
+  local pressed, moved, released = game.touchpressed, game.touchmoved, game.touchreleased
+  state.rawZoomGuardOriginal = {
+    touchpressed = pressed, touchmoved = moved, touchreleased = released,
+  }
+
+  -- Everything below the bottom-edge reservation goes through these three
+  -- dispatchers. This lets a reserved contact be replayed into the SAME
+  -- dialogue/battle/player-hold/native path once we know it was not an OS
+  -- navigation swipe, without re-entering raw two-finger tracking twice.
+  local function dispatchPress(self, id, x, y, dx, dy, pressure)
+    state.rawDispatchedTouches = state.rawDispatchedTouches or {}
+    state.rawDispatchedTouches[id] = true
+    local battleOwned = id ~= nil and id ~= "mouse"
+        and ControlsFree.battleTouchFeatureEnabled(self)
+    if battleOwned then
+      state.battleCameraOwnedTouches = state.battleCameraOwnedTouches or {}
+      state.battleCameraOwnedTouches[id] = true
+      state.stats.battleCameraTouchesSuppressed =
+        (state.stats.battleCameraTouchesSuppressed or 0) + 1
+    end
+
+    if state.dialogTouches and state.dialogTouches[id] then return true end
+    if state.battleTouches and state.battleTouches[id] then return true end
+    if not state.twoFingerGesture and ControlsFree.beginDialogTouch(self, id, x, y) then
+      return true
+    end
+    if not state.twoFingerGesture and ControlsFree.beginBattleTouch(self, id, x, y) then
+      return true
+    end
+
+    if not (state.playerHoldTouches and state.playerHoldTouches[id]) then
+      ControlsFree.beginPlayerHoldTouch(self, id, x, y)
+    end
+    if battleOwned then return true end
+    return pressed(self, id, x, y, dx, dy, pressure)
+  end
+
+  local function dispatchMove(self, id, x, y, dx, dy, pressure)
+    if ControlsFree.moveDialogTouch(id, x, y) then return true end
+    if ControlsFree.moveBattleTouch(id, x, y) then return true end
+    ControlsFree.movePlayerHoldTouch(id, x, y)
+    if state.battleCameraOwnedTouches and state.battleCameraOwnedTouches[id] then
+      return true
+    end
+    return moved(self, id, x, y, dx, dy, pressure)
+  end
+
+  local function dispatchRelease(self, id, x, y, dx, dy, pressure)
+    if state.rawDispatchedTouches then state.rawDispatchedTouches[id] = nil end
+    local battleOwned = state.battleCameraOwnedTouches
+        and state.battleCameraOwnedTouches[id] == true
+
+    if state.dialogTouches and state.dialogTouches[id] then
+      ControlsFree.finishDialogTouch(self, id, x, y, false)
+      if state.battleCameraOwnedTouches then state.battleCameraOwnedTouches[id] = nil end
+      ControlsFree.finishPlayerHoldTouch(id)
+      return true
+    end
+    if state.battleTouches and state.battleTouches[id] then
+      ControlsFree.finishBattleTouch(self, id, x, y, false)
+      if state.battleCameraOwnedTouches then state.battleCameraOwnedTouches[id] = nil end
+      ControlsFree.finishPlayerHoldTouch(id)
+      return true
+    end
+
+    if battleOwned then
+      state.battleCameraOwnedTouches[id] = nil
+      ControlsFree.finishPlayerHoldTouch(id)
+      return true
+    end
+
+    local result = released(self, id, x, y, dx, dy, pressure)
+    ControlsFree.finishPlayerHoldTouch(id)
+    return result
+  end
+
+  -- Expose only these already-sanitized dispatch closures to the fixed-step
+  -- grace promoter. They bypass THIS raw wrapper (so raw gesture bookkeeping
+  -- is not counted twice) but still flow through TouchControls + input.pointer
+  -- exactly as a normal single touch would have.
+  state.rawTouchDispatchPress = dispatchPress
+  state.rawTouchDispatchMove = dispatchMove
+  state.rawTouchDispatchRelease = dispatchRelease
+
+  game.touchpressed = function(self, id, x, y, dx, dy, pressure)
+    -- A lifecycle interruption can swallow the previous release. Any NEW press
+    -- with the same host touch id is authoritative and retires stale ownership.
+    if state.nativeControlOwnedTouches then state.nativeControlOwnedTouches[id] = nil end
+
+    -- Absolute priority for Gen1Recomp's visible virtual controls. Ownership is
+    -- decided only at touch-DOWN: a finger that starts on A/B/D-pad/START/SELECT
+    -- bypasses every Tap-to-Move/dialog/battle/pinch/system-edge classifier and
+    -- rides the native TouchControls lifecycle unchanged. A world finger that
+    -- merely crosses over a control later remains a world/hold gesture.
+    if id ~= nil and id ~= "mouse" and ControlsFree.rawTouchControlHit(self, x, y) then
+      state.nativeControlOwnedTouches = state.nativeControlOwnedTouches or {}
+      state.nativeControlOwnedTouches[id] = true
+      state.stats.nativeControlTouchesBypassed =
+        (state.stats.nativeControlTouchesBypassed or 0) + 1
+      return pressed(self, id, x, y, dx, dy, pressure)
+    end
+
+    noteRawTouchPressed(self, id, x, y)
+
+    -- The second finger can create the raw gesture before it ever reaches
+    -- TouchControls/input.pointer. Once that happens, neither participant may
+    -- leak a synthetic single-touch press into gameplay.
+    local rawGesture = state.twoFingerGesture
+    if rawGesture and rawGesture.raw
+        and (id == rawGesture.id1 or id == rawGesture.id2) then
+      restoreNativeZoomSuppression(self)
+      return true
+    end
+
+    -- Reserve bottom-edge WORLD contacts before input.pointer. Visible native
+    -- controls have already bypassed the mod above, and systemEdgeGuardEnabled
+    -- limits this reservation to the bare overworld, so this suppresses only a
+    -- possible false Tap-to-Move command rather than disabling app controls.
+    if ControlsFree.beginSystemEdgeTouch(self, id, x, y) then
+      -- Preserve HOLD PLAYER SPRITE: the edge guard suppresses only world
+      -- movement. A stationary avatar hold may still intentionally fire START.
+      ControlsFree.beginPlayerHoldTouch(self, id, x, y)
+      restoreNativeZoomSuppression(self)
+      return true
+    end
+
+    -- PINCH OR SPREAD needs a short first-finger pairing window on the free
+    -- overworld. Tap to Move used to act on press immediately, so a human
+    -- placing finger #2 a few frames later could get one walking step plus
+    -- START/SELECT. During this grace the first touch is not forwarded at all.
+    if ControlsFree.beginPinchGraceTouch(self, id, x, y, dx, dy, pressure) then
+      restoreNativeZoomSuppression(self)
+      return true
+    end
+
+    local result = dispatchPress(self, id, x, y, dx, dy, pressure)
+    restoreNativeZoomSuppression(self)
+    return result
+  end
+
+  game.touchmoved = function(self, id, x, y, dx, dy, pressure)
+    if state.nativeControlOwnedTouches and state.nativeControlOwnedTouches[id] then
+      return moved(self, id, x, y, dx, dy, pressure)
+    end
+
+    noteRawTouchMoved(self, id, x, y)
+
+    local rawGesture = state.twoFingerGesture
+    if rawGesture and rawGesture.raw
+        and (id == rawGesture.id1 or id == rawGesture.id2) then
+      ControlsFree.movePinchGraceTouch(id, x, y, dx, dy, pressure)
+      restoreNativeZoomSuppression(self)
+      return true
+    end
+
+    if ControlsFree.movePinchGraceTouch(id, x, y, dx, dy, pressure) then
+      restoreNativeZoomSuppression(self)
+      return true
+    end
+
+    local edgeStatus = state.systemEdgeTouches and state.systemEdgeTouches[id]
+        and "pending" or nil
+    if edgeStatus then
+      edgeStatus = ControlsFree.moveSystemEdgeTouch(self, id, x, y)
+      ControlsFree.movePlayerHoldTouch(id, x, y)
+      if edgeStatus == "promote" then
+        local edge = state.systemEdgeTouches[id]
+        state.systemEdgeTouches[id] = nil
+        dispatchPress(self, id, edge.startX, edge.startY, 0, 0, pressure)
+        local result = dispatchMove(self, id, x, y, dx, dy, pressure)
+        restoreNativeZoomSuppression(self)
+        return result
+      end
+      restoreNativeZoomSuppression(self)
+      return true
+    end
+
+    local result = dispatchMove(self, id, x, y, dx, dy, pressure)
+    restoreNativeZoomSuppression(self)
+    return result
+  end
+
+  game.touchreleased = function(self, id, x, y, dx, dy, pressure)
+    if state.nativeControlOwnedTouches and state.nativeControlOwnedTouches[id] then
+      -- Keep the ownership flag set while the original Game path calls the
+      -- TouchControls fallback wrapper, so that wrapper can forward the native
+      -- release instead of mistaking it for battle-camera suppression.
+      local result = released(self, id, x, y, dx, dy, pressure)
+      state.nativeControlOwnedTouches[id] = nil
+      return result
+    end
+
+    local rawGesture = state.twoFingerGesture
+    if rawGesture and rawGesture.raw
+        and (id == rawGesture.id1 or id == rawGesture.id2) then
+      if state.pinchGraceTouches then state.pinchGraceTouches[id] = nil end
+      -- If this finger had already left the grace window before finger #2
+      -- arrived, it owns a real Game/TouchControls press that still requires
+      -- its matching release for cleanup. Gesture suppression above guarantees
+      -- that this release cannot start another route or A/D-pad action.
+      if state.rawDispatchedTouches and state.rawDispatchedTouches[id] then
+        dispatchRelease(self, id, x, y, dx, dy, pressure)
+      else
+        -- Grace/system-edge contacts were never sent into Game. Retire any
+        -- provisional classifier state directly instead of manufacturing a
+        -- release for a press that never existed.
+        if state.systemEdgeTouches then state.systemEdgeTouches[id] = nil end
+        if state.dialogTouches then state.dialogTouches[id] = nil end
+        if state.battleTouches then state.battleTouches[id] = nil end
+        ControlsFree.finishPlayerHoldTouch(id)
+      end
+      noteRawTouchReleased(self, id)
+      restoreNativeZoomSuppression(self)
+      return true
+    end
+
+    local grace = state.pinchGraceTouches and state.pinchGraceTouches[id]
+    if grace then
+      state.pinchGraceTouches[id] = nil
+      local result
+      if not grace.suppressed then
+        -- A quick ordinary tap can end before the 0.20 s timer. Replay press +
+        -- release now; this preserves normal Tap to Move semantics while still
+        -- guaranteeing there was no press-time movement available to a pinch.
+        dispatchPress(self, id, grace.startX, grace.startY, 0, 0, grace.pressure)
+        result = dispatchRelease(self, id, x, y, dx, dy, pressure)
+        state.stats.pinchGraceReleaseReplays =
+          (state.stats.pinchGraceReleaseReplays or 0) + 1
+      else
+        result = true
+      end
+      noteRawTouchReleased(self, id)
+      restoreNativeZoomSuppression(self)
+      return result
+    end
+
+    local edge = state.systemEdgeTouches and state.systemEdgeTouches[id]
+    if edge then
+      local edgeStatus = ControlsFree.moveSystemEdgeTouch(self, id, x, y)
+      edge = state.systemEdgeTouches[id]
+      state.systemEdgeTouches[id] = nil
+      local ph = state.playerHoldTouches and state.playerHoldTouches[id]
+
+      if edgeStatus == "system" or (ph and ph.fired) then
+        noteRawTouchReleased(self, id)
+        ControlsFree.finishPlayerHoldTouch(id)
+        restoreNativeZoomSuppression(self)
+        return true
+      end
+
+      -- It was merely a tap/other gesture that happened to START near the
+      -- system edge. Replay the deferred press at its original point, then
+      -- release at the real endpoint so normal A/swipe/navigation semantics
+      -- are preserved without any press-time false movement.
+      dispatchPress(self, id, edge.startX, edge.startY, 0, 0, pressure)
+      local result = dispatchRelease(self, id, x, y, dx, dy, pressure)
+      noteRawTouchReleased(self, id)
+      restoreNativeZoomSuppression(self)
+      return result
+    end
+
+    local result = dispatchRelease(self, id, x, y, dx, dy, pressure)
+    noteRawTouchReleased(self, id)
+    restoreNativeZoomSuppression(self)
+    return result
+  end
+
+  state.rawZoomGuardInstalled = true
+  return true
+end
+
+local function suppressGesturePointer(id)
+  local p = id and state.pointers[id]
+  if not p then return end
+  p.gestureSuppressed = "two_finger_gesture"
+  p.manualSuppressed = true
+end
+
+local function beginTwoFingerGesture(game)
+  if state.twoFingerGesture or not twoFingerFeatureEnabled() then return false end
+  local ids = {}
+  for id in pairs(state.gestureTouches or {}) do ids[#ids + 1] = id end
+  if #ids < 2 then return false end
+  table.sort(ids, function(a, b) return tostring(a) < tostring(b) end)
+  local a, b = state.gestureTouches[ids[1]], state.gestureTouches[ids[2]]
+  local dist = gestureDistance(a, b)
+  if not dist then return false end
+
+  installZoomGestureGuard(game)
+  local gesture = {
+    id1 = ids[1], id2 = ids[2], startDistance = dist, lastDistance = dist,
+    direction = nil, fired = false, ended = false, blockZoom = true,
+  }
+  state.twoFingerGesture = gesture
+  captureGestureZoom(game, gesture)
+  suppressGesturePointer(gesture.id1)
+  suppressGesturePointer(gesture.id2)
+  if state.nav then cancelRoute("two_finger_gesture") end
+  state.stats.twoFingerGestures = (state.stats.twoFingerGestures or 0) + 1
+  return true
+end
+
+local function classifyTwoFingerGesture(game)
+  local gesture = state.twoFingerGesture
+  if not gesture or gesture.ended or gesture.direction then return end
+  local a = state.gestureTouches[gesture.id1]
+  local b = state.gestureTouches[gesture.id2]
+  local dist = gestureDistance(a, b)
+  if not dist then return end
+  gesture.lastDistance = dist
+  local threshold = math.max(TWO_FINGER_TRIGGER_UNITS,
+                             (gesture.startDistance or dist) * TWO_FINGER_TRIGGER_RATIO)
+  local delta = dist - (gesture.startDistance or dist)
+  if math.abs(delta) < threshold then
+    restoreGestureZoom(game, gesture)
+    return
+  end
+
+  local direction = delta > 0 and "spread" or "pinch"
+  gesture.direction = direction
+  -- PINCH OR SPREAD owns the complete two-finger gesture. While selected,
+  -- native pinch/spread zoom is disabled and the classified gesture is mapped
+  -- directly to the corresponding Game Boy button.
+  gesture.blockZoom = twoFingerFeatureEnabled()
+  if state.nativeZoomSuppression then
+    setNativeZoomSuppressionBlock(game, gesture.blockZoom)
+  end
+  if gesture.blockZoom then restoreGestureZoom(game, gesture) end
+
+  if twoFingerFeatureEnabled() and direction == "spread" then
+    mod.input:tap(game, "start")
+    gesture.fired = true
+    state.stats.gestureStartTriggers =
+      (state.stats.gestureStartTriggers or 0) + 1
+  elseif twoFingerFeatureEnabled() and direction == "pinch" then
+    mod.input:tap(game, "select")
+    gesture.fired = true
+    state.stats.gestureSelectTriggers =
+      (state.stats.gestureSelectTriggers or 0) + 1
+  end
+end
+
+local function finishTwoFingerGesture(game, id)
+  local gesture = state.twoFingerGesture
+  if not gesture or (id ~= gesture.id1 and id ~= gesture.id2) then return end
+  gesture.ended = true
+  restoreGestureZoom(game, gesture)
+  -- Do not drop the raw suppression latch here. Some platforms deliver the
+  -- actual survey-zoom command after the touch release. raw touch tracking
+  -- keeps the captured baseline alive for PINCH_ZOOM_GRACE_TICKS.
+  gesture.blockZoom = false
+end
+
+local function maybeClearTwoFingerGesture(game)
+  local gesture = state.twoFingerGesture
+  if not gesture then return end
+  if state.gestureTouches[gesture.id1] or state.gestureTouches[gesture.id2] then
+    return
+  end
+  local suppression = state.nativeZoomSuppression
+  if (gesture.zoomDirty or (suppression and suppression.dirty))
+      and game and type(game.writeOptions) == "function" then
+    pcall(function() game:writeOptions() end)
+    if suppression then suppression.dirty = false end
+  end
+  state.twoFingerGesture = nil
+end
+
+local function trackTwoFingerPointer(game, ev)
+  if not ev or ev.source ~= "touch" then return end
+  -- Real mobile touches are already classified at Game:touch* before
+  -- TouchControls can swallow either contact. Keep input.pointer only as a
+  -- compatibility fallback if that raw bridge could not be installed.
+  if state.rawZoomGuardInstalled then return end
+  if not twoFingerFeatureEnabled() and not state.twoFingerGesture then return end
+  state.gestureTouches = state.gestureTouches or {}
+  local id = ev.id
+  if ev.phase == "pressed" then
+    state.gestureTouches[id] = { x = ev.x, y = ev.y }
+    if state.twoFingerGesture then
+      suppressGesturePointer(id)
+    else
+      beginTwoFingerGesture(game)
+    end
+  elseif ev.phase == "moved" then
+    local t = state.gestureTouches[id]
+    if t then t.x, t.y = ev.x, ev.y end
+    if state.twoFingerGesture then
+      suppressGesturePointer(id)
+      classifyTwoFingerGesture(game)
+      restoreGestureZoom(game, state.twoFingerGesture)
+    end
+  elseif ev.phase == "released" or ev.phase == "cancelled" then
+    finishTwoFingerGesture(game, id)
+    state.gestureTouches[id] = nil
+    maybeClearTwoFingerGesture(game)
+  end
+end
+
+-- Exact dialogue recognition. TextBox exposes isTextBox on its class, so this
+-- does not guess from screen geometry or overworld lock state. An anchored
+-- YES/NO ChoiceBox is also part of dialogue when a TextBox is immediately
+-- underneath it on the stack.
+function ControlsFree.dialogueActive(game)
+  local stack = game and game.stack
+  if not stack or type(stack.top) ~= "function" then return false end
+  local ok, top = pcall(stack.top, stack)
+  if not ok or not top then return false end
+  if top.isTextBox == true then return true end
+  local states = stack.states
+  if top.anchor == "bottom" and type(states) == "table" and #states >= 2 then
+    local under = states[#states - 1]
+    if under and under.isTextBox == true then return true end
+  end
+  return false
+end
+
+function ControlsFree.hostOS()
+  if not (love and love.system and type(love.system.getOS) == "function") then
+    return nil
+  end
+  local ok, name = pcall(love.system.getOS)
+  return ok and name or nil
+end
+
+function ControlsFree.mobileHost()
+  local osName = ControlsFree.hostOS()
+  return osName == "Android" or osName == "iOS"
+end
+
+function ControlsFree.desktopHost()
+  local osName = ControlsFree.hostOS()
+  return osName ~= "Android" and osName ~= "iOS" and osName ~= "NX"
+end
+
+-- PINCH OR SPREAD uses raw Game:touch* input so it can see both contacts before
+-- TouchControls or input.pointer consume them. The first overworld finger is
+-- therefore held briefly in a pairing grace window. This prevents the classic
+-- race where Tap to Move starts walking on finger #1 and finger #2 then turns
+-- the same physical gesture into START/SELECT.
+function ControlsFree.rawTouchControlHit(game, x, y)
+  local tc = game and game.touchControls
+  if type(tc) ~= "table" or type(tc.hitTest) ~= "function" then return false end
+  if type(tc.visible) == "function" then
+    local okVisible, visible = pcall(tc.visible, tc)
+    if okVisible and not visible then return false end
+  end
+  local ok, hit = pcall(tc.hitTest, tc, x, y)
+  return ok and hit ~= nil
+end
+
+function ControlsFree.beginPinchGraceTouch(game, id, x, y, dx, dy, pressure)
+  if id == nil or id == "mouse" or not ControlsFree.mobileHost()
+      or not twoFingerFeatureEnabled() or state.twoFingerGesture
+      or rawTouchCount() ~= 1 then
+    return false
+  end
+  local free = overworldGate(game)
+  if not free then return false end
+  -- Do not add latency to the visible virtual D-pad/A/B/etc. Pinch tolerance is
+  -- specifically for the world surface where Tap to Move would otherwise act
+  -- immediately on the first finger.
+  if ControlsFree.rawTouchControlHit(game, x, y) then return false end
+
+  state.pinchGraceTouches = state.pinchGraceTouches or {}
+  state.pinchGraceTouches[id] = {
+    startX = x, startY = y, x = x, y = y,
+    dx = dx or 0, dy = dy or 0, pressure = pressure,
+    startedTick = state.tick, suppressed = false,
+  }
+  state.stats.pinchGraceCandidates = (state.stats.pinchGraceCandidates or 0) + 1
+  return true
+end
+
+function ControlsFree.movePinchGraceTouch(id, x, y, dx, dy, pressure)
+  local t = state.pinchGraceTouches and state.pinchGraceTouches[id]
+  if not t then return false end
+  t.x, t.y = x, y
+  t.dx, t.dy = dx or t.dx or 0, dy or t.dy or 0
+  if pressure ~= nil then t.pressure = pressure end
+  return true
+end
+
+function ControlsFree.promotePinchGraceTouches(game)
+  if not state.pinchGraceTouches or next(state.pinchGraceTouches) == nil then return end
+  local press = state.rawTouchDispatchPress
+  local move = state.rawTouchDispatchMove
+  if type(press) ~= "function" then return end
+
+  for id, t in pairs(state.pinchGraceTouches) do
+    if t.suppressed then
+      -- Keep the record until physical release so the raw wrapper knows this
+      -- contact must stay swallowed for the whole two-finger gesture.
+    elseif state.twoFingerGesture then
+      t.suppressed = true
+      t.suppressReason = "two_finger_gesture"
+    elseif state.tick - (t.startedTick or state.tick) + 1
+        >= ControlsFree.PINCH_FIRST_TOUCH_GRACE_TICKS then
+      local free = overworldGate(game)
+      if not free then
+        t.suppressed = true
+        t.suppressReason = "overworld_not_free"
+      else
+        state.pinchGraceTouches[id] = nil
+        press(game, id, t.startX, t.startY, 0, 0, t.pressure)
+        if type(move) == "function" and (t.x ~= t.startX or t.y ~= t.startY) then
+          move(game, id, t.x, t.y, t.x - t.startX, t.y - t.startY, t.pressure)
+        end
+        state.stats.pinchGracePromotions =
+          (state.stats.pinchGracePromotions or 0) + 1
+      end
+    end
+  end
+end
+
+function ControlsFree.prunePinchGraceTouches()
+  if not state.pinchGraceTouches or next(state.pinchGraceTouches) == nil then return end
+  local touch = love and love.touch
+  if type(touch) ~= "table" or type(touch.getTouches) ~= "function" then return end
+  local ok, ids = pcall(touch.getTouches)
+  if not ok or type(ids) ~= "table" then return end
+  local active = {}
+  for _, id in ipairs(ids) do active[id] = true end
+  for id in pairs(state.pinchGraceTouches) do
+    if not active[id] then
+      state.pinchGraceTouches[id] = nil
+      if state.rawZoomTouches then state.rawZoomTouches[id] = nil end
+      state.stats.pinchGraceCancelled = (state.stats.pinchGraceCancelled or 0) + 1
+    end
+  end
+end
+
+-- There is no portable LÖVE callback that says "the OS has claimed this touch".
+-- Instead, reserve only bare-overworld WORLD touches that START in the phone's
+-- bottom system-gesture strip. A strongly upward, vertically dominant move is
+-- discarded as a probable OS navigation gesture. Visible native controls are
+-- detected earlier and bypass this guard entirely; UI/battle states do not enter
+-- it. Other world contacts are promoted back into the normal Gen1Recomp path.
+function ControlsFree.systemEdgeGuardEnabled(game)
+  -- This guard exists only to prevent a probable phone Home/app-switch swipe
+  -- from becoming a Tap-to-Move WORLD command. It must never reserve the
+  -- application's own virtual controls or generic UI touches. Native controls
+  -- are bypassed before this function is reached; overlays/battles fail the
+  -- bare-overworld gate here and keep their normal touch stream.
+  local free = overworldGate(game)
+  return ControlsFree.mobileHost()
+      and option("enabled", true) ~= false
+      and free == true
+end
+
+function ControlsFree.touchWindowHeight()
+  local h = state.frame and tonumber(state.frame.wh) or nil
+  if (not h or h <= 0) and love and love.graphics
+      and type(love.graphics.getDimensions) == "function" then
+    local ok, _, gh = pcall(love.graphics.getDimensions)
+    if ok then h = tonumber(gh) end
+  end
+  return h
+end
+
+function ControlsFree.beginSystemEdgeTouch(game, id, x, y)
+  if id == nil or id == "mouse" or not ControlsFree.systemEdgeGuardEnabled(game) then
+    return false
+  end
+  local h = ControlsFree.touchWindowHeight()
+  if not h or h <= 0 then return false end
+  local band = math.max(ControlsFree.SYSTEM_EDGE_START_BAND_MIN_UNITS,
+    math.min(ControlsFree.SYSTEM_EDGE_START_BAND_MAX_UNITS,
+      h * ControlsFree.SYSTEM_EDGE_START_BAND_RATIO))
+  if y < h - band then return false end
+  state.systemEdgeTouches = state.systemEdgeTouches or {}
+  state.systemEdgeTouches[id] = {
+    startX = x, startY = y, x = x, y = y, startedTick = state.tick,
+    systemGesture = false,
+  }
+  state.stats.systemEdgeCandidates = (state.stats.systemEdgeCandidates or 0) + 1
+  return true
+end
+
+-- Returns nil when this id is not reserved, otherwise "pending", "system"
+-- or "promote". Promotion is intentionally conservative: a strong sideways
+-- or downward move is clearly not the phone's bottom-up navigation gesture and
+-- can be returned to gameplay immediately. Upward-ish motion stays reserved
+-- until it either crosses the OS threshold or releases.
+function ControlsFree.moveSystemEdgeTouch(game, id, x, y)
+  local t = state.systemEdgeTouches and state.systemEdgeTouches[id]
+  if not t then return nil end
+  t.x, t.y = x, y
+  if t.systemGesture then return "system" end
+  local dx, dy = x - t.startX, y - t.startY
+  local up = -dy
+  local side = math.abs(dx)
+  if up >= ControlsFree.SYSTEM_EDGE_UP_TRIGGER_UNITS
+      and up >= side * ControlsFree.SYSTEM_EDGE_AXIS_RATIO then
+    t.systemGesture = true
+    local ph = state.playerHoldTouches and state.playerHoldTouches[id]
+    if ph then ph.cancelled = true; ph.cancelReason = "system_edge_swipe" end
+    state.stats.systemEdgeSwipesSuppressed =
+      (state.stats.systemEdgeSwipesSuppressed or 0) + 1
+    if state.nav then cancelRoute("system_edge_swipe") end
+    return "system"
+  end
+  if dy >= ControlsFree.SYSTEM_EDGE_UP_TRIGGER_UNITS
+      or (side >= ControlsFree.SYSTEM_EDGE_SIDE_ESCAPE_UNITS and side > math.max(0, up)) then
+    state.stats.systemEdgeTouchesPromoted =
+      (state.stats.systemEdgeTouchesPromoted or 0) + 1
+    return "promote"
+  end
+  return "pending"
+end
+
+-- If the host/OS cancels a touch without routing a normal release callback,
+-- LÖVE's active-touch list still lets us retire the reservation instead of
+-- keeping stale state around. This is intentionally cleanup-only: disappearance
+-- is treated as cancellation and never replays gameplay input.
+function ControlsFree.pruneSystemEdgeTouches()
+  if not state.systemEdgeTouches or next(state.systemEdgeTouches) == nil then return end
+  local touch = love and love.touch
+  if type(touch) ~= "table" or type(touch.getTouches) ~= "function" then return end
+  local ok, ids = pcall(touch.getTouches)
+  if not ok or type(ids) ~= "table" then return end
+  local active = {}
+  for _, id in ipairs(ids) do active[id] = true end
+  for id in pairs(state.systemEdgeTouches) do
+    if not active[id] then
+      state.systemEdgeTouches[id] = nil
+      local ph = state.playerHoldTouches and state.playerHoldTouches[id]
+      if ph then ph.cancelled = true; ph.cancelReason = "touch_cancelled" end
+      ControlsFree.finishPlayerHoldTouch(id)
+    end
+  end
+end
+
+-- DIALOG TOUCH CONTROL is intentionally broader than literal TextBox dialogue.
+-- It is the mobile fallback controller for every game UI/state except the two
+-- contexts that already have their own touch semantics:
+--   * free overworld -> Tap to Move / Hold to Steer
+--   * any BattleState in the stack -> BATTLE TOUCH CONTROL / native battle touch
+-- This fail-open coverage means newly added menus, choice screens and overlays
+-- automatically inherit release-A + swipe D-pad without needing a hard-coded
+-- state-name allowlist.
+function ControlsFree.dialogTouchSurfaceActive(game)
+  local stack = game and game.stack
+  if not stack or type(stack.top) ~= "function" then return false end
+
+  -- A battle remains a battle even when a Party/Item/Choice/TextBox state is
+  -- pushed above BattleState. DIALOG TOUCH CONTROL must never steal those.
+  local states = stack.states
+  if type(states) == "table" then
+    for i = #states, 1, -1 do
+      local st = states[i]
+      if st and st.isBattle == true then return false end
+    end
+  end
+
+  local ok, top = pcall(stack.top, stack)
+  if not ok or not top then return false end
+  if top.isBattle == true then return false end
+
+  -- Only the bare overworld is excluded. Any overlay pushed above it is a UI
+  -- surface and is deliberately covered by this catch-all control.
+  if game.overworld and top == game.overworld then return false end
+  return true
+end
+
+function ControlsFree.dialogTouchFeatureEnabled(game)
+  return option("dialog_touch_control", false) == true
+      and ControlsFree.mobileHost()
+      and ControlsFree.dialogTouchSurfaceActive(game)
+end
+
+
+-- A BattleState can be covered by its own message box, choice box, party menu
+-- or item screen.  The user is still "in battle" in all of those cases, so
+-- inspect the complete state stack instead of only the top state.
+function ControlsFree.battleActive(game)
+  local stack = game and game.stack
+  if not stack then return false end
+  local states = stack.states
+  if type(states) == "table" then
+    for i = #states, 1, -1 do
+      local st = states[i]
+      if st and st.isBattle == true then return true end
+    end
+  end
+  if type(stack.top) == "function" then
+    local ok, top = pcall(stack.top, stack)
+    if ok and top and top.isBattle == true then return true end
+  end
+  return false
+end
+
+function ControlsFree.battleTouchFeatureEnabled(game)
+  return option("battle_touch_control", false) == true
+      and ControlsFree.mobileHost()
+      and ControlsFree.battleActive(game)
+end
+
+local function voxelCanvasToWindow(voxel3d, p)
+  if not p then return nil end
+  local frame = state.frame or {}
+  local cw, ch
+  if voxel3d and type(voxel3d.canvas) == "function" then
+    local okC, canvas = pcall(voxel3d.canvas)
+    if okC and canvas then
+      local okW, w = pcall(canvas.getWidth, canvas)
+      local okH, h = pcall(canvas.getHeight, canvas)
+      if okW and okH then cw, ch = tonumber(w), tonumber(h) end
+    end
+  end
+  cw, ch = cw or tonumber(frame.pw), ch or tonumber(frame.ph)
+  local ww, wh = tonumber(frame.ww), tonumber(frame.wh)
+  if not (cw and ch and ww and wh and cw > 0 and ch > 0 and ww > 0 and wh > 0) then
+    return nil
+  end
+  local sy = p[2]
+  if love and love.system and type(love.system.getOS) == "function" then
+    local okOS, osName = pcall(love.system.getOS)
+    if okOS and osName == "iOS" then sy = ch - sy end
+  end
+  return p[1] * ww / cw, sy * wh / ch
+end
+
+-- Hit the visible player rather than merely his world cell.  Flat rendering
+-- uses the same live camera transform as tap targeting; Voxel mode projects a
+-- short vertical segment through the player's cell so the whole billboard/body
+-- is a practical one-second hold target, not only the feet pixel.
+function ControlsFree.playerScreenHit(game, x, y)
+  -- Hit-testing the avatar is useful beyond HOLD PLAYER SPRITE: short taps use
+  -- the same visual hitbox to proxy the interaction surface directly in front
+  -- of the player. The caller decides whether the hit means START-hold or tap.
+  -- Keep this host-agnostic so desktop mouse Tap to Move gets the same occlusion
+  -- fix; beginPlayerHoldTouch itself remains real-touch/mobile-only in practice.
+  local free = overworldGate(game)
+  if not free then return false end
+  local cur = mod.world and mod.world:current()
+  if not cur then return false end
+
+  local scene = voxelContext()
+  if scene and scene.voxel3d then
+    local wx = (cur.x + 0.5) * TILE_SIZE
+    local wz = (cur.y + 0.5) * TILE_SIZE
+    local foot = projectedPoint(scene.voxel3d, wx, wz, 0.5)
+    local head = projectedPoint(scene.voxel3d, wx, wz, 28)
+    local fx, fy = voxelCanvasToWindow(scene.voxel3d, foot)
+    local hx, hy = voxelCanvasToWindow(scene.voxel3d, head)
+    if fx and hx then
+      -- 24 LOVE units is large enough for a thumb but still local to the
+      -- character.  Distance-to-segment naturally follows camera tilt/scale.
+      if pointSegmentDistance2(x, y, fx, fy, hx, hy) <= 24 * 24 then return true end
+    end
+  end
+
+  local view = state.view
+  if view then
+    local ppx, ppy = playerPixel(game, cur)
+    local ow = game and game.overworld
+    local cameraX = ow and ow.camera and tonumber(ow.camera.x)
+      or (ppx - (view.worldW / 2 - 16))
+    local cameraY = ow and ow.camera and tonumber(ow.camera.y)
+      or (ppy - (view.worldH / 2 - 8))
+    local canvasX = cur.x * TILE_SIZE + TILE_SIZE / 2 - cameraX
+    local canvasY = cur.y * TILE_SIZE + TILE_SIZE / 2 - cameraY
+    local cx = (view.ox + canvasX * view.scale) / math.max(view.dpiX or 1, 1e-6)
+    local cy = (view.oy + canvasY * view.scale) / math.max(view.dpiY or 1, 1e-6)
+    local tileW = TILE_SIZE * view.scale / math.max(view.dpiX or 1, 1e-6)
+    local tileH = TILE_SIZE * view.scale / math.max(view.dpiY or 1, 1e-6)
+    -- The sprite extends above its cell centre, so bias the hitbox upward.
+    cy = cy - tileH * 0.35
+    local halfW = math.max(16, tileW * 0.85)
+    local halfH = math.max(22, tileH * 1.35)
+    if math.abs(x - cx) <= halfW and math.abs(y - cy) <= halfH then return true end
+  end
+
+  -- Last compatibility fallback: if the renderer's exact screen transform is
+  -- unavailable but the tap resolver still maps the contact to the player's
+  -- current cell, treat it as the player.
+  local tx, ty, tapCur = targetFromTap(game, x, y)
+  return tapCur ~= nil and tapCur.mapId == cur.mapId and tx == cur.x and ty == cur.y
+end
+
+-- START-menu tap semantics: the menu is a generic Menu with startCloses=true
+-- and an edge anchor. A release tap INSIDE its actually rendered box means A;
+-- a tap OUTSIDE means B/close. Return nil for every other UI state so the
+-- catch-all DIALOG behavior stays release-A there.
+function ControlsFree.startMenuTapInside(game, x, y)
+  local stack = game and game.stack
+  if not stack or type(stack.top) ~= "function" then return nil end
+  local okTop, top = pcall(stack.top, stack)
+  if not okTop or type(top) ~= "table" or top.startCloses ~= true then return nil end
+  local tx, ty, tw, th = tonumber(top.tx), tonumber(top.ty), tonumber(top.tw), tonumber(top.th)
+  if not (tx and ty and tw and th and tw > 0 and th > 0) then return nil end
+
+  local r = game.renderer
+  local frame = state.frame or {}
+  local ww, wh = tonumber(frame.ww), tonumber(frame.wh)
+  if (not ww or not wh) and love and love.graphics
+      and type(love.graphics.getDimensions) == "function" then
+    local okDims, gw, gh = pcall(love.graphics.getDimensions)
+    if okDims then ww, wh = tonumber(gw), tonumber(gh) end
+  end
+  if not (r and ww and wh and ww > 0 and wh > 0) then return nil end
+
+  local dpiX, dpiY = tonumber(frame.dpiX) or 1, tonumber(frame.dpiY) or 1
+  if dpiX <= 0 then dpiX = 1 end
+  if dpiY <= 0 then dpiY = 1 end
+  local up
+  if type(r.uiScale) == "function" then
+    local okScale, v = pcall(r.uiScale, r)
+    if okScale then up = tonumber(v) end
+  end
+  if not up or up <= 0 then
+    if type(r.fitScale) == "function" then
+      local okScale, v = pcall(r.fitScale, r)
+      if okScale then up = tonumber(v) end
+    end
+  end
+  if not up or up <= 0 then return nil end
+
+  local uiw, uih = 160, 144
+  if type(r.uiSize) == "function" then
+    local okSize, w, h = pcall(r.uiSize, r)
+    if okSize and tonumber(w) and tonumber(h) then uiw, uih = tonumber(w), tonumber(h) end
+  end
+  local ux, uy = up / dpiX, up / dpiY
+  local bx, by, bw, bh = tx * 8, ty * 8, tw * 8, th * 8
+  local dx, dy
+  if top.anchor == "topright" and not r.uiCentered and not r.uiAnchorHold then
+    local gapR = (uiw - (bx + bw)) * ux
+    dx = ww - gapR - bw * ux
+    dy = by * uy
+  else
+    local pw = tonumber(frame.pw) or ww * dpiX
+    local ph = tonumber(frame.ph) or wh * dpiY
+    local uox = math.floor((pw - uiw * up) / 2) / dpiX
+    local uoy = math.floor((ph - uih * up) / 2) / dpiY
+    dx, dy = uox + bx * ux, uoy + by * uy
+  end
+  return x >= dx and y >= dy and x < dx + bw * ux and y < dy + bh * uy
+end
+
+function ControlsFree.beginDialogTouch(game, id, x, y)
+  if id == nil or id == "mouse" or state.twoFingerGesture
+      or not ControlsFree.dialogTouchFeatureEnabled(game) then
+    return false
+  end
+  state.dialogTouches = state.dialogTouches or {}
+  state.dialogTouches[id] = {
+    startX = x, startY = y, x = x, y = y, startedTick = state.tick,
+    suppressed = false, holdBCancelled = false, bFired = false,
+  }
+  return true
+end
+
+local function dialogSwipeDirection(dx, dy)
+  if math.abs(dx) >= math.abs(dy) then
+    return dx >= 0 and "right" or "left"
+  end
+  return dy >= 0 and "down" or "up"
+end
+
+function ControlsFree.moveDialogTouch(id, x, y)
+  local t = state.dialogTouches and state.dialogTouches[id]
+  if not t then return false end
+  t.x, t.y = x, y
+  if t.bFired then return true end
+  local dx, dy = x - t.startX, y - t.startY
+  if not t.holdBCancelled
+      and dx * dx + dy * dy > ControlsFree.TOUCH_HOLD_B_MOVE_SLOP_UNITS * ControlsFree.TOUCH_HOLD_B_MOVE_SLOP_UNITS then
+    -- Long-hold B is intentionally stricter than swipe. Once the finger has
+    -- meaningfully wandered, returning near the origin later must not resurrect
+    -- a B candidate.
+    t.holdBCancelled = true
+  end
+  if not t.swipeDirection then
+    if dx * dx + dy * dy >= DIALOG_SWIPE_TRIGGER_UNITS * DIALOG_SWIPE_TRIGGER_UNITS then
+      -- Classification latches the instant a deliberate swipe is recognized.
+      -- Returning the finger toward its start point later must never turn that
+      -- already-recognized swipe back into an A tap on release.
+      t.swipeDirection = dialogSwipeDirection(dx, dy)
+    end
+  end
+  return true
+end
+
+function ControlsFree.finishDialogTouch(game, id, x, y, cancelled)
+  local t = state.dialogTouches and state.dialogTouches[id]
+  if not t then return false end
+  state.dialogTouches[id] = nil
+  t.x, t.y = x or t.x, y or t.y
+  if cancelled or t.suppressed or not ControlsFree.dialogTouchFeatureEnabled(game) then return true end
+  if t.bFired then return true end
+
+  local dx, dy = (t.x or t.startX) - t.startX, (t.y or t.startY) - t.startY
+  if not t.swipeDirection
+      and dx * dx + dy * dy >= DIALOG_SWIPE_TRIGGER_UNITS * DIALOG_SWIPE_TRIGGER_UNITS then
+    -- Some hosts can coalesce touch-move events; classify from the release
+    -- displacement too so a fast swipe is not mistaken for a tap.
+    t.swipeDirection = dialogSwipeDirection(dx, dy)
+  end
+  if t.swipeDirection then
+    local btn = t.swipeDirection
+    mod.input:tap(game, btn)
+    state.stats.dialogSwipes = (state.stats.dialogSwipes or 0) + 1
+    local statKey = "dialogSwipe" .. btn:sub(1, 1):upper() .. btn:sub(2)
+    state.stats[statKey] = (state.stats[statKey] or 0) + 1
+    return true
+  end
+
+  local insideStartMenu = ControlsFree.startMenuTapInside(game, t.startX, t.startY)
+  if insideStartMenu == false then
+    mod.input:tap(game, "b")
+    state.stats.startMenuOutsideBTaps = (state.stats.startMenuOutsideBTaps or 0) + 1
+    return true
+  end
+  mod.input:tap(game, "a")
+  state.stats.dialogATaps = (state.stats.dialogATaps or 0) + 1
+  if insideStartMenu == true then
+    state.stats.startMenuInsideATaps = (state.stats.startMenuInsideATaps or 0) + 1
+  end
+  return true
+end
+
+
+-- BATTLE TOUCH CONTROL intentionally mirrors DIALOG TOUCH CONTROL: no Game
+-- Boy input on touch-down, a stationary one-second hold can fire B, otherwise
+-- sticky swipe/tap classification resolves exactly one action on release.  The raw Game:touch* bridge additionally owns the whole
+-- contact while the battle is present, which is what prevents a 3D camera
+-- drag from receiving the same swipe.
+function ControlsFree.beginBattleTouch(game, id, x, y)
+  if id == nil or id == "mouse" or state.twoFingerGesture
+      or not ControlsFree.battleTouchFeatureEnabled(game) then
+    return false
+  end
+  -- DIALOG TOUCH CONTROL excludes BattleState by contract, so there is no
+  -- semantic overlap here. Keep this guard as a defensive single-owner check.
+  if ControlsFree.dialogTouchFeatureEnabled(game) then return false end
+  state.battleTouches = state.battleTouches or {}
+  state.battleTouches[id] = {
+    startX = x, startY = y, x = x, y = y, startedTick = state.tick,
+    suppressed = false, holdBCancelled = false, bFired = false,
+  }
+  return true
+end
+
+function ControlsFree.moveBattleTouch(id, x, y)
+  local t = state.battleTouches and state.battleTouches[id]
+  if not t then return false end
+  t.x, t.y = x, y
+  if t.bFired then return true end
+  local dx, dy = x - t.startX, y - t.startY
+  if not t.holdBCancelled
+      and dx * dx + dy * dy > ControlsFree.TOUCH_HOLD_B_MOVE_SLOP_UNITS * ControlsFree.TOUCH_HOLD_B_MOVE_SLOP_UNITS then
+    t.holdBCancelled = true
+  end
+  if not t.swipeDirection then
+    if dx * dx + dy * dy >= DIALOG_SWIPE_TRIGGER_UNITS * DIALOG_SWIPE_TRIGGER_UNITS then
+      t.swipeDirection = dialogSwipeDirection(dx, dy)
+    end
+  end
+  return true
+end
+
+function ControlsFree.finishBattleTouch(game, id, x, y, cancelled)
+  local t = state.battleTouches and state.battleTouches[id]
+  if not t then return false end
+  state.battleTouches[id] = nil
+  t.x, t.y = x or t.x, y or t.y
+  if cancelled or t.suppressed or not ControlsFree.battleActive(game) then return true end
+  if t.bFired then return true end
+
+  local dx, dy = (t.x or t.startX) - t.startX, (t.y or t.startY) - t.startY
+  if not t.swipeDirection
+      and dx * dx + dy * dy >= DIALOG_SWIPE_TRIGGER_UNITS * DIALOG_SWIPE_TRIGGER_UNITS then
+    t.swipeDirection = dialogSwipeDirection(dx, dy)
+  end
+  if t.swipeDirection then
+    local btn = t.swipeDirection
+    mod.input:tap(game, btn)
+    state.stats.battleSwipes = (state.stats.battleSwipes or 0) + 1
+    local statKey = "battleSwipe" .. btn:sub(1, 1):upper() .. btn:sub(2)
+    state.stats[statKey] = (state.stats[statKey] or 0) + 1
+    return true
+  end
+
+  mod.input:tap(game, "a")
+  state.stats.battleATaps = (state.stats.battleATaps or 0) + 1
+  return true
+end
+
+-- A stationary one-finger hold is the B counterpart to release-A. The two
+-- contexts keep separate touch tables and counters, so enabling DIALOG does
+-- not affect battles and enabling BATTLE does not affect non-battle UI.
+function ControlsFree.fireHoldBForTouches(game, touches, active, statKey)
+  for _, t in pairs(touches or {}) do
+    if not t.bFired and not t.suppressed and not t.holdBCancelled then
+      if not active(game) or state.twoFingerGesture then
+        t.holdBCancelled = true
+      elseif state.tick - (t.startedTick or state.tick) + 1 >= ControlsFree.TOUCH_HOLD_B_TICKS then
+        mod.input:tap(game, "b")
+        t.bFired = true
+        state.stats[statKey] = (state.stats[statKey] or 0) + 1
+      end
+    end
+  end
+end
+
+function ControlsFree.holdBTouchTick(game)
+  ControlsFree.fireHoldBForTouches(game, state.dialogTouches,
+    ControlsFree.dialogTouchFeatureEnabled, "dialogBHoldTriggers")
+  ControlsFree.fireHoldBForTouches(game, state.battleTouches,
+    ControlsFree.battleTouchFeatureEnabled, "battleBHoldTriggers")
+end
+
+function ControlsFree.beginPlayerHoldTouch(game, id, x, y)
+  if id == nil or id == "mouse"
+      or startSelectTouchMode() ~= "hold_player_sprite"
+      or ControlsFree.dialogueActive(game) or state.twoFingerGesture then
+    return false
+  end
+  if not ControlsFree.playerScreenHit(game, x, y) then return false end
+  state.playerHoldTouches = state.playerHoldTouches or {}
+  state.playerHoldTouches[id] = {
+    startX = x, startY = y, x = x, y = y, pressTick = state.tick,
+    cancelled = false, fired = false,
+  }
+  return true
+end
+
+function ControlsFree.movePlayerHoldTouch(id, x, y)
+  local t = state.playerHoldTouches and state.playerHoldTouches[id]
+  if not t then return false end
+  t.x, t.y = x, y
+  if not t.cancelled and not t.fired then
+    local dx, dy = x - t.startX, y - t.startY
+    if dx * dx + dy * dy > PLAYER_HOLD_MOVE_SLOP_UNITS * PLAYER_HOLD_MOVE_SLOP_UNITS then
+      t.cancelled = true
+      t.cancelReason = "moved"
+    end
+  end
+  return true
+end
+
+function ControlsFree.finishPlayerHoldTouch(id)
+  local t = state.playerHoldTouches and state.playerHoldTouches[id]
+  if not t then return false end
+  state.playerHoldTouches[id] = nil
+  return true
+end
+
+function ControlsFree.playerHoldStartTick(game)
+  if startSelectTouchMode() ~= "hold_player_sprite" then return end
+  for id, t in pairs(state.playerHoldTouches or {}) do
+    if not t.cancelled and not t.fired
+        and state.tick - (t.pressTick or state.tick) + 1 >= PLAYER_HOLD_START_TICKS then
+      local free = overworldGate(game)
+      if not free or state.twoFingerGesture then
+        t.cancelled = true
+        t.cancelReason = "busy"
+      else
+        mod.input:tap(game, "start")
+        t.fired = true
+        state.stats.playerHoldStartTriggers =
+          (state.stats.playerHoldStartTriggers or 0) + 1
+        local p = state.pointers and state.pointers[id]
+        if p then
+          p.playerHoldCandidate = false
+          p.gestureSuppressed = "player_hold_start"
+          p.manualSuppressed = true
+        end
+        if state.nav then cancelRoute("player_hold_start") end
+      end
+    end
+  end
+end
+
+-- Compatibility fallback for builds where the raw Game:touch* bridge cannot
+-- be installed. Current Gen1Recomp is handled earlier by installRawPinchZoomGuard;
+-- this TouchControls seam preserves the same release-only tap/swipe semantics
+-- for catch-all non-overworld UI and battle control if a future/older host
+-- routes a virtual-control-zone touch here first.
+function ControlsFree.installTouchDialogueBridge(game)
+  if state.touchDialogueBridgeInstalled or not game then return false end
+  local tc = game.touchControls
+  if type(tc) ~= "table" or type(tc.touchpressed) ~= "function"
+      or type(tc.touchmoved) ~= "function" or type(tc.touchreleased) ~= "function" then
+    return false
+  end
+  local pressed0, moved0, released0 = tc.touchpressed, tc.touchmoved, tc.touchreleased
+  state.touchDialogueBridgeOriginal = {
+    touchpressed = pressed0, touchmoved = moved0, touchreleased = released0,
+  }
+  tc.touchpressed = function(self, id, x, y)
+    -- Fallback parity with the raw Game bridge: a contact that STARTS on a
+    -- visible virtual control belongs to native TouchControls, never this mod.
+    if ControlsFree.rawTouchControlHit(game, x, y) then
+      state.nativeControlOwnedTouches = state.nativeControlOwnedTouches or {}
+      if id ~= nil then state.nativeControlOwnedTouches[id] = true end
+      return pressed0(self, id, x, y)
+    end
+    if ControlsFree.beginDialogTouch(game, id, x, y) then return true end
+    if ControlsFree.beginBattleTouch(game, id, x, y) then return true end
+    if ControlsFree.battleTouchFeatureEnabled(game) and id ~= nil and id ~= "mouse" then
+      return true
+    end
+    return pressed0(self, id, x, y)
+  end
+  tc.touchmoved = function(self, id, x, y)
+    if state.nativeControlOwnedTouches and state.nativeControlOwnedTouches[id] then
+      return moved0(self, id, x, y)
+    end
+    if ControlsFree.moveDialogTouch(id, x, y) then return true end
+    if ControlsFree.moveBattleTouch(id, x, y) then return true end
+    if ControlsFree.battleTouchFeatureEnabled(game) and id ~= nil and id ~= "mouse" then
+      return true
+    end
+    return moved0(self, id, x, y)
+  end
+  tc.touchreleased = function(self, id, x, y)
+    if state.nativeControlOwnedTouches and state.nativeControlOwnedTouches[id] then
+      local result = released0(self, id, x, y)
+      state.nativeControlOwnedTouches[id] = nil
+      return result
+    end
+    if state.dialogTouches and state.dialogTouches[id] then
+      ControlsFree.finishDialogTouch(game, id, x, y, false)
+      return true
+    end
+    if state.battleTouches and state.battleTouches[id] then
+      ControlsFree.finishBattleTouch(game, id, x, y, false)
+      return true
+    end
+    if ControlsFree.battleTouchFeatureEnabled(game) and id ~= nil and id ~= "mouse" then
+      return true
+    end
+    return released0(self, id, x, y)
+  end
+  state.touchDialogueBridgeInstalled = true
+  return true
+end
+
+function ControlsFree.shakeState()
+  if state.shake then return state.shake end
+  state.shake = {
+    backend = nil, attempted = false, unavailableCounted = false,
+    accel = nil, gyro = nil, gravity = nil, warmup = 0,
+    impulseArmed = true, lastImpulse = nil, cooldownUntil = 0,
+    lastStrength = 0,
+  }
+  return state.shake
+end
+
+function ControlsFree.initLoveSensorBackend(sh)
+  local sensor = love and love.sensor
+  if type(sensor) ~= "table" or type(sensor.hasSensor) ~= "function"
+      or type(sensor.setEnabled) ~= "function"
+      or type(sensor.getData) ~= "function" then
+    return false
+  end
+  local function enable(kind)
+    local okHas, has = pcall(sensor.hasSensor, kind)
+    if not okHas or not has then return false end
+    local okEnable = pcall(sensor.setEnabled, kind, true)
+    return okEnable
+  end
+  local accel = enable("accelerometer")
+  local gyro = enable("gyroscope")
+  if not accel and not gyro then return false end
+  sh.backend = "love.sensor"
+  sh.loveSensor = sensor
+  sh.accelAvailable = accel
+  sh.gyroAvailable = gyro
+  return true
+end
+
+-- LÖVE 11.5 has no love.sensor module. Gen1Recomp also intentionally sets
+-- t.accelerometerjoystick=false on Android, so reopening the old joystick
+-- path would resurrect the tilt-to-walk bug. SDL2 already ships a separate
+-- sensor subsystem; initialize only that subsystem and read it directly.
+function ControlsFree.initSdlSensorBackend(sh)
+  if ControlsFree.hostOS() ~= "Android" then return false end
+  local okFfi, ffi = pcall(require, "ffi")
+  if not okFfi or not ffi then return false end
+  pcall(ffi.cdef, [[
+    typedef struct TTM_SDL_Sensor TTM_SDL_Sensor;
+    int SDL_InitSubSystem(unsigned int flags);
+    int SDL_NumSensors(void);
+    int SDL_SensorGetDeviceType(int device_index);
+    TTM_SDL_Sensor *SDL_SensorOpen(int device_index);
+    int SDL_SensorGetData(TTM_SDL_Sensor *sensor, float *data, int num_values);
+    void SDL_SensorUpdate(void);
+    void SDL_SensorClose(TTM_SDL_Sensor *sensor);
+  ]])
+  local okInit, rc = pcall(function()
+    return tonumber(ffi.C.SDL_InitSubSystem(ControlsFree.SDL_INIT_SENSOR))
+  end)
+  if not okInit or not rc or rc < 0 then return false end
+
+  local okCount, count = pcall(function() return tonumber(ffi.C.SDL_NumSensors()) end)
+  if not okCount or not count or count <= 0 then return false end
+  local accel, gyro
+  for i = 0, count - 1 do
+    local okType, typ = pcall(function()
+      return tonumber(ffi.C.SDL_SensorGetDeviceType(i))
+    end)
+    if okType and typ == ControlsFree.SDL_SENSOR_ACCEL and accel == nil then
+      local okOpen, ptr = pcall(function() return ffi.C.SDL_SensorOpen(i) end)
+      if okOpen and ptr ~= nil then accel = ptr end
+    elseif okType and typ == ControlsFree.SDL_SENSOR_GYRO and gyro == nil then
+      local okOpen, ptr = pcall(function() return ffi.C.SDL_SensorOpen(i) end)
+      if okOpen and ptr ~= nil then gyro = ptr end
+    end
+  end
+  if accel == nil and gyro == nil then return false end
+  sh.backend = "SDL2 sensor FFI"
+  sh.ffi = ffi
+  sh.accel = accel
+  sh.gyro = gyro
+  sh.accelBuf = accel ~= nil and ffi.new("float[3]") or nil
+  sh.gyroBuf = gyro ~= nil and ffi.new("float[3]") or nil
+  sh.accelAvailable = accel ~= nil
+  sh.gyroAvailable = gyro ~= nil
+  return true
+end
+
+function ControlsFree.ensureMotionSensors()
+  local sh = ControlsFree.shakeState()
+  if sh.backend then return true end
+  if sh.attempted then return false end
+  sh.attempted = true
+  state.stats.sensorInitAttempts = (state.stats.sensorInitAttempts or 0) + 1
+  if ControlsFree.initLoveSensorBackend(sh) or ControlsFree.initSdlSensorBackend(sh) then
+    return true
+  end
+  if not sh.unavailableCounted then
+    sh.unavailableCounted = true
+    state.stats.sensorUnavailable = (state.stats.sensorUnavailable or 0) + 1
+  end
+  return false
+end
+
+function ControlsFree.readMotionSensors()
+  local sh = ControlsFree.shakeState()
+  if not sh.backend and not ControlsFree.ensureMotionSensors() then return nil, nil end
+  local accel, gyro
+  if sh.backend == "love.sensor" then
+    if sh.accelAvailable then
+      local ok, x, y, z = pcall(sh.loveSensor.getData, "accelerometer")
+      if ok and type(x) == "number" and type(y) == "number" and type(z) == "number" then
+        accel = { x, y, z }
+      end
+    end
+    if sh.gyroAvailable then
+      local ok, x, y, z = pcall(sh.loveSensor.getData, "gyroscope")
+      if ok and type(x) == "number" and type(y) == "number" and type(z) == "number" then
+        gyro = { x, y, z }
+      end
+    end
+  elseif sh.backend == "SDL2 sensor FFI" then
+    local ffi = sh.ffi
+    pcall(function() ffi.C.SDL_SensorUpdate() end)
+    if sh.accel ~= nil and sh.accelBuf then
+      local ok, rc = pcall(function()
+        return tonumber(ffi.C.SDL_SensorGetData(sh.accel, sh.accelBuf, 3))
+      end)
+      if ok and rc == 0 then
+        accel = { tonumber(sh.accelBuf[0]), tonumber(sh.accelBuf[1]),
+                  tonumber(sh.accelBuf[2]) }
+      end
+    end
+    if sh.gyro ~= nil and sh.gyroBuf then
+      local ok, rc = pcall(function()
+        return tonumber(ffi.C.SDL_SensorGetData(sh.gyro, sh.gyroBuf, 3))
+      end)
+      if ok and rc == 0 then
+        gyro = { tonumber(sh.gyroBuf[0]), tonumber(sh.gyroBuf[1]),
+                 tonumber(sh.gyroBuf[2]) }
+      end
+    end
+  end
+  return accel, gyro
+end
+
+function ControlsFree.vecMagnitude(v)
+  if not v then return 0 end
+  return math.sqrt(v[1] * v[1] + v[2] * v[2] + v[3] * v[3])
+end
+
+function ControlsFree.normalizedVec(v, mag)
+  if not v or not mag or mag <= 0 then return nil end
+  return { v[1] / mag, v[2] / mag, v[3] / mag }
+end
+
+function ControlsFree.vecDot(a, b)
+  if not a or not b then return 1 end
+  return a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+end
+
+function ControlsFree.shakeInputTick(game)
+  if option("shake_b", true) == false or not ControlsFree.mobileHost() then return end
+  local accel, gyro = ControlsFree.readMotionSensors()
+  if not accel and not gyro then return end
+  local sh = ControlsFree.shakeState()
+
+  local linearAccel
+  if accel then
+    if not sh.gravity then
+      sh.gravity = { accel[1], accel[2], accel[3] }
+    else
+      local a = ControlsFree.SHAKE_GRAVITY_ALPHA
+      for i = 1, 3 do
+        sh.gravity[i] = sh.gravity[i] * (1 - a) + accel[i] * a
+      end
+    end
+    linearAccel = {
+      accel[1] - sh.gravity[1], accel[2] - sh.gravity[2],
+      accel[3] - sh.gravity[3],
+    }
+  end
+
+  sh.warmup = (sh.warmup or 0) + 1
+  local accelMag = ControlsFree.vecMagnitude(linearAccel)
+  local gyroMag = ControlsFree.vecMagnitude(gyro)
+  local accelScore = accelMag / ControlsFree.SHAKE_ACCEL_THRESHOLD
+  local gyroScore = gyroMag / ControlsFree.SHAKE_GYRO_THRESHOLD
+  local source, motion, mag, score
+  if gyroScore >= accelScore and gyro then
+    source, motion, mag, score = "gyro", gyro, gyroMag, gyroScore
+  else
+    source, motion, mag, score = "accel", linearAccel, accelMag, accelScore
+  end
+  sh.lastStrength = score or 0
+
+  if (score or 0) < ControlsFree.SHAKE_RESET_RATIO then sh.impulseArmed = true end
+  if sh.warmup < ControlsFree.SHAKE_WARMUP_TICKS then return end
+  if state.tick < (sh.cooldownUntil or 0) then return end
+
+  local last = sh.lastImpulse
+  if last and state.tick - last.tick > ControlsFree.SHAKE_MAX_IMPULSE_TICKS then
+    sh.lastImpulse = nil
+    last = nil
+  end
+  if (score or 0) < 1 or not sh.impulseArmed or not motion or mag <= 0 then return end
+  sh.impulseArmed = false
+  local impulse = {
+    tick = state.tick, source = source,
+    vector = ControlsFree.normalizedVec(motion, mag), strength = score,
+  }
+
+  if last and last.source == impulse.source then
+    local dt = impulse.tick - last.tick
+    if dt >= ControlsFree.SHAKE_MIN_IMPULSE_TICKS and dt <= ControlsFree.SHAKE_MAX_IMPULSE_TICKS
+        and ControlsFree.vecDot(last.vector, impulse.vector) <= ControlsFree.SHAKE_REVERSAL_DOT then
+      mod.input:tap(game, "b")
+      state.stats.shakeBTriggers = (state.stats.shakeBTriggers or 0) + 1
+      sh.cooldownUntil = state.tick + ControlsFree.SHAKE_COOLDOWN_TICKS
+      sh.lastImpulse = nil
+      return
+    end
+  end
+  sh.lastImpulse = impulse
+end
 
 local function pointerOverTouchControl(game, x, y)
   local tc = game and game.touchControls
@@ -3817,24 +5906,94 @@ end
 -- Interactive destinations are armed on press but may fire A only after this
 -- exact gesture has been released.
 mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
+  state.game = game or state.game
   local result = nextFn(game, ev)
   if not ev then return result end
   -- Respect another pointer consumer deeper in the chain. If it claims this
   -- contact, retire any local gesture record rather than responding as well.
   if result == true then
+    -- A claimed non-left mouse button is unrelated to an LMB navigation
+    -- gesture even though Gen1Recomp reports both under id "mouse".
+    if ev.source == "mouse" and ev.button and ev.button ~= 1 then
+      return result
+    end
+    -- If another pointer consumer takes over mid-gesture, retire our
+    -- two-finger bookkeeping too. Otherwise a swallowed release could leave
+    -- the zoom guard armed after the contact belongs to somebody else.
+    if state.gestureTouches and state.gestureTouches[ev.id] then
+      finishTwoFingerGesture(game, ev.id)
+      state.gestureTouches[ev.id] = nil
+      maybeClearTwoFingerGesture(game)
+    end
     state.pointers[ev.id] = nil
     if state.tapOwner == ev.id then state.tapOwner = nil end
     return result
   end
   if option("enabled", true) == false then return result end
 
+  -- Mouse shortcuts are independent from mouse walking. Only LMB is ever
+  -- allowed into navigation pointer state. Gen1Recomp exposes every physical
+  -- mouse button under the same pointer id ("mouse"), so non-left releases
+  -- must return before generic pointer cleanup or they could cancel an LMB walk.
+  if ev.source == "mouse" and ev.button and ev.button ~= 1 then
+    if ev.button == 4 or ev.button == 5 then
+      local mode = tostring(option("mouse_side_buttons", "off") or "off")
+      if mode ~= "off" then
+        if ev.phase == "pressed" then
+          local mapped
+          if mode == "on_flipped" then
+            mapped = ev.button == 5 and "select" or "start"
+          else
+            -- Normal: MOUSE 5 = START, MOUSE 4 = SELECT.
+            mapped = ev.button == 5 and "start" or "select"
+          end
+          mod.input:tap(game, mapped)
+          state.stats.mouseSideButtonTaps =
+            (state.stats.mouseSideButtonTaps or 0) + 1
+          state.stats["mouseSide_" .. mapped] =
+            (state.stats["mouseSide_" .. mapped] or 0) + 1
+          return true
+        elseif ev.phase == "released" then
+          return true
+        end
+      end
+      return result
+    end
+
+    if ev.button == 2 and ControlsFree.desktopHost()
+        and option("desktop_mouse_ab", false) == true then
+      if ev.phase == "pressed" then
+        mod.input:tap(game, "b")
+        state.stats.desktopBTaps = (state.stats.desktopBTaps or 0) + 1
+        return true
+      elseif ev.phase == "released" then
+        return true
+      end
+    end
+    return result
+  end
+
+  -- Optional desktop click mapping: LMB=A on UI; bare-overworld LMB remains
+  -- independently controlled by MOUSE WALK CONTROL.
+  if ev.phase == "pressed" and ev.source == "mouse" and ev.button == 1
+      and ControlsFree.desktopHost()
+      and option("desktop_mouse_ab", false) == true then
+    local stack = game and game.stack
+    local top = stack and type(stack.top) == "function" and stack:top() or nil
+    if top and top ~= game.overworld then
+      mod.input:tap(game, "a")
+      state.stats.desktopATaps = (state.stats.desktopATaps or 0) + 1
+      return true
+    end
+  end
+
   local eligible = ev.source == "touch"
-    or (ev.source == "mouse" and ev.button == 1 and option("mouse", true) ~= false)
+    or (ev.source == "mouse" and ev.button == 1 and option("mouse", false) == true)
   local id = ev.id
 
   if ev.phase == "pressed" then
     if eligible then
-      local owns = state.tapOwner == nil
+      local owns = state.tapOwner == nil and state.twoFingerGesture == nil
       if owns then state.tapOwner = id end
       if owns then state.gestureSerial = (state.gestureSerial or 0) + 1 end
       local p = {
@@ -3848,11 +6007,26 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
         gestureId = owns and state.gestureSerial or nil,
       }
       state.pointers[id] = p
+      local playerHold = state.playerHoldTouches and state.playerHoldTouches[id]
+      if playerHold and not playerHold.cancelled and not playerHold.fired then
+        p.playerHoldCandidate = true
+        p.feedbackShown = false
+      end
+      trackTwoFingerPointer(game, ev)
+      if state.twoFingerGesture then
+        suppressGesturePointer(id)
+        owns = false
+        p.ignored = true
+      end
 
-      -- The first route is acquired NOW, not after TAP/HOLD delay or release.
+      -- The first route is acquired NOW, not after TAP/HOLD delay or release,
+      -- except for a touch that began on the visible player: that one reserves
+      -- one second for HOLD PLAYER -> START and becomes normal navigation only
+      -- if the finger moves far enough to cancel the hold candidate.
       -- A target may carry an interaction, but interactionAtDestination gates
       -- A on this gesture no longer being down.
-      if owns and not pointerOverTouchControl(game, ev.x, ev.y) then
+      if owns and not p.playerHoldCandidate
+          and not pointerOverTouchControl(game, ev.x, ev.y) then
         local accepted = startRoute(game, ev.x, ev.y, false, true, p.gestureId)
         p.initialAccepted = accepted and true or false
         if accepted then
@@ -3864,11 +6038,45 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
   elseif ev.phase == "moved" then
     local p = state.pointers[id]
     if p then p.x, p.y = ev.x, ev.y end
+    trackTwoFingerPointer(game, ev)
+    if p and p.playerHoldCandidate then
+      local ph = state.playerHoldTouches and state.playerHoldTouches[id]
+      if not ph or ph.cancelled then
+        p.playerHoldCandidate = false
+        p.pressTick = state.tick
+        p.lastRetargetTick = state.tick
+        if not p.ignored and not p.gestureSuppressed
+            and not pointerOverTouchControl(game, ev.x, ev.y) then
+          local accepted = startRoute(game, ev.x, ev.y, false, true, p.gestureId)
+          p.initialAccepted = accepted and true or false
+          if accepted then
+            state.stats.immediatePressRoutes =
+              (state.stats.immediatePressRoutes or 0) + 1
+          end
+        end
+      end
+    end
   elseif ev.phase == "released" then
     local p = state.pointers[id]
     if p then p.x, p.y = ev.x, ev.y end
+    trackTwoFingerPointer(game, ev)
     if p and not p.ignored and not p.gestureSuppressed then
-      if p.holdActive and not state.exitJourney and not p.stickySemantic then
+      -- HOLD PLAYER SPRITE reserves a stationary avatar touch for START. If it
+      -- is released before the one-second START threshold, reinterpret that
+      -- short touch now as an ordinary avatar tap. startRoute's avatar proxy
+      -- can then target the interaction/door directly in front of the player.
+      if p.playerHoldCandidate then
+        local ph = state.playerHoldTouches and state.playerHoldTouches[id]
+        if ph and not ph.fired and not ph.cancelled
+            and not pointerOverTouchControl(game, p.startX, p.startY) then
+          local accepted = startRoute(game, p.startX, p.startY, false, true, p.gestureId)
+          p.initialAccepted = accepted and true or false
+          if accepted then
+            state.stats.immediatePressRoutes =
+              (state.stats.immediatePressRoutes or 0) + 1
+          end
+        end
+      elseif p.holdActive and not state.exitJourney and not p.stickySemantic then
         -- Pin an ordinary steering gesture to its final screen position.
         -- A semantic door/NPC selection is different: RELEASE is not another
         -- steering sample, it only ends the gesture (and for NPCs authorizes
@@ -3886,6 +6094,10 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
     if state.tapOwner == id then state.tapOwner = nil end
   elseif ev.phase == "cancelled" then
     local p = state.pointers[id]
+    trackTwoFingerPointer(game, ev)
+    if state.playerHoldTouches and state.playerHoldTouches[id] then
+      state.playerHoldTouches[id] = nil
+    end
     state.pointers[id] = nil
     if state.tapOwner == id then state.tapOwner = nil end
     -- A cancelled OS gesture is neither a tap nor a deliberate hold release.
@@ -3908,6 +6120,7 @@ local function pointerSteeringTick(game)
   local id = state.tapOwner
   local p = id and state.pointers[id]
   if not p or p.ignored or p.manualSuppressed or p.gestureSuppressed then return end
+  if p.playerHoldCandidate then return end
   if pointerOverTouchControl(game, p.x, p.y) then return end
   local age = state.tick - (p.pressTick or state.tick)
   local startTicks = holdSteerDelayTicks()
@@ -3934,6 +6147,27 @@ end
 
 -- Fixed-step input seam: directions pressed here affect the same gameplay tick.
 mod.hooks:wrap("input.step", function(nextFn, game, dt)
+  restoreNativeZoomSuppression(game)
+  if state.twoFingerGesture then
+    restoreGestureZoom(game, state.twoFingerGesture)
+  end
+  if option("enabled", true) ~= false then
+    ControlsFree.shakeInputTick(game)
+  end
+  -- Clean up raw reservations if the mobile OS consumed/cancelled a physical
+  -- touch without a normal release callback.
+  ControlsFree.pruneSystemEdgeTouches()
+  ControlsFree.prunePinchGraceTouches()
+  -- Let an ordinary first world touch through once the PINCH OR SPREAD pairing
+  -- tolerance expires. If a second finger arrived, beginRawTwoFingerGesture has
+  -- already marked the candidate suppressed and nothing is replayed.
+  ControlsFree.promotePinchGraceTouches(game)
+  -- DIALOG/BATTLE TOUCH CONTROL each include their own stationary 1-second
+  -- hold -> B gesture. This is independent from overworld Tap to Move.
+  ControlsFree.holdBTouchTick(game)
+  -- START/SELECT TOUCH CONTROL is independent from the TAP TO MOVE switch.
+  -- Its own OFF/HOLD/PINCH-SPREAD choice is authoritative.
+  ControlsFree.playerHoldStartTick(game)
   pointerSteeringTick(game)
   navigationTick(game)
   return nextFn(game, dt)
@@ -3980,9 +6214,49 @@ mod.hooks:wrap("movement.collision", function(nextFn, allowed, ctx)
   return result
 end)
 
+-- Gen1Recomp normally maps the mouse wheel to survey zoom. OFF preserves that
+-- native behavior; ON/ON FLIPPED claim vertical wheel events and emit one real
+-- GB D-pad tap instead. Hook the live Game method so launcher/editor scrolling
+-- is untouched.
+function ControlsFree.installMouseWheelBridge(game)
+  if state.mouseWheelBridgeInstalled or not game
+      or type(game.wheelmoved) ~= "function" then
+    return false
+  end
+  state.mouseWheelOriginal = game.wheelmoved
+  game.wheelmoved = function(self, dx, dy)
+    local mode = tostring(option("mouse_wheel_control", "off") or "off")
+    if option("enabled", true) ~= false and mode ~= "off"
+        and type(dy) == "number" and dy ~= 0 then
+      local mapped = dy > 0 and "up" or "down"
+      if mode == "on_flipped" then
+        mapped = mapped == "up" and "down" or "up"
+      end
+      mod.input:tap(self, mapped)
+      state.stats.mouseWheelTaps = (state.stats.mouseWheelTaps or 0) + 1
+      state.stats["mouseWheel_" .. mapped] =
+        (state.stats["mouseWheel_" .. mapped] or 0) + 1
+      return true
+    end
+    return state.mouseWheelOriginal(self, dx, dy)
+  end
+  state.mouseWheelBridgeInstalled = true
+  return true
+end
+
 -- Immediate lifecycle release, before the next fixed input tick.  These public
 -- events close the two most important transition races: entering a new map
 -- while a direction is held, and a battle beginning from a walking step.
+mod.events:on("game.ready", function(ev)
+  local game = ev and ev.game or nil
+  if game then
+    state.game = game
+    installRawPinchZoomGuard(game)
+    ControlsFree.installTouchDialogueBridge(game)
+    ControlsFree.installMouseWheelBridge(game)
+  end
+end)
+
 mod.events:on("world.interacted", function(ev)
   local pending = state.pendingInteraction
   if not pending then return end
@@ -4016,13 +6290,68 @@ local BUILDING_INTERIOR_TILESETS = {
   FACILITY = true,
 }
 
-local function mapDefIsBuildingInterior(def)
+function ControlsFree.mapDefIsBuildingInterior(def)
   if type(def) ~= "table" then return false end
   -- Mod-authored maps can opt in explicitly instead of borrowing a vanilla
   -- tileset merely to communicate semantics.
   if def.building ~= nil then return def.building == true end
   if def.indoorBuilding ~= nil then return def.indoorBuilding == true end
   return BUILDING_INTERIOR_TILESETS[tostring(def.tileset or "")] == true
+end
+
+-- Is this blocked overview cell part of the blank shell surrounding a normal
+-- room-style building? WorldAPI intentionally exposes only a compact collision
+-- alphabet, so the safest semantic split available to a mod is topological:
+-- flood-fill blocked " " cells from the map boundary. Anything reached is the
+-- exterior/void shell; isolated blocked islands remain furniture/interior walls
+-- and continue to use nearest-legal movement. Cache by the exact overview rows
+-- because map scripts/mods can replace blocks without changing mapId.
+function ControlsFree.exteriorVoidCell(game, overview, x, y)
+  if not overview or cellChar(overview, x, y) ~= " " then return false end
+  local map = game and game.overworld and game.overworld.map
+  if not map or not ControlsFree.mapDefIsBuildingInterior(map.def) then return false end
+  local w, h = tonumber(overview.width), tonumber(overview.height)
+  if not w or not h or w < 1 or h < 1 or type(overview.rows) ~= "table" then
+    return false
+  end
+
+  local signature = tostring(overview.mapId) .. ":" .. tostring(w) .. "x"
+    .. tostring(h) .. ":" .. table.concat(overview.rows, "\n")
+  local cache = state.exteriorVoidCache
+  if not cache or cache.signature ~= signature then
+    local cells, queue = {}, {}
+    local function add(cx, cy)
+      if cx < 0 or cy < 0 or cx >= w or cy >= h then return end
+      if cellChar(overview, cx, cy) ~= " " then return end
+      local k = key(cx, cy)
+      if cells[k] then return end
+      cells[k] = true
+      queue[#queue + 1] = k
+    end
+
+    for cx = 0, w - 1 do
+      add(cx, 0)
+      if h > 1 then add(cx, h - 1) end
+    end
+    for cy = 1, h - 2 do
+      add(0, cy)
+      if w > 1 then add(w - 1, cy) end
+    end
+
+    local head = 1
+    while head <= #queue do
+      local cx, cy = parseKey(queue[head])
+      head = head + 1
+      add(cx + 1, cy)
+      add(cx - 1, cy)
+      add(cx, cy + 1)
+      add(cx, cy - 1)
+    end
+
+    cache = { signature = signature, cells = cells }
+    state.exteriorVoidCache = cache
+  end
+  return cache.cells[key(x, y)] == true
 end
 
 -- A held screen-space destination is meaningful across route/town seams and
@@ -4036,11 +6365,12 @@ local function enteringBuildingInterior(ev)
   local maps = game and game.data and game.data.maps
   local fromDef = maps and maps[ev.fromMapId] or nil
   local toDef = ev.map and ev.map.def or (maps and maps[ev.mapId])
-  return mapDefIsOutdoor(fromDef) == true and mapDefIsBuildingInterior(toDef)
+  return mapDefIsOutdoor(fromDef) == true and ControlsFree.mapDefIsBuildingInterior(toDef)
 end
 
 mod.events:on("map.entered", function(ev)
   state.view = nil
+  state.exteriorVoidCache = nil
   invalidateLoadedMapOverviewCache()
   invalidateVoxelCandidateCache()
   if ev and ev.via ~= "connection" then invalidateLedgeTopologyCache() end
@@ -4126,12 +6456,31 @@ mod.events:on("battle.ended", function(ev)
   resume.readyTick = state.tick + 1
 end)
 
+
+mod.events:on("battle.ended", function()
+  -- Never emit a late A/D-pad after the battle disappeared under a held
+  -- finger. Keep battleCameraOwnedTouches until each physical contact releases
+  -- so a late drag still cannot leak into whatever state the battle revealed.
+  for _, t in pairs(state.battleTouches or {}) do t.suppressed = true end
+end)
+
 mod.events:on("save.loading", function()
   cancelRoute("save_loading")
   invalidateLedgeTopologyCache()
   invalidateLoadedMapOverviewCache()
   invalidateVoxelCandidateCache()
   state.pointers = {}
+  state.gestureTouches = {}
+  state.rawZoomTouches = {}
+  state.dialogTouches = {}
+  state.battleTouches = {}
+  state.battleCameraOwnedTouches = {}
+  state.playerHoldTouches = {}
+  state.systemEdgeTouches = {}
+  state.pinchGraceTouches = {}
+  state.rawDispatchedTouches = {}
+  state.nativeControlOwnedTouches = {}
+  state.twoFingerGesture = nil
   state.tapOwner = nil
   state.pendingInteraction = nil
   state.battleResume = nil
@@ -4408,7 +6757,15 @@ local function drawDebug()
     ("VOXEL %d  RAY %d  COLUMN %d"):format(
       state.stats.voxelTargets or 0, state.stats.voxelRayTargets or 0,
       state.stats.voxelColumnTargets or 0),
-    ("V-OUT %d"):format(state.stats.voxelRayOutside or 0),
+    ("V-OUT %d  EXACT-VOID %d  CARPET-DOWN %d"):format(
+      state.stats.voxelRayOutside or 0,
+      state.stats.voxelExactVoidExitIntents or 0,
+      state.stats.carpetDownIntents or 0),
+    ("V-TILE %s  %s  @%s,%s"):format(
+      tostring(state.lastVoxelPick and state.lastVoxelPick.tile or "-"),
+      tostring(state.lastVoxelPick and state.lastVoxelPick.class or "-"),
+      tostring(state.lastVoxelPick and state.lastVoxelPick.tx or "-"),
+      tostring(state.lastVoxelPick and state.lastVoxelPick.ty or "-")),
     ("TOPO %d/%d  OVR %d/%d  ENTRY %d"):format(
       state.stats.topologyCacheHits or 0, state.stats.topologyCacheMisses or 0,
       state.stats.overviewCacheHits or 0, state.stats.overviewCacheMisses or 0,
@@ -4459,6 +6816,26 @@ local function diagnostics()
       value = tostring(option("voxel_path_rate", DEFAULT_VOXEL_PATH_RATE)
                        or DEFAULT_VOXEL_PATH_RATE),
       ticks = previewRefreshTicks(),
+    },
+    controlsFree = {
+      dialogTouchControl = option("dialog_touch_control", false) == true,
+      battleTouchControl = option("battle_touch_control", false) == true,
+      startSelectTouchControl = startSelectTouchMode(),
+      dialogue = option("dialog_touch_control", false) == true,
+      dialogueSwipe = option("dialog_touch_control", false) == true,
+      battle = option("battle_touch_control", false) == true,
+      battleSwipe = option("battle_touch_control", false) == true,
+      battleCameraTouchSuppression = option("battle_touch_control", false) == true,
+      holdPlayerStart = startSelectTouchMode() == "hold_player_sprite",
+      pinchSpreadStartSelect = startSelectTouchMode() == "pinch_or_spread",
+      pinchFirstTouchGraceTicks = ControlsFree.PINCH_FIRST_TOUCH_GRACE_TICKS,
+      mouseWalk = option("mouse", false) == true,
+      desktopMouseAB = option("desktop_mouse_ab", false) == true,
+      mouseWheelControl = tostring(option("mouse_wheel_control", "off") or "off"),
+      mouseSideButtons = tostring(option("mouse_side_buttons", "off") or "off"),
+      shakeB = option("shake_b", true) ~= false,
+      sensorBackend = state.shake and state.shake.backend or nil,
+      sensorStrength = state.shake and state.shake.lastStrength or nil,
     },
     stats = copyFlat(state.stats),
     lastStop = state.lastStop and copyFlat(state.lastStop) or nil,
