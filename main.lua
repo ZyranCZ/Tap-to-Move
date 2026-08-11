@@ -1,4 +1,4 @@
--- Tap to Move v1.3.29
+-- Tap to Move v1.4.0
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,7 +9,7 @@
 
 local mod = ...
 
-local VERSION = "1.3.29"
+local VERSION = "1.4.0"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 150 -- 1X base; scaled by live overworld logic speed
@@ -1957,48 +1957,191 @@ local function neighbourInteractionAt(game, cross, x, y)
 end
 
 
--- Dramatic Shape Voxel compatibility.  Dramatic Shape exports the same lib
--- namespace its renderer uses.  Read the live camera AND the cached scene
--- description from that seam; do not recreate a 2D camera approximation.
-local voxelLibCache = { peer = nil, lib = nil }
+-- Voxel Provider Adapter -------------------------------------------------------
+-- Keep the adapter in one namespace table: main.lua is already near Lua's
+-- top-level local-variable ceiling, and companion integration should not spend
+-- a dozen additional locals just to name adapter helpers.
+local VoxelAdapter = {
+  providers = {
+    { id = "DRAMATIC_SHAPE", kind = "dramatic_shape", short = "DS" },
+    { id = "potato_voxel", kind = "potato_voxel", short = "POTATO" },
+  },
+  cache = { id = nil, peer = nil, lib = nil },
+}
 
-local function voxelContext()
-  if type(mod.find) ~= "function" then return nil end
-  local okPeer, peer = pcall(mod.find, "DRAMATIC_SHAPE")
-  if not okPeer or not peer or type(peer.exports) ~= "table" then return nil end
-  local lib = peer.exports.lib
+function VoxelAdapter.module(lib, name)
   if type(lib) ~= "table" or type(lib.require) ~= "function" then return nil end
+  local ok, value = pcall(lib.require, name)
+  return ok and value or nil
+end
 
-  -- lib.require is internally cached by Dramatic Shape, but test7 still went
-  -- through four protected lookups on every hold sample AND every preview
-  -- frame. Cache the companion seam until the peer/lib identity changes (hot
-  -- reload naturally replaces one of them).
-  if voxelLibCache.peer ~= peer or voxelLibCache.lib ~= lib then
-    local cache = { peer = peer, lib = lib }
-    local okState, voxelState = pcall(lib.require, "VoxelState")
-    local ok3d, voxel3d = pcall(lib.require, "Voxel3D")
-    if okState then cache.voxelState = voxelState end
-    if ok3d then cache.voxel3d = voxel3d end
-    local okStructures, structures = pcall(lib.require, "Structures")
-    if okStructures and type(structures) == "table"
-        and type(structures.forMap) == "function" then
-      cache.structures = structures
-    end
-    local okShape, tileShape = pcall(lib.require, "TileShape")
-    if okShape and type(tileShape) == "table" then cache.tileShape = tileShape end
-    voxelLibCache = cache
-  end
-
-  local voxelState, voxel3d = voxelLibCache.voxelState, voxelLibCache.voxel3d
-  if type(voxel3d) ~= "table" or type(voxel3d.project) ~= "function" then
+function VoxelAdapter.discover()
+  if type(mod.find) ~= "function" then
+    VoxelAdapter.cache = { id = nil, peer = nil, lib = nil }
     return nil
   end
+
+  local selected, fallback
+  for _, spec in ipairs(VoxelAdapter.providers) do
+    local okPeer, peer = pcall(mod.find, spec.id)
+    local lib = okPeer and peer and type(peer.exports) == "table"
+      and peer.exports.lib or nil
+    if peer and type(lib) == "table" and type(lib.require) == "function" then
+      local voxelState = VoxelAdapter.module(lib, "VoxelState")
+      local voxel3d = VoxelAdapter.module(lib, "Voxel3D")
+      if type(voxel3d) == "table" and type(voxel3d.project) == "function" then
+        local candidate = {
+          id = spec.id, kind = spec.kind, short = spec.short,
+          peer = peer, lib = lib, voxelState = voxelState, voxel3d = voxel3d,
+        }
+        fallback = fallback or candidate
+        local active = true
+        if type(voxelState) == "table" and type(voxelState.active) == "function" then
+          local okActive, value = pcall(voxelState.active)
+          active = okActive and value == true
+        end
+        if active then selected = candidate break end
+      end
+    end
+  end
+  selected = selected or fallback
+  if not selected then
+    VoxelAdapter.cache = { id = nil, peer = nil, lib = nil }
+    return nil
+  end
+
+  local old = VoxelAdapter.cache
+  if old.id ~= selected.id or old.peer ~= selected.peer or old.lib ~= selected.lib then
+    selected.voxelScene = VoxelAdapter.module(selected.lib, "VoxelScene")
+    selected.structures = VoxelAdapter.module(selected.lib, "Structures")
+    selected.tileShape = VoxelAdapter.module(selected.lib, "TileShape")
+    selected.brickProfile = VoxelAdapter.module(selected.lib, "BrickProfile")
+    selected.firstPerson = VoxelAdapter.module(selected.lib, "FirstPerson")
+    VoxelAdapter.cache = selected
+  end
+  return VoxelAdapter.cache
+end
+
+function VoxelAdapter.canvasSize(scene)
+  local voxel3d = scene and scene.voxel3d
+  if type(voxel3d) ~= "table" then return nil end
+  if type(voxel3d.size) == "function" then
+    local ok, w, h = pcall(voxel3d.size)
+    w, h = tonumber(w), tonumber(h)
+    if ok and w and h and w > 0 and h > 0 then return w, h end
+  end
+  if type(voxel3d.canvas) == "function" then
+    local okC, canvas = pcall(voxel3d.canvas)
+    if okC and canvas then
+      if type(canvas.getDimensions) == "function" then
+        local ok, w, h = pcall(canvas.getDimensions, canvas)
+        w, h = tonumber(w), tonumber(h)
+        if ok and w and h and w > 0 and h > 0 then return w, h end
+      end
+      local okW, w = pcall(canvas.getWidth, canvas)
+      local okH, h = pcall(canvas.getHeight, canvas)
+      w, h = tonumber(w), tonumber(h)
+      if okW and okH and w and h and w > 0 and h > 0 then return w, h end
+    end
+  end
+  return nil
+end
+
+function VoxelAdapter.windowSize()
+  local frame = state.frame or {}
+  local ww, wh = tonumber(frame.ww), tonumber(frame.wh)
+  if ww and wh and ww > 0 and wh > 0 then return ww, wh end
+  if love and love.graphics and type(love.graphics.getDimensions) == "function" then
+    local ok, w, h = pcall(love.graphics.getDimensions)
+    w, h = tonumber(w), tonumber(h)
+    if ok and w and h and w > 0 and h > 0 then return w, h end
+  end
+  return nil
+end
+
+function VoxelAdapter.pixelSize()
+  local frame = state.frame or {}
+  local pw, ph = tonumber(frame.pw), tonumber(frame.ph)
+  if pw and ph and pw > 0 and ph > 0 then return pw, ph end
+  if love and love.graphics and type(love.graphics.getPixelDimensions) == "function" then
+    local ok, w, h = pcall(love.graphics.getPixelDimensions)
+    w, h = tonumber(w), tonumber(h)
+    if ok and w and h and w > 0 and h > 0 then return w, h end
+  end
+  return nil
+end
+
+function VoxelAdapter.flipY()
+  if love and love.system and type(love.system.getOS) == "function" then
+    local ok, osName = pcall(love.system.getOS)
+    return ok and osName == "iOS"
+  end
+  return false
+end
+
+function VoxelAdapter.windowToCanvas(scene, x, y)
+  local cw, ch = VoxelAdapter.canvasSize(scene)
+  local ww, wh = VoxelAdapter.windowSize()
+  if not (cw and ch and ww and wh) then return nil end
+  local px, py = x * cw / ww, y * ch / wh
+  if VoxelAdapter.flipY() then py = ch - py end
+  return px, py, cw, ch
+end
+
+function VoxelAdapter.canvasToWindow(scene, x, y)
+  local cw, ch = VoxelAdapter.canvasSize(scene)
+  local ww, wh = VoxelAdapter.windowSize()
+  if not (cw and ch and ww and wh) then return nil end
+  if VoxelAdapter.flipY() then y = ch - y end
+  return x * ww / cw, y * wh / ch
+end
+
+function VoxelAdapter.groundHeight(scene, map, cellX, cellY)
+  local voxelScene = scene and scene.voxelScene
+  if type(voxelScene) == "table" and type(voxelScene.groundAt) == "function" then
+    local ok, h = pcall(voxelScene.groundAt, map, cellX, cellY)
+    h = tonumber(h)
+    if ok and h then return h end
+  end
+  local tileShape = scene and scene.tileShape
+  if map and tileShape and type(tileShape.forMap) == "function"
+      and type(map.cellTile) == "function" then
+    if type(map.inBounds) == "function" then
+      local ok, inside = pcall(map.inBounds, map, cellX, cellY)
+      if ok and not inside then return 0 end
+    end
+    local okS, shapes = pcall(tileShape.forMap, map)
+    local okT, tile = pcall(map.cellTile, map, cellX, cellY)
+    local shape = okS and okT and type(shapes) == "table" and shapes[tile] or nil
+    if type(shape) == "table" and shape.art ~= "stair" then
+      return math.max(0, tonumber(shape.h) or 0)
+    end
+  end
+  return 0
+end
+
+local function voxelContext()
+  local scene = VoxelAdapter.discover()
+  if not scene then return nil end
+  local voxelState, voxel3d = scene.voxelState, scene.voxel3d
+  if type(voxel3d) ~= "table" or type(voxel3d.project) ~= "function" then return nil end
+
   if type(voxelState) == "table" and type(voxelState.active) == "function" then
     local okActive, active = pcall(voxelState.active)
     if not okActive or not active then return nil end
+    -- Async mesh builders explicitly expose readiness. Do not let a stale VP
+    -- or stale canvas from the previous map/frame turn a 2D fallback frame into
+    -- a bogus 3D pick.
+    if voxelState.ready == false then return nil end
   end
 
-  return voxelLibCache
+  local cw, ch = VoxelAdapter.canvasSize(scene)
+  if not (cw and ch and type(voxel3d.vp) == "table" and #voxel3d.vp >= 16) then
+    return nil
+  end
+  scene.canvasW, scene.canvasH = cw, ch
+  scene.ready = true
+  return scene
 end
 
 local function pointInTriangle(px, py, ax, ay, bx, by, cx, cy)
@@ -2040,37 +2183,11 @@ local function pointSegmentDistance2(px, py, ax, ay, bx, by)
 end
 
 local function framebufferPoint(x, y, voxel3d)
-  local frame = state.frame or {}
-  local cw, ch
-  if voxel3d and type(voxel3d.canvas) == "function" then
-    local okC, canvas = pcall(voxel3d.canvas)
-    if okC and canvas then
-      local okW, w = pcall(canvas.getWidth, canvas)
-      local okH, h = pcall(canvas.getHeight, canvas)
-      if okW and okH then cw, ch = tonumber(w), tonumber(h) end
-    end
+  local scene = VoxelAdapter.discover()
+  if scene and scene.voxel3d == voxel3d then
+    return VoxelAdapter.windowToCanvas(scene, x, y)
   end
-
-  -- Prefer the actual Voxel canvas / LOVE-unit ratio.  This survives odd
-  -- Android DPI, anisotropic dpiX/dpiY and future pipeline canvas sizing.
-  local ww, wh = tonumber(frame.ww), tonumber(frame.wh)
-  local px, py
-  if cw and ch and ww and wh and ww > 0 and wh > 0 then
-    px, py = x * cw / ww, y * ch / wh
-  else
-    local dx, dy = tonumber(frame.dpiX) or 1, tonumber(frame.dpiY) or 1
-    px, py = x * dx, y * dy
-    cw, ch = cw or tonumber(frame.pw), ch or tonumber(frame.ph)
-  end
-
-  -- Renderer flips a window-resolution worldOverride vertically on iOS.
-  -- Voxel3D.project itself stays in canvas Y-down coordinates, so mirror the
-  -- pointer into that same canvas before unprojecting it.
-  if ch and love and love.system and type(love.system.getOS) == "function" then
-    local okOS, osName = pcall(love.system.getOS)
-    if okOS and osName == "iOS" then py = ch - py end
-  end
-  return px, py, cw, ch
+  return nil
 end
 
 local function projectedPoint(voxel3d, wx, wy, height)
@@ -2083,7 +2200,7 @@ local function projectedPoint(voxel3d, wx, wy, height)
 end
 
 -- Texture-independent semantic hit for engine hidden-event fixtures in the
--- active Dramatic Shape scene.  We do NOT inspect a texture or ask the event
+-- active Voxel provider scene.  We do NOT inspect a texture or ask the event
 -- to execute.  Instead, project the gameplay cell that owns each known hidden
 -- fixture into screen space and use that only to SELECT the interaction.  The
 -- pathfinder then walks to a legal adjacent cell, faces the required direction
@@ -2432,7 +2549,7 @@ local function voxelMapAtWorld(entries, wx, wz)
 end
 
 -- Traverse the ray through a map's 8x8 visual-tile grid and test the actual
--- structure heights Dramatic Shape cached for its ChunkMesher.  This catches
+-- structure heights the active Voxel provider cached for its ChunkMesher.  This catches
 -- a building/wall/counter BEFORE the ground behind it, matching the depth
 -- buffered scene well enough for semantic picking without duplicating the
 -- renderer's enormous raw mesh in Lua memory.
@@ -2555,7 +2672,7 @@ local function voxelRayTargetFromTap(game, x, y, scene)
 
   local groundHit = voxelMapAtWorld(entries,gx,gz)
 
-  -- Dramatic Shape already has a stronger answer than our 2D collision shell:
+  -- The active Voxel provider already has a stronger answer than our 2D collision shell:
   -- Structures.forMap resolves every rendered 8x8 visual tile and classifies
   -- atlas-black/transparent interior darkness as shape.class == "void".
   -- Capture the EXACT ground visual tile under this ray before folding it back
@@ -2630,7 +2747,7 @@ local function voxelRayTargetFromTap(game, x, y, scene)
            intentX=intentX, intentY=intentY }
 end
 
--- Hit-test the actual ground quads Dramatic Shape's current camera projects.
+-- Hit-test the actual ground quads the active Voxel provider's current camera projects.
 -- Grid intersections are projected once and shared by adjacent cells. Raised
 -- semantic surfaces (actors, counters, walls, warps) may occlude a farther
 -- ground quad, matching the renderer's depth-buffered presentation.
@@ -2832,7 +2949,7 @@ local function targetFromTap(game, x, y)
       end
       return ray.x, ray.y, ray.cur, ray.overview, nil, ray.cross, ray
     end
-    -- Older Dramatic Shape builds (or the very first frame before a VP has
+    -- Older Voxel provider builds (or the very first frame before a VP has
     -- been established) retain the projection-based compatibility path.
     -- Once a live VP exists, the ray path above is authoritative except for
     -- the explicit semantic rescue above.
@@ -3545,12 +3662,16 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
   state.battleResume = nil
 
   local tx, ty, cur, overview, targetErr, cross, targetMeta
+  tx, ty, cur, overview, targetErr, cross, targetMeta =
+    targetFromTap(game, screenX, screenY)
 
-  -- Avatar taps no longer run an all-directions "radar".  A short tap on the
-  -- player is now a plain native A press in the direction the player already
-  -- faces.  Fixed hidden-event fixtures are selected directly by the normal
-  -- pathfinding tap pipeline (see ControlsFree.voxelFixedHiddenInteractionFromTap), so the
-  -- avatar no longer needs to guess UP/DOWN/RIGHT/LEFT around itself.
+  -- The player's billboard is not an opaque semantic target. A short tap that
+  -- begins on Red first gets the exact same scene/interaction resolution as
+  -- every other tap. If an NPC, PC/sign/fixture, door/warp, scripted hole,
+  -- connected-map entrance or Smart Exit is genuinely behind the avatar's
+  -- projection, let that target continue through the normal pathfinder.
+  -- Only when there is NO stronger semantic target does tapping Red proxy the
+  -- native A button in the direction he already faces.
   local gp = gesture
   local sx, sy = gp and gp.startX or screenX, gp and gp.startY or screenY
   local pdx, pdy = screenX - sx, screenY - sy
@@ -3564,15 +3685,42 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     if startedOnPlayer then
       state.stats.playerAvatarHitDetections =
         (state.stats.playerAvatarHitDetections or 0) + 1
-      mod.input:tap(game, "a")
-      state.stats.playerAvatarInteractionProxies =
-        (state.stats.playerAvatarInteractionProxies or 0) + 1
-      return true
+
+      local semanticBehind = cross ~= nil
+        or (targetMeta and targetMeta.forcedInteraction ~= nil)
+        or (targetMeta and targetMeta.visibleKind == "entity")
+      local currentMap = game and game.overworld and game.overworld.map
+      if not semanticBehind and tx and ty then
+        semanticBehind = interactionAt(game, tx, ty) ~= nil
+          or warpIntentAt(game, currentMap, cur, tx, ty) ~= nil
+        if not semanticBehind and ControlsFree.directionalWarpIntentAt then
+          semanticBehind =
+            ControlsFree.directionalWarpIntentAt(game, currentMap, cur, tx, ty) ~= nil
+        end
+        if not semanticBehind and ControlsFree.holeStepIntentAt then
+          semanticBehind =
+            ControlsFree.holeStepIntentAt(currentMap, overview, tx, ty) ~= nil
+        end
+      end
+      if not semanticBehind and cur and overview
+          and (targetErr == "outside_world" or targetErr == "outside_map")
+          and targetMeta then
+        local wanted = ControlsFree.outsideIntentDirections(
+          overview, targetMeta.intentX, targetMeta.intentY)
+        if #wanted > 0 then
+          semanticBehind = nearestExitTarget(
+            game, overview, cur, targetMeta.intentX, targetMeta.intentY) ~= nil
+        end
+      end
+
+      if not semanticBehind then
+        mod.input:tap(game, "a")
+        state.stats.playerAvatarInteractionProxies =
+          (state.stats.playerAvatarInteractionProxies or 0) + 1
+        return true
+      end
     end
   end
-
-  tx, ty, cur, overview, targetErr, cross, targetMeta =
-    targetFromTap(game, screenX, screenY)
 
   local exitFallback = false
   local exitIntent = nil
@@ -5855,27 +6003,11 @@ end
 
 local function voxelCanvasToWindow(voxel3d, p)
   if not p then return nil end
-  local frame = state.frame or {}
-  local cw, ch
-  if voxel3d and type(voxel3d.canvas) == "function" then
-    local okC, canvas = pcall(voxel3d.canvas)
-    if okC and canvas then
-      local okW, w = pcall(canvas.getWidth, canvas)
-      local okH, h = pcall(canvas.getHeight, canvas)
-      if okW and okH then cw, ch = tonumber(w), tonumber(h) end
-    end
+  local scene = VoxelAdapter.discover()
+  if scene and scene.voxel3d == voxel3d then
+    return VoxelAdapter.canvasToWindow(scene, p[1], p[2])
   end
-  cw, ch = cw or tonumber(frame.pw), ch or tonumber(frame.ph)
-  local ww, wh = tonumber(frame.ww), tonumber(frame.wh)
-  if not (cw and ch and ww and wh and cw > 0 and ch > 0 and ww > 0 and wh > 0) then
-    return nil
-  end
-  local sy = p[2]
-  if love and love.system and type(love.system.getOS) == "function" then
-    local okOS, osName = pcall(love.system.getOS)
-    if okOS and osName == "iOS" then sy = ch - sy end
-  end
-  return p[1] * ww / cw, sy * wh / ch
+  return nil
 end
 
 -- Hit the visible player rather than merely his world cell.  Flat rendering
@@ -5895,24 +6027,14 @@ function ControlsFree.playerScreenHit(game, x, y)
 
   local scene = voxelContext()
   if scene and scene.voxel3d then
-    -- Dramatic Shape does NOT draw the player as a vertical column above the
+    -- The supported Voxel renderers do NOT draw the player as a vertical column above the
     -- cell centre. It draws the live 16x16 sprite as a billboard card whose
     -- feet pivot at (player.px+8, player.py+8) and whose card leans back by
     -- (VoxelState.angle - pi/2). Hit-test that actual projected card.
     local player = game and game.overworld and game.overworld.player
     local px, py = playerPixel(game, cur)
-    local ground = 0
     local map = game and game.overworld and game.overworld.map
-    local tileShape = scene.tileShape
-    if map and tileShape and type(tileShape.forMap) == "function"
-        and type(map.cellTile) == "function" then
-      local okShapes, shapes = pcall(tileShape.forMap, map)
-      local okTile, tile = pcall(map.cellTile, map, cur.x, cur.y)
-      local shape = okShapes and okTile and type(shapes) == "table" and shapes[tile] or nil
-      if shape and shape.art ~= "stair" and tonumber(shape.h) and tonumber(shape.h) > 0 then
-        ground = tonumber(shape.h)
-      end
-    end
+    local ground = VoxelAdapter.groundHeight(scene, map, cur.x, cur.y)
 
     local angle = scene.voxelState and tonumber(scene.voxelState.angle) or 0
     local lean = angle - math.pi / 2
@@ -7956,55 +8078,18 @@ local function voxelPreviewContext(game, scene, mapId)
   end
   if not entry then return nil end
 
-  local frame = state.frame or {}
-  local cw, ch
-  if type(voxel3d.canvas) == "function" then
-    local okC, canvas = pcall(voxel3d.canvas)
-    if okC and canvas then
-      local okW, w = pcall(canvas.getWidth, canvas)
-      local okH, h = pcall(canvas.getHeight, canvas)
-      if okW and okH then cw, ch = tonumber(w), tonumber(h) end
-    end
-  end
-  cw, ch = cw or tonumber(frame.pw), ch or tonumber(frame.ph)
-  if not (cw and ch and cw > 0 and ch > 0) then return nil end
-
-  local ww, wh = tonumber(frame.ww), tonumber(frame.wh)
-  if not ww then ww = cw / math.max(tonumber(frame.dpiX) or 1, 1e-6) end
-  if not wh then wh = ch / math.max(tonumber(frame.dpiY) or 1, 1e-6) end
-  if not (ww and wh and ww > 0 and wh > 0) then return nil end
-
-  local flipY = false
-  if love and love.system and type(love.system.getOS) == "function" then
-    local okOS, osName = pcall(love.system.getOS)
-    flipY = okOS and osName == "iOS"
-  end
-
-  local shapes
-  if scene.tileShape and type(scene.tileShape.forMap) == "function" then
-    local okS, value = pcall(scene.tileShape.forMap, entry.map)
-    if okS and type(value) == "table" then shapes = value end
-  end
+  local cw, ch = VoxelAdapter.canvasSize(scene)
+  local ww, wh = VoxelAdapter.windowSize()
+  if not (cw and ch and ww and wh) then return nil end
 
   return {
-    voxel3d = voxel3d, entry = entry, shapes = shapes,
-    cw = cw, ch = ch, ww = ww, wh = wh, flipY = flipY,
+    scene = scene, voxel3d = voxel3d, entry = entry,
+    cw = cw, ch = ch, ww = ww, wh = wh,
   }
 end
 
 local function voxelPreviewGroundHeight(ctx, x, y)
-  local map, shapes = ctx.entry.map, ctx.shapes
-  if not (map and shapes and type(map.cellTile) == "function") then return 0 end
-  if type(map.inBounds) == "function" then
-    local ok, inside = pcall(map.inBounds, map, x, y)
-    if ok and not inside then return 0 end
-  end
-  local okT, tile = pcall(map.cellTile, map, x, y)
-  if not okT then return 0 end
-  local shape = shapes[tile]
-  if type(shape) ~= "table" or shape.art == "stair" then return 0 end
-  local h = tonumber(shape.h) or 0
-  return h > 0 and h or 0
+  return VoxelAdapter.groundHeight(ctx.scene, ctx.entry and ctx.entry.map, x, y)
 end
 
 local function voxelPathCellToScreen(ctx, x, y)
@@ -8017,8 +8102,9 @@ local function voxelPathCellToScreen(ctx, x, y)
   if p[1] < 0 or p[2] < 0 or p[1] >= ctx.cw or p[2] >= ctx.ch then
     return nil
   end
-  local sy = ctx.flipY and (ctx.ch - p[2]) or p[2]
-  return p[1] * ctx.ww / ctx.cw, sy * ctx.wh / ctx.ch, p[3]
+  local sx, sy = VoxelAdapter.canvasToWindow(ctx.scene, p[1], p[2])
+  if not sx then return nil end
+  return sx, sy, p[3]
 end
 
 local function drawPathPreview(game)
@@ -8158,6 +8244,18 @@ local function drawDebug()
     ("VOXEL %d  RAY %d  COLUMN %d"):format(
       state.stats.voxelTargets or 0, state.stats.voxelRayTargets or 0,
       state.stats.voxelColumnTargets or 0),
+    (function()
+      local p = VoxelAdapter.discover()
+      if not p then return "VOXEL PROVIDER NONE" end
+      local cw, ch = VoxelAdapter.canvasSize(p)
+      local pw, ph = VoxelAdapter.pixelSize()
+      local ready = p.voxelState and p.voxelState.ready ~= false
+      if cw and ch and pw and ph then
+        return ("VOXEL %s %dx%d>%dx%d %s"):format(
+          p.short or p.id, cw, ch, pw, ph, ready and "READY" or "WAIT")
+      end
+      return ("VOXEL %s %s"):format(p.short or p.id, ready and "READY" or "WAIT")
+    end)(),
     ("V-OUT %d  SEM-HIT %d  EDGE-WARP %d"):format(
       state.stats.voxelRayOutside or 0,
       state.stats.voxelSemanticRecoveries or 0,
