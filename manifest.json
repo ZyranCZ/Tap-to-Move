@@ -1,0 +1,15 @@
+{
+  "id": "tap_to_move",
+  "name": "Tap to Move",
+  "version": "1.0.0",
+  "entry": "main.lua",
+  "api": 2,
+  "category": "GAMEPLAY",
+  "priority": 100,
+  "dependencies": [],
+  "optional_dependencies": [
+    "DRAMATIC_SHAPE"
+  ],
+  "conflicts": [],
+  "description": "Mobile-first tap/hold navigation with native Voxel support, A* routing, smart interactions, seamless connections and persistent interior-exit pathfinding."
+}
