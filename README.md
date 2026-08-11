@@ -1,6 +1,6 @@
 # Tap to Move
 
-> **v1.3.11:** Added a deterministic **exit carpet / mat fallback**. Clicking a DOWN-activated exit carpet routes to its real warp source and always arms one extra DOWN input after arrival. This uses Gen1Recomp's warp-carpet semantics instead of relying on Smart Exit geometry/void heuristics.
+> **v1.3.12:** Fixed the exit-carpet routing deadlock: validated directional exit warp sources (such as DOWN carpets/mats) may now be the final A* goal even when the compact overview marks them non-walkable, and Tap to Move can selectively pass the engine collision check for that exact non-walkable warp endpoint. Warp cells remain forbidden as ordinary intermediate route nodes.
 
 **Tap to Move** adds modern touch navigation to **Pokémon Gen1Recomp**.
 
@@ -313,7 +313,7 @@ For 3D overworld play, install/enable **Dramatic Shape Voxel Mod** as well. Tap 
 
 Tap to Move declares its official GitHub repository in `manifest.json`, so Gen1Recomp's native mod updater can check GitHub Releases for newer versions and install a ZIP release from the launcher.
 
-The update check is handled by Gen1Recomp itself; Tap to Move does not run a separate background network checker during gameplay. Release ZIP assets should keep a name beginning with `tap_to_move`, for example `tap_to_move_v1.3.11.zip`.
+The update check is handled by Gen1Recomp itself; Tap to Move does not run a separate background network checker during gameplay. Release ZIP assets should keep a name beginning with `tap_to_move`, for example `tap_to_move_v1.3.12.zip`.
 
 ## Compatibility philosophy
 
@@ -322,6 +322,14 @@ Tap to Move does not hard-lock itself to one specific Gen1Recomp version. It att
 The Dramatic Shape integration uses its exported companion-library interface where available rather than modifying Voxel rendering behavior.
 
 ## Version
+
+**1.3.12**
+
+- Fixed the core A* legality bug that prevented Tap to Move from routing BACK onto certain exit warp/carpet source cells after the player had stepped away.
+- A validated directional EXIT warp source (for example a DOWN carpet/mat) may now be the final A* destination even when `mapOverview()` reports that cell as blocked/blank. The exception applies only to the exact final exit goal; the same warp cell is still forbidden as an ordinary intermediate route node.
+- Added a narrowly scoped `movement.collision` exception for the exact active directional exit goal when the engine rejects that actual warp-record cell solely because its tile is not in the ordinary walkable list. Entity collisions, map bounds and tile-pair/elevation collisions are not bypassed.
+- Confirmed carpet/warp exit intents no longer get rewritten into `move_nearest`, and multi-leg Smart Exit no longer re-rejects an actual warp source through the compact `.`/`+` terrain check.
+- DEBUG OVERLAY adds **EXIT-GOAL PASS** so a physical non-walkable warp-source override can be confirmed during testing.
 
 **1.3.11**
 

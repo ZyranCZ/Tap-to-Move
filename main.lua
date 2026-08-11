@@ -1,4 +1,4 @@
--- Tap to Move v1.3.11
+-- Tap to Move v1.3.12
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never teleports or writes player coordinates.  It
@@ -8,7 +8,7 @@
 
 local mod = ...
 
-local VERSION = "1.3.11"
+local VERSION = "1.3.12"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 800 -- delay before a held pointer starts continuous retargeting
@@ -235,6 +235,7 @@ local state = {
     exteriorVoidExitIntents = 0,
     voxelExactVoidExitIntents = 0,
     carpetDownIntents = 0,
+    exitGoalCollisionOverrides = 0,
     retainedTargets = 0,
     nearestFallbacks = 0,
     stickySemanticRetains = 0,
@@ -782,7 +783,7 @@ end
 
 local function passable(overview, x, y, goalX, goalY, waterMode,
                         occupied, tempBlocked, blockedEdges, blockedCells,
-                        fromX, fromY)
+                        fromX, fromY, allowBlockedGoal)
   local ch = cellChar(overview, x, y)
   if not ch then return false end
 
@@ -796,6 +797,14 @@ local function passable(overview, x, y, goalX, goalY, waterMode,
       and blockedEdges[edgeKey(fromX, fromY, x, y)] then
     return false
   end
+
+  -- Exit carpets are a special graph endpoint. Gen I can attach a warp
+  -- record to a collision cell that is NOT ordinary walkable terrain and
+  -- not reported as '+' by mapOverview. Such a cell must remain forbidden
+  -- as an intermediate A* node (otherwise routing could accidentally warp),
+  -- but an already-validated exit intent may explicitly allow that exact
+  -- cell as the final destination.
+  if allowBlockedGoal and x == goalX and y == goalY then return true end
 
   if ch == "." then return true end
   if ch == "~" then return waterMode end
@@ -875,7 +884,8 @@ local function reconstruct(cameFrom, cameVia, goalKey)
 end
 
 local function findPath(overview, sx, sy, gx, gy, waterMode,
-                        occupied, tempBlocked, blockedEdges, blockedCells, specialEdges)
+                        occupied, tempBlocked, blockedEdges, blockedCells, specialEdges,
+                        allowBlockedGoal)
   if not overview then return nil end
   if sx == gx and sy == gy then return {} end
 
@@ -883,7 +893,8 @@ local function findPath(overview, sx, sy, gx, gy, waterMode,
   occupied[key(sx, sy)] = nil -- the player occupies the start cell
 
   if not passable(overview, gx, gy, gx, gy, waterMode,
-                  occupied, tempBlocked, blockedEdges, blockedCells) then
+                  occupied, tempBlocked, blockedEdges, blockedCells,
+                  nil, nil, allowBlockedGoal) then
     return nil
   end
 
@@ -918,7 +929,7 @@ local function findPath(overview, sx, sy, gx, gy, waterMode,
         local nx, ny = cur.x + d.dx, cur.y + d.dy
         if passable(overview, nx, ny, gx, gy, waterMode,
                     occupied, tempBlocked, blockedEdges, blockedCells,
-                    cur.x, cur.y) then
+                    cur.x, cur.y, allowBlockedGoal) then
           local nk = key(nx, ny)
           local ng = cur.g + 1
           if gScore[nk] == nil or ng < gScore[nk] then
@@ -1190,10 +1201,12 @@ local function buildPath(game, nav, cur)
   local waterMode = currentWaterMode(game, overview, cur)
   local topology = ledgeTopology(game, game.overworld and game.overworld.map, overview)
   local blockedEdges = mergeBlockedEdges(nav.blockedEdges, topology.blockedEdges)
+  local allowExitGoal = nav.goalKind == "exit" and nav.exitIntent ~= nil
+    and nav.exitDir ~= nil
   local path = findPath(overview, cur.x, cur.y,
                         nav.targetX, nav.targetY, waterMode,
                         occupied, nav.tempBlocked, blockedEdges, nav.blockedCells,
-                        topology.jumps)
+                        topology.jumps, allowExitGoal)
   if not path then
     -- Only wait when removing CURRENTLY-MOVABLE actors makes a path possible.
     -- A wall or a stationary NPC therefore fails immediately rather than
@@ -1202,7 +1215,7 @@ local function buildPath(game, nav, cur)
     local withoutDynamic = findPath(overview, cur.x, cur.y,
                                     nav.targetX, nav.targetY, waterMode,
                                     static, nil, blockedEdges, nav.blockedCells,
-                                    topology.jumps)
+                                    topology.jumps, allowExitGoal)
     if withoutDynamic then return nil, "dynamic" end
     return nil, "blocked"
   end
@@ -2894,11 +2907,13 @@ local function nearestExitTarget(game, overview, cur)
     for k in pairs(warpKeys) do
       if k ~= key(dst.x,dst.y) then blocked[k] = true end
     end
-    local path = findPath(overview, cur.x, cur.y, dst.x, dst.y, waterMode,
-      occupied, nil, topology.blockedEdges, blocked, topology.jumps)
-    if not path then return end
-
     local dirs = warpActivationDirections(game, map, dst.x, dst.y)
+    -- Only directional warp sources (edge/carpet semantics) may need the
+    -- special non-walkable endpoint exception. Ordinary arrival warps must
+    -- remain reachable through their normal terrain legality.
+    local path = findPath(overview, cur.x, cur.y, dst.x, dst.y, waterMode,
+      occupied, nil, topology.blockedEdges, blocked, topology.jumps, #dirs > 0)
+    if not path then return end
     local warpTile = false
     if type(map.isWarpTileCell) == "function" then
       local ok, yes = pcall(map.isWarpTileCell, map, dst.x, dst.y)
@@ -3310,7 +3325,8 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       -- Fixed interaction surfaces during a HOLD are movement targets only:
       -- approach their nearest legal floor, never fire A. Generic solid
       -- geometry gets the same nearest-reachable behavior.
-      local needsNearest = (not legalMovement and ch ~= "+")
+      local needsNearest = ((not legalMovement and ch ~= "+")
+          and activeExitIntent == nil)
         or (continuous and rawInteraction ~= nil)
 
       if needsNearest then
@@ -3469,12 +3485,10 @@ local function startExitJourneyLeg(game)
     candidate.requestedMapId = intent.cross and intent.cross.destMapId or cur.mapId
     ok, why = rebuildNavigation(game, candidate, cur)
   else
-    local ch = cellChar(overview, intent.x, intent.y)
-    local waterMode = currentWaterMode(game, overview, cur)
-    if ch ~= "." and ch ~= "+" and not (ch == "~" and waterMode) then
-      state.exitJourney = nil
-      return false, "exit_cell_invalid"
-    end
+    -- nearestExitTarget is built from ACTUAL map warp records. Do not run its
+    -- chosen endpoint back through mapOverview terrain legality: some Gen I
+    -- exit carpets are deliberately non-walkable collision cells and would
+    -- be rejected here even though they are the correct warp source.
     candidate.goalKind = "exit"
     candidate.targetX, candidate.targetY = intent.x, intent.y
     candidate.exitDir = intent.exitDir
@@ -6192,6 +6206,36 @@ mod.hooks:wrap("movement.collision", function(nextFn, allowed, ctx)
     return result
   end
 
+  -- Some Gen I exit warp records sit on collision cells that are not in the
+  -- tileset's ordinary walkable list. mapOverview therefore reports them as
+  -- blank/solid and vanilla Collision.canMove returns reason="tile" when the
+  -- player tries to WALK BACK onto the source after leaving it. A validated
+  -- Tap-to-Move EXIT route may override only that exact final step.
+  --
+  -- Safety constraints:
+  --   * exact active EXIT goal only (never an intermediate node),
+  --   * an actual warp record must exist on the destination cell,
+  --   * only the engine's non-walkable-tile rejection is bypassed,
+  --   * entity/bounds failures and tile-pair/elevation failures remain final.
+  if result == false and ctx.reason == "tile"
+      and nav.goalKind == "exit" and nav.exitIntent ~= nil
+      and nav.exitDir ~= nil
+      and nav.holdDir == ctx.dir
+      and nav.targetX == ctx.toX and nav.targetY == ctx.toY
+      and nav.expectedX == ctx.toX and nav.expectedY == ctx.toY then
+    local map = game.overworld.map
+    local hasWarp = map and type(map.warpAtCell) == "function"
+      and map:warpAtCell(ctx.toX, ctx.toY) ~= nil
+    local ordinaryWalkable = map and type(map.isWalkableCell) == "function"
+      and map:isWalkableCell(ctx.toX, ctx.toY) == true
+    if hasWarp and not ordinaryWalkable then
+      state.stats.exitGoalCollisionOverrides =
+        (state.stats.exitGoalCollisionOverrides or 0) + 1
+      ctx.reason = "tap_to_move_exit_goal"
+      return true
+    end
+  end
+
   if result == false and nav.holdDir == ctx.dir
       and nav.expectedX == ctx.toX and nav.expectedY == ctx.toY then
     state.stats.collisions = state.stats.collisions + 1
@@ -6761,6 +6805,8 @@ local function drawDebug()
       state.stats.voxelRayOutside or 0,
       state.stats.voxelExactVoidExitIntents or 0,
       state.stats.carpetDownIntents or 0),
+    ("EXIT-GOAL PASS %d"):format(
+      state.stats.exitGoalCollisionOverrides or 0),
     ("V-TILE %s  %s  @%s,%s"):format(
       tostring(state.lastVoxelPick and state.lastVoxelPick.tile or "-"),
       tostring(state.lastVoxelPick and state.lastVoxelPick.class or "-"),
