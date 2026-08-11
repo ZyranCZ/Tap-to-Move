@@ -1,10 +1,22 @@
 # Tap to Move
 
+> **v1.3.29:** Moved the renderer-agnostic fallback to the very end of Mod Options and renamed it **EXPERIMENTAL: Simple Mode**. Its three movement tolerances are now user-tunable for testing: Center Deadzone, Axis Deadzone, and Dominance Ratio. The existing defaults remain 10%, 6%, and 4X; Dominance Ratio can also be disabled entirely to test pure weighted two-axis steering.
+
+> **v1.3.28:** Expanded **SIMPLE TOUCH MOVEMENT** into a self-contained fallback control scheme. If one direction component is at least 4× stronger than the other, the weaker axis is ignored completely to prevent accidental sideways steps. If all requested movement is blocked, the avatar turns toward the strongest finger direction without moving. In Simple mode: short avatar tap = A, one-second avatar hold = START, and a one-second hold elsewhere sends B. The separate START/SELECT gesture setting no longer reserves Simple-mode touches. Added an always-visible semi-transparent top-right controller icon that hides/shows Gen1Recomp's stock on-screen controls without removing the fallback toggle itself.
+
 > **v1.3.27:** HOLD STEER DELAY is now a 1X base delay that automatically scales with Gen1Recomp's live overworld logic speed. The default is 150 ms; at 2X/3X/4X it becomes 300/450/600 logic-ms respectively, preserving the same real-time grace before a held pointer is allowed to retarget and overwrite the initial semantic route. Available base values are 150/200/250/300/350/400/450/500 ms.
 
 > **v1.3.26:** Fixed interaction finishing for PCs and other facing-gated targets. After pathfinding reaches the interaction position, Tap to Move now gives Gen1Recomp one neutral input poll to re-arm turn-in-place, performs a dedicated turn toward the target, verifies the live player facing, waits for the short vanilla turn timer to settle, and only then presses A. This prevents hidden-event interactions from firing while the avatar is still facing the wrong direction.
 
+> **v1.3.25:** Removed the avatar-adjacent UP → DOWN → RIGHT → LEFT interaction radar. Fixed hidden-event fixtures such as Pokémon Center PCs are now first-class pathfinding interaction targets: in Dramatic Shape, Tap to Move projects the engine-owned hidden-event cell itself into screen space, routes to a legal adjacent tile, faces the required direction and presses ordinary A. The hidden event is never executed remotely; Gen1Recomp's normal interaction dispatcher fires it only after the player actually reaches it. Secret hidden items/coins remain excluded. A short avatar/centre tap is now simply native A in the player's current facing. Debug overlay adds `HID-PATH`.
+
+> **v1.3.24:** Fixed avatar-adjacent rescue for Pokémon Center PCs and other engine hidden-object surfaces. The normal semantic scan remains first, but when an adjacent hidden-object cell is usable by the running engine and the mod-side semantic mirror misses it, Tap to Move now asks the live `tryHiddenObject` routine directly in the same UP → DOWN → RIGHT → LEFT priority. Hidden floor treasure is explicitly excluded from this fallback. Debug overlay adds `NATIVE-HID`.
+
 > **v1.3.23:** Added **SIMPLE TOUCH MOVEMENT** (default OFF), a renderer-agnostic alternative to Tap-to-Move pathfinding. While ON, world touches never use 2D/3D target picking or A*: the finger vector from screen centre becomes weighted D-pad input. A 70% UP / 30% LEFT vector produces an approximately 7:3 interleaved UP/LEFT sequence; if the preferred next tile is obviously blocked, the legal secondary direction is used instead. Normal Gen1Recomp movement/collision still decides every actual step.
+>
+> **v1.3.22:** Fixed avatar-click rescue in Dramatic Shape/Voxel mode. Player hit-testing now follows Dramatic Shape's actual live 16x16 leaning billboard instead of approximating the avatar as a vertical column. Avatar ownership is snapshotted on pointer-down, and a confirmed adjacent interaction is resolved before 3D raycasting/Smart Exit, so tapping the player beside a PC can reliably turn toward it and press A.
+>
+> **v1.3.21:** A short tap on the player now performs a one-tile interaction rescue scan in strict **UP → DOWN → RIGHT → LEFT** priority. If a genuine adjacent NPC/PC/sign/bookshelf/counter or other supported interaction exists, Tap to Move turns toward it and presses A; this bypasses unreliable 3D object picking while never probing empty cells. If no adjacent interaction exists, the previous front-cell avatar proxy remains available.
 >
 > **v1.3.20:** Smart Exit is now direction-gated. An off-map click above/below/left/right of an interior may only choose a real exit that leaves in the same direction; if no matching exit exists, Tap to Move does nothing instead of sending the player through an unrelated door. Hold-to-Steer retarget samples can no longer create a new Smart Exit solely because camera movement moves the map out from under a held pointer.
 
@@ -20,7 +32,8 @@ The mod does **not** write player coordinates or invent destinations. It drives 
 
 ## Features
 
-- **Simple Touch Movement (optional)** — renderer-agnostic direct steering from the finger vector relative to screen centre. It is mutually exclusive with world pathfinding while enabled and works without reading scene textures or Voxel geometry.
+- **Simple Touch Movement (optional)** — renderer-agnostic direct steering from the finger vector relative to screen centre. It is mutually exclusive with world pathfinding while enabled, works without reading scene textures or Voxel geometry, suppresses tiny secondary-axis drift when the primary direction is at least 4× stronger, and includes its own A/B/START gestures.
+- **Always-available native controls toggle** — a semi-transparent controller icon in the top-right corner can hide or restore Gen1Recomp's stock on-screen D-pad/A/B/START/SELECT overlay at any time. The toggle itself remains visible while the controls are hidden.
 - **Tap to walk** — movement normally starts immediately on pointer press. With **PINCH OR SPREAD** selected, the first mobile world touch gets a brief 0.20 s two-finger pairing tolerance (quick single taps are replayed on release).
 - **Hold to steer** — keep your finger down and the destination updates as the world moves under it. **HOLD STEER DELAY** is a configurable 1X base (150–500 ms in 50 ms steps, default 150 ms) and automatically multiplies with the live Overworld Speed, so 150 ms becomes 300/450/600 at 2X/3X/4X before retargeting is allowed.
 - **A\* pathfinding** around walls, buildings, NPCs and other obstacles.
@@ -66,7 +79,7 @@ Voxel support includes:
 
 Dramatic Shape is an **optional dependency**. If it is not installed or Voxel mode is disabled, Tap to Move automatically uses its normal 2D targeting path.
 
-For other visual/Voxel mods whose geometry cannot be interpreted reliably, enable **SIMPLE TOUCH MOVEMENT**. That mode ignores renderer geometry entirely and steers only from the finger position relative to screen centre.
+For other visual/Voxel mods whose geometry cannot be interpreted reliably, enable **EXPERIMENTAL: Simple Mode**. That mode ignores renderer geometry entirely and steers only from the finger position relative to screen centre.
 
 ## Tap, hold and interactions
 
@@ -196,12 +209,32 @@ Mouse features are independent. For example, wheel navigation can be enabled whi
 ### TAP TO MOVE
 Enable or disable the mod.
 
-### SIMPLE TOUCH MOVEMENT
+### EXPERIMENTAL: Simple Mode
 **Default: OFF**
 
 Alternative renderer-agnostic world movement. While ON, the normal Tap-to-Move/pathfinding system is disabled for world pointer movement. The mod reads only the finger/mouse vector from the centre of the screen and converts its vertical/horizontal components into a weighted sequence of real D-pad inputs. If the preferred component is obviously blocked but the secondary component is legal, the secondary direction is used. A small centre dead zone stops movement.
 
-The game remains authoritative for collisions, ledges, warps, map connections and Strength pushes; Simple Touch Movement never writes player coordinates. A short centre/avatar tap remains a native A press in the player's current facing.
+The Simple block is intentionally placed **at the very end of Mod Options** and exposes its movement tolerances for experimentation:
+
+- **SIMPLE CENTER DEADZONE** — ignores the entire pointer vector near screen centre. Default **10%**; choices OFF / 5 / 10 / 15 / 20 / 25 / 30%.
+- **SIMPLE AXIS DEADZONE** — ignores an individual horizontal/vertical component when that axis is only a tiny part of the gesture. Default **6%**; choices OFF / 2 / 4 / 6 / 8 / 10 / 12 / 15 / 20%.
+- **SIMPLE DOMINANCE RATIO** — if the strongest axis is at least this many times stronger than the second axis, the weaker axis is discarded and movement becomes 100% cardinal. Default **4X**; choices OFF / 1.5X / 2X / 2.5X / 3X / 3.5X / 4X / 5X / 6X / 8X. **OFF** disables this dominance rule and leaves weighted two-axis steering active.
+
+For example, with the default 4X ratio, `80% LEFT + 20% DOWN` becomes pure LEFT, while `70% LEFT + 30% DOWN` keeps weighted steering. If none of the requested directions is legal, the avatar still turns to face the strongest finger direction without moving through the collision.
+
+Simple mode also owns its interaction gestures directly, independent of the separate START/SELECT setting:
+
+- short tap on the avatar/centre → **A**;
+- one-second hold on the avatar/centre → **START**;
+- one-second hold anywhere else → **B** once while the directional hold can continue;
+- SELECT is intentionally not assigned in Simple mode.
+
+The game remains authoritative for collisions, ledges, warps, map connections and Strength pushes; Simple Touch Movement never writes player coordinates.
+
+### ON-SCREEN CONTROLS TOGGLE
+A small semi-transparent controller icon is always drawn in the **top-right corner** while the mod is running. Tap it to hide/show Gen1Recomp's original on-screen D-pad, A, B, START and SELECT controls. The icon itself stays visible when those controls are hidden, providing an emergency fallback without permanently cluttering the screen.
+
+The toggle is runtime-only and does not rewrite the player's saved touch-control layout.
 
 ### TAP TO INTERACT
 Allow interactive world targets to be approached and activated after release.

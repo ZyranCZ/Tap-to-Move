@@ -1,4 +1,4 @@
--- Tap to Move v1.3.27
+-- Tap to Move v1.3.29
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,7 +9,7 @@
 
 local mod = ...
 
-local VERSION = "1.3.27"
+local VERSION = "1.3.29"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 150 -- 1X base; scaled by live overworld logic speed
@@ -67,10 +67,20 @@ local ControlsFree = {
   -- Renderer-agnostic direct steering constants. Kept on this table rather
   -- than as extra chunk locals because this very large mod deliberately stays
   -- below Lua 5.1's 200-local limit for one compiled function.
-  SIMPLE_TOUCH_DEADZONE = 0.10,
-  SIMPLE_TOUCH_AXIS_DEADZONE = 0.06,
+  SIMPLE_TOUCH_DEADZONE = 0.10, -- default; runtime-tunable in Simple Mode
+  SIMPLE_TOUCH_AXIS_DEADZONE = 0.06, -- default; runtime-tunable in Simple Mode
+  -- If one screen-axis component is at least four times stronger than the
+  -- other, treat the gesture as intentionally cardinal. This prevents tiny
+  -- thumb drift from leaking an occasional sideways step into a long hold.
+  SIMPLE_TOUCH_DOMINANCE_RATIO = 4.0, -- default; runtime-tunable in Simple Mode
   SIMPLE_TOUCH_PRESS_FAIL_TICKS = 4,
   SIMPLE_TOUCH_RETRY_BLOCK_TICKS = 10,
+  SIMPLE_TOUCH_LONG_PRESS_SECONDS = 1.0,
+  SIMPLE_TOUCH_LONG_PRESS_MOVE_SLOP_UNITS = 22,
+  NATIVE_CONTROLS_TOGGLE_MIN_SIZE = 34,
+  NATIVE_CONTROLS_TOGGLE_MAX_SIZE = 48,
+  NATIVE_CONTROLS_TOGGLE_MARGIN = 10,
+  NATIVE_CONTROLS_TOGGLE_SLOP = 8,
   SIMPLE_DIR_COMPASS = { up="north", down="south", left="west", right="east" },
   SHAKE_ACCEL_THRESHOLD = 5.5,       -- m/s^2 after gravity removal
   SHAKE_GYRO_THRESHOLD = 3.2,        -- rad/s
@@ -130,8 +140,6 @@ for _, d in ipairs(DIRS) do DIR_BY_NAME[d.name] = d end
 
 mod.options:define({
   { key = "enabled", label = "TAP TO MOVE", type = "toggle", default = true },
-  { key = "simple_touch_movement", label = "SIMPLE TOUCH MOVEMENT",
-    type = "toggle", default = false },
   { key = "interact", label = "TAP TO INTERACT", type = "toggle", default = true },
   { key = "hold_steer", label = "HOLD TO STEER", type = "toggle", default = true },
   { key = "hold_steer_delay_ms", label = "HOLD STEER DELAY", type = "number",
@@ -167,7 +175,7 @@ mod.options:define({
   { key = "battle_resume", label = "RESUME AFTER WILD", type = "toggle", default = false },
   { key = "debug", label = "DEBUG OVERLAY", type = "toggle", default = false },
 
-  -- Mouse options stay at the very bottom: all are opt-in.
+  -- Mouse options stay grouped together: all are opt-in.
   { key = "mouse", label = "MOUSE WALK CONTROL",
     type = "toggle", default = false },
   { key = "desktop_mouse_ab", label = "MOUSE LMB/RMB=A/B",
@@ -187,6 +195,31 @@ mod.options:define({
     choices = {
       { "OFF", "off" }, { "ON", "on" }, { "ON FLIPPED", "on_flipped" },
     } },
+
+  -- Renderer-agnostic fallback mode is intentionally the final options block:
+  -- it is experimental and its tuning rows belong together for iteration.
+  { key = "simple_touch_movement", label = "EXPERIMENTAL: Simple Mode",
+    type = "toggle", default = false },
+  { key = "simple_center_deadzone_pct", label = "SIMPLE CENTER DEADZONE",
+    type = "choice", default = "10",
+    choices = {
+      { "OFF", "0" }, { "5%", "5" }, { "10%", "10" }, { "15%", "15" },
+      { "20%", "20" }, { "25%", "25" }, { "30%", "30" },
+    } },
+  { key = "simple_axis_deadzone_pct", label = "SIMPLE AXIS DEADZONE",
+    type = "choice", default = "6",
+    choices = {
+      { "OFF", "0" }, { "2%", "2" }, { "4%", "4" }, { "6%", "6" },
+      { "8%", "8" }, { "10%", "10" }, { "12%", "12" },
+      { "15%", "15" }, { "20%", "20" },
+    } },
+  { key = "simple_dominance_ratio", label = "SIMPLE DOMINANCE RATIO",
+    type = "choice", default = "4",
+    choices = {
+      { "OFF", "off" }, { "1.5X", "1.5" }, { "2X", "2" },
+      { "2.5X", "2.5" }, { "3X", "3" }, { "3.5X", "3.5" },
+      { "4X", "4" }, { "5X", "5" }, { "6X", "6" }, { "8X", "8" },
+    } },
 })
 
 local state = {
@@ -200,6 +233,10 @@ local state = {
   simpleHold = nil,
   simpleInteraction = nil,
   simpleModeLast = false,
+  nativeControlsVisibleOverride = nil,
+  nativeControlsToggleTouches = {},
+  nativeControlsToggleInstalled = false,
+  nativeControlsToggleOriginalDraw = nil,
   game = nil,
   lastStop = nil,
   pendingInteraction = nil,
@@ -254,6 +291,13 @@ local state = {
     simpleTouchLeft = 0,
     simpleTouchRight = 0,
     simpleTouchAvatarInteractions = 0,
+    simpleTouchDominantCardinals = 0,
+    simpleTouchBlockedTurns = 0,
+    simpleTouchStartHolds = 0,
+    simpleTouchBHolds = 0,
+    nativeControlsTogglePresses = 0,
+    nativeControlsShown = 0,
+    nativeControlsHidden = 0,
     seamNeutralTicks = 0,
     seamHeldFastStarts = 0,
     entryGestureSuppressions = 0,
@@ -4708,6 +4752,11 @@ mod.hooks:wrap("render.compose", function(nextFn, renderer, ctx)
 end)
 
 local function startSelectTouchMode()
+  -- SIMPLE TOUCH MOVEMENT owns its own A/B/START gesture set. Do not let the
+  -- separate START/SELECT option reserve the same avatar touch or pinch pair.
+  if ControlsFree.simpleTouchEnabled and ControlsFree.simpleTouchEnabled() then
+    return "off"
+  end
   local value = tostring(option("start_select_touch_control", "off") or "off")
   if value == "hold_player_sprite" or value == "pinch_or_spread" then
     return value
@@ -5167,6 +5216,14 @@ local function installRawPinchZoomGuard(game)
   state.rawTouchDispatchRelease = dispatchRelease
 
   game.touchpressed = function(self, id, x, y, dx, dy, pressure)
+    -- The persistent top-right stock-controls toggle sits above every game/UI
+    -- state and gets absolute first refusal, even while the native controls
+    -- themselves are hidden.
+    if id ~= nil and id ~= "mouse" and ControlsFree.nativeControlsToggleHit(x, y) then
+      state.nativeControlsToggleTouches = state.nativeControlsToggleTouches or {}
+      state.nativeControlsToggleTouches[id] = { startX = x, startY = y, x = x, y = y }
+      return true
+    end
     -- A lifecycle interruption can swallow the previous release. Any NEW press
     -- with the same host touch id is authoritative and retires stale ownership.
     if state.nativeControlOwnedTouches then state.nativeControlOwnedTouches[id] = nil end
@@ -5223,6 +5280,14 @@ local function installRawPinchZoomGuard(game)
   end
 
   game.touchmoved = function(self, id, x, y, dx, dy, pressure)
+    local toggleTouch = state.nativeControlsToggleTouches and state.nativeControlsToggleTouches[id]
+    if toggleTouch then
+      toggleTouch.x, toggleTouch.y = x, y
+      local ddx, ddy = x - toggleTouch.startX, y - toggleTouch.startY
+      local slop = ControlsFree.NATIVE_CONTROLS_TOGGLE_SLOP * 1.5
+      if ddx * ddx + ddy * ddy > slop * slop then toggleTouch.cancelled = true end
+      return true
+    end
     if state.nativeControlOwnedTouches and state.nativeControlOwnedTouches[id] then
       return moved(self, id, x, y, dx, dy, pressure)
     end
@@ -5265,6 +5330,14 @@ local function installRawPinchZoomGuard(game)
   end
 
   game.touchreleased = function(self, id, x, y, dx, dy, pressure)
+    local toggleTouch = state.nativeControlsToggleTouches and state.nativeControlsToggleTouches[id]
+    if toggleTouch then
+      state.nativeControlsToggleTouches[id] = nil
+      if not toggleTouch.cancelled and ControlsFree.nativeControlsToggleHit(x, y) then
+        ControlsFree.toggleNativeControls(self)
+      end
+      return true
+    end
     if state.nativeControlOwnedTouches and state.nativeControlOwnedTouches[id] then
       -- Keep the ownership flag set while the original Game path calls the
       -- TouchControls fallback wrapper, so that wrapper can forward the native
@@ -6136,6 +6209,9 @@ function ControlsFree.holdBTouchTick(game)
 end
 
 function ControlsFree.beginPlayerHoldTouch(game, id, x, y)
+  if ControlsFree.simpleTouchEnabled and ControlsFree.simpleTouchEnabled() then
+    return false
+  end
   if id == nil or id == "mouse"
       or startSelectTouchMode() ~= "hold_player_sprite"
       or ControlsFree.dialogueActive(game) or state.twoFingerGesture then
@@ -6570,6 +6646,125 @@ local function disarmInteractionForGesture(gestureId, reason)
   return changed
 end
 
+-- ALWAYS-AVAILABLE NATIVE TOUCH-CONTROLS TOGGLE ---------------------------
+--
+-- A tiny top-right overlay remains visible even when the stock Gen1Recomp
+-- D-pad/A/B/START/SELECT overlay is hidden. It is intentionally runtime-only:
+-- it does not rewrite the player's persistent launcher layout/options.
+function ControlsFree.nativeControlsToggleRect()
+  local w, h = ControlsFree.simpleTouchWindowSize and ControlsFree.simpleTouchWindowSize() or nil
+  if not w or not h then
+    if love and love.graphics and type(love.graphics.getDimensions) == "function" then
+      local ok, gw, gh = pcall(love.graphics.getDimensions)
+      if ok then w, h = tonumber(gw), tonumber(gh) end
+    end
+  end
+  if not w or not h then return nil end
+  local size = math.max(ControlsFree.NATIVE_CONTROLS_TOGGLE_MIN_SIZE,
+    math.min(ControlsFree.NATIVE_CONTROLS_TOGGLE_MAX_SIZE, math.min(w, h) * 0.075))
+  local margin = ControlsFree.NATIVE_CONTROLS_TOGGLE_MARGIN
+  return w - margin - size, margin, size, size
+end
+
+function ControlsFree.nativeControlsToggleHit(x, y)
+  local rx, ry, rw, rh = ControlsFree.nativeControlsToggleRect()
+  if not rx then return false end
+  local slop = ControlsFree.NATIVE_CONTROLS_TOGGLE_SLOP
+  x, y = tonumber(x), tonumber(y)
+  return x and y and x >= rx - slop and x <= rx + rw + slop
+    and y >= ry - slop and y <= ry + rh + slop or false
+end
+
+function ControlsFree.nativeControlsVisible(game)
+  if state.nativeControlsVisibleOverride ~= nil then
+    return state.nativeControlsVisibleOverride == true
+  end
+  local tc = game and game.touchControls
+  if tc and type(tc.visible) == "function" then
+    local ok, visible = pcall(tc.visible, tc)
+    if ok then return visible == true end
+  end
+  return tc and tc.enabled ~= false and not tc.controllerHidden or false
+end
+
+function ControlsFree.applyNativeControlsVisibility(game)
+  local tc = game and game.touchControls
+  if not tc or state.nativeControlsVisibleOverride == nil then return end
+  local show = state.nativeControlsVisibleOverride == true
+  if show then
+    tc.enabled = true
+    tc.controllerHidden = false
+    if not tc.img and type(tc.ensureImages) == "function" then pcall(tc.ensureImages, tc) end
+  else
+    if tc.enabled ~= false and type(tc.reset) == "function" then pcall(tc.reset, tc) end
+    tc.enabled = false
+    tc.controllerHidden = false
+  end
+end
+
+function ControlsFree.toggleNativeControls(game)
+  local show = not ControlsFree.nativeControlsVisible(game)
+  state.nativeControlsVisibleOverride = show
+  ControlsFree.applyNativeControlsVisibility(game)
+  state.stats.nativeControlsTogglePresses =
+    (state.stats.nativeControlsTogglePresses or 0) + 1
+  if show then
+    state.stats.nativeControlsShown = (state.stats.nativeControlsShown or 0) + 1
+  else
+    state.stats.nativeControlsHidden = (state.stats.nativeControlsHidden or 0) + 1
+  end
+  return show
+end
+
+function ControlsFree.drawNativeControlsToggle(game)
+  if not (love and love.graphics) then return end
+  local x, y, w, h = ControlsFree.nativeControlsToggleRect()
+  if not x then return end
+  local visible = ControlsFree.nativeControlsVisible(game)
+  local pressed = false
+  for _, t in pairs(state.nativeControlsToggleTouches or {}) do
+    if not t.cancelled then pressed = true break end
+  end
+  local a = pressed and 0.78 or 0.48
+  love.graphics.push("all")
+  love.graphics.origin()
+  love.graphics.setColor(0, 0, 0, a * 0.72)
+  love.graphics.rectangle("fill", x, y, w, h, w * 0.22, h * 0.22)
+  love.graphics.setColor(1, 1, 1, a)
+  love.graphics.setLineWidth(math.max(1.5, w * 0.055))
+  -- Compact controller glyph: d-pad on the left, A/B dots on the right.
+  local cx, cy = x + w * 0.34, y + h * 0.52
+  local arm = w * 0.11
+  love.graphics.line(cx - arm, cy, cx + arm, cy)
+  love.graphics.line(cx, cy - arm, cx, cy + arm)
+  love.graphics.circle("fill", x + w * 0.67, y + h * 0.45, w * 0.055)
+  love.graphics.circle("fill", x + w * 0.78, y + h * 0.59, w * 0.055)
+  if not visible then
+    -- Slash means the stock overlay is currently hidden; the icon itself stays.
+    love.graphics.setLineWidth(math.max(2, w * 0.07))
+    love.graphics.line(x + w * 0.20, y + h * 0.18, x + w * 0.82, y + h * 0.82)
+  end
+  love.graphics.pop()
+end
+
+function ControlsFree.installNativeControlsToggle(game)
+  if state.nativeControlsToggleInstalled or not game or not game.touchControls then
+    return false
+  end
+  local tc = game.touchControls
+  if type(tc.draw) ~= "function" then return false end
+  local draw0 = tc.draw
+  state.nativeControlsToggleOriginalDraw = draw0
+  tc.draw = function(self, ...)
+    ControlsFree.applyNativeControlsVisibility(game)
+    local result = draw0(self, ...)
+    ControlsFree.drawNativeControlsToggle(game)
+    return result
+  end
+  state.nativeControlsToggleInstalled = true
+  return true
+end
+
 -- SIMPLE TOUCH MOVEMENT -----------------------------------------------------
 --
 -- This deliberately lives completely outside targetFromTap()/Voxel/pathfinding.
@@ -6613,6 +6808,26 @@ function ControlsFree.clampUnit(v)
   return v
 end
 
+function ControlsFree.simpleCenterDeadzone()
+  local fallback = math.floor((ControlsFree.SIMPLE_TOUCH_DEADZONE or 0.10) * 100 + 0.5)
+  local pct = tonumber(option("simple_center_deadzone_pct", tostring(fallback))) or fallback
+  return math.max(0, math.min(50, pct)) / 100
+end
+
+function ControlsFree.simpleAxisDeadzone()
+  local fallback = math.floor((ControlsFree.SIMPLE_TOUCH_AXIS_DEADZONE or 0.06) * 100 + 0.5)
+  local pct = tonumber(option("simple_axis_deadzone_pct", tostring(fallback))) or fallback
+  return math.max(0, math.min(50, pct)) / 100
+end
+
+function ControlsFree.simpleDominanceRatio()
+  local raw = tostring(option("simple_dominance_ratio",
+    tostring(ControlsFree.SIMPLE_TOUCH_DOMINANCE_RATIO or 4.0)) or "4")
+  if raw == "off" then return math.huge end
+  local ratio = tonumber(raw) or ControlsFree.SIMPLE_TOUCH_DOMINANCE_RATIO or 4.0
+  return math.max(1.0, math.min(100.0, ratio))
+end
+
 -- Return the two directional components represented by a pointer.  Magnitudes
 -- are literal percentages of centre->screen-edge distance on each axis: e.g.
 -- 70% up + 30% left becomes weights 0.70/0.30.
@@ -6623,9 +6838,11 @@ function ControlsFree.simpleTouchComponents(p)
   local nx = ControlsFree.clampUnit(((tonumber(p.x) or cx) - cx) / math.max(w * 0.5, 1))
   local ny = ControlsFree.clampUnit(((tonumber(p.y) or cy) - cy) / math.max(h * 0.5, 1))
   local ax, ay = math.abs(nx), math.abs(ny)
-  if math.sqrt(nx * nx + ny * ny) < ControlsFree.SIMPLE_TOUCH_DEADZONE then return {} end
-  if ax < ControlsFree.SIMPLE_TOUCH_AXIS_DEADZONE then ax = 0 end
-  if ay < ControlsFree.SIMPLE_TOUCH_AXIS_DEADZONE then ay = 0 end
+  local centerDeadzone = ControlsFree.simpleCenterDeadzone()
+  local axisDeadzone = ControlsFree.simpleAxisDeadzone()
+  if math.sqrt(nx * nx + ny * ny) < centerDeadzone then return {} end
+  if ax < axisDeadzone then ax = 0 end
+  if ay < axisDeadzone then ay = 0 end
   local out = {}
   if ay > 0 then
     out[#out + 1] = { dir = ny < 0 and "up" or "down", weight = ay, axis = "v" }
@@ -6637,6 +6854,13 @@ function ControlsFree.simpleTouchComponents(p)
     if a.weight ~= b.weight then return a.weight > b.weight end
     return a.axis == "v" -- deterministic tie: vertical first
   end)
+  if #out >= 2 and out[2].weight > 0
+      and out[1].weight >= out[2].weight * ControlsFree.simpleDominanceRatio() then
+    -- Preserve raw nx/ny for diagnostics, but make the movement decision truly
+    -- cardinal: a blocked primary does NOT fall through to tiny thumb drift.
+    out[1].dominant = true
+    out[2] = nil
+  end
   return out, nx, ny
 end
 
@@ -6750,6 +6974,10 @@ function ControlsFree.chooseSimpleDirection(game, p)
     return nil
   end
   local primary, secondary = comps[1], comps[2]
+  if primary and primary.dominant then
+    state.stats.simpleTouchDominantCardinals =
+      (state.stats.simpleTouchDominantCardinals or 0) + 1
+  end
   local pOK = primary and ControlsFree.simpleDirectionLikelyLegal(game, p, primary.dir)
   local sOK = secondary and ControlsFree.simpleDirectionLikelyLegal(game, p, secondary.dir)
   if primary and not pOK and secondary and sOK then
@@ -6760,7 +6988,10 @@ function ControlsFree.chooseSimpleDirection(game, p)
   if primary and pOK and (not secondary or not sOK) then return primary.dir end
   if not pOK and not sOK then
     state.stats.simpleTouchBlocked = (state.stats.simpleTouchBlocked or 0) + 1
-    return nil
+    -- Return the strongest intended direction as metadata. The movement tick
+    -- uses it only to turn the avatar toward the finger; it never invents a
+    -- step through the blocked collision.
+    return nil, primary and primary.dir or nil
   end
 
   local total = primary.weight + secondary.weight
@@ -6776,62 +7007,83 @@ function ControlsFree.chooseSimpleDirection(game, p)
   return primary.dir
 end
 
-function ControlsFree.queueSimpleAvatarInteraction(game, p)
-  if not p or option("interact", true) == false then return false end
-  -- SIMPLE mode uses the screen centre as a renderer-independent avatar
-  -- proxy.  No four-direction scan: a stationary centre tap is just native A
-  -- in the player's current facing, exactly like pressing the real A button.
-  local probe = { x = p.startX, y = p.startY }
-  local centred = ControlsFree.simpleTouchComponents(probe)
-  centred = centred and #centred == 0
-  if not p.startedOnPlayer and not centred then return false end
-  local dx, dy = (p.x or p.startX) - p.startX, (p.y or p.startY) - p.startY
-  if dx * dx + dy * dy > PLAYER_HOLD_MOVE_SLOP_UNITS * PLAYER_HOLD_MOVE_SLOP_UNITS then
-    return false
-  end
-  mod.input:tap(game, "a")
-  state.stats.simpleTouchAvatarInteractions =
-    (state.stats.simpleTouchAvatarInteractions or 0) + 1
-  return true
+function ControlsFree.simpleLongPressTicks(game)
+  -- input.step runs once per fixed logic step, and fast-forward runs N of
+  -- those per real frame. Scale the one-second gesture threshold by the same
+  -- live multiplier so START/B still take roughly one wall-clock second.
+  local speed = ControlsFree.overworldSpeedMultiplier and
+    ControlsFree.overworldSpeedMultiplier(game) or 1
+  return math.max(1, math.floor(FIXED_TICKS_PER_SECOND
+    * ControlsFree.SIMPLE_TOUCH_LONG_PRESS_SECONDS * math.max(1, speed) + 0.5))
 end
 
-function ControlsFree.simpleInteractionTick(game)
-  local a = state.simpleInteraction
-  if not a then return false end
-  local free = overworldGate(game)
-  local cur = mod.world and mod.world:current()
-  local player = game and game.overworld and game.overworld.player
-  if not free or not cur or not player or cur.mapId ~= a.mapId
-      or cur.x ~= a.x or cur.y ~= a.y then
-    if a.faceHandle then mod.input:release(a.faceHandle) end
-    state.simpleInteraction = nil
+function ControlsFree.simplePointerMovedTooFar(p)
+  if not p then return false end
+  local dx, dy = (p.x or p.startX) - p.startX, (p.y or p.startY) - p.startY
+  local slop = ControlsFree.SIMPLE_TOUCH_LONG_PRESS_MOVE_SLOP_UNITS
+  return dx * dx + dy * dy > slop * slop
+end
+
+function ControlsFree.simpleGestureTick(game, p)
+  if not p or p.simpleLongPressAction or p.ignored or p.gestureSuppressed then
     return false
   end
-  if player.facing == a.dir then
-    if a.faceHandle then mod.input:release(a.faceHandle) end
+  local age = state.tick - (p.pressTick or state.tick)
+  if age < ControlsFree.simpleLongPressTicks(game) then return false end
+  if p.startedOnPlayer then
+    if p.simpleAvatarHoldCancelled or ControlsFree.simplePointerMovedTooFar(p) then
+      return false
+    end
+    ControlsFree.releaseSimpleHold()
+    mod.input:tap(game, "start")
+    p.simpleLongPressAction = "start"
+    p.manualSuppressed = true
+    state.stats.simpleTouchStartHolds = (state.stats.simpleTouchStartHolds or 0) + 1
+    return true
+  end
+
+  -- A world hold remains a movement gesture as well; B is a one-shot overlay
+  -- action and does not steal the held directional input. This keeps long
+  -- renderer-agnostic walks usable while still making B universally available.
+  if overworldGate(game) then
+    mod.input:tap(game, "b")
+    p.simpleLongPressAction = "b"
+    state.stats.simpleTouchBHolds = (state.stats.simpleTouchBHolds or 0) + 1
+    return true
+  end
+  return false
+end
+
+function ControlsFree.finishSimpleGesture(game, p)
+  if not p then return false end
+  if p.simpleLongPressAction then return true end
+  if p.startedOnPlayer and not p.simpleAvatarHoldCancelled
+      and not ControlsFree.simplePointerMovedTooFar(p) then
     mod.input:tap(game, "a")
-    state.simpleInteraction = nil
+    state.stats.simpleTouchAvatarInteractions =
+      (state.stats.simpleTouchAvatarInteractions or 0) + 1
     return true
   end
-  if not a.faceHandle then
-    a.faceHandle = mod.input:press(game, a.dir)
-    a.faceTick = state.tick
-    return true
-  end
-  if state.tick > (a.faceTick or state.tick) then
-    mod.input:release(a.faceHandle)
-    a.faceHandle = nil
-    if player.facing ~= a.dir then state.simpleInteraction = nil end
-  end
+  return false
+end
+
+function ControlsFree.simpleTurnTowardBlocked(game, p, dir)
+  local player = game and game.overworld and game.overworld.player
+  if not player or not dir or player.moving or player.facing == dir then return false end
+  -- The direction was already proven non-walkable by the simple legality
+  -- filter, so one fixed-step hold can only turn/bonk; it cannot move through
+  -- the obstacle. The real engine remains authoritative for the turn.
+  state.simpleHold = {
+    dir = dir, handle = mod.input:press(game, dir),
+    startX = player.cellX, startY = player.cellY, startedTick = state.tick,
+    turnOnly = true,
+  }
+  state.stats.simpleTouchBlockedTurns = (state.stats.simpleTouchBlockedTurns or 0) + 1
   return true
 end
 
 function ControlsFree.simpleMovementTick(game)
   if not ControlsFree.simpleTouchEnabled() then
-    ControlsFree.releaseSimpleHold()
-    return
-  end
-  if ControlsFree.simpleInteractionTick(game) then
     ControlsFree.releaseSimpleHold()
     return
   end
@@ -6843,6 +7095,11 @@ function ControlsFree.simpleMovementTick(game)
     return
   end
   if pointerOverTouchControl(game, p.x, p.y) then
+    ControlsFree.releaseSimpleHold()
+    return
+  end
+  ControlsFree.simpleGestureTick(game, p)
+  if p.simpleLongPressAction == "start" then
     ControlsFree.releaseSimpleHold()
     return
   end
@@ -6865,6 +7122,13 @@ function ControlsFree.simpleMovementTick(game)
 
   local h = state.simpleHold
   if h then
+    if h.turnOnly then
+      if state.tick > (h.startedTick or state.tick) then
+        mod.input:release(h.handle)
+        state.simpleHold = nil
+      end
+      return
+    end
     if player.cellX ~= h.startX or player.cellY ~= h.startY then
       mod.input:release(h.handle)
       state.simpleHold = nil
@@ -6885,8 +7149,11 @@ function ControlsFree.simpleMovementTick(game)
     end
   end
 
-  local dir = ControlsFree.chooseSimpleDirection(game, p)
-  if not dir then return end
+  local dir, blockedDir = ControlsFree.chooseSimpleDirection(game, p)
+  if not dir then
+    if blockedDir then ControlsFree.simpleTurnTowardBlocked(game, p, blockedDir) end
+    return
+  end
   state.stats.simpleTouchDecisions = (state.stats.simpleTouchDecisions or 0) + 1
   state.stats["simpleTouch" .. dir:sub(1,1):upper() .. dir:sub(2)] =
     (state.stats["simpleTouch" .. dir:sub(1,1):upper() .. dir:sub(2)] or 0) + 1
@@ -6907,6 +7174,35 @@ end
 -- exact gesture has been released.
 mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
   state.game = game or state.game
+
+  -- Desktop parity for the always-visible controller toggle. Touch reaches the
+  -- raw Game bridge above; LMB reaches this public pointer seam, and must be
+  -- claimed BEFORE the underlying UI can treat the top-right icon as a menu
+  -- click.
+  if ev and ev.source == "mouse" and (ev.button == nil or ev.button == 1) then
+    local mt = state.nativeControlsToggleTouches and state.nativeControlsToggleTouches.mouse
+    if ev.phase == "pressed" and ControlsFree.nativeControlsToggleHit(ev.x, ev.y) then
+      state.nativeControlsToggleTouches = state.nativeControlsToggleTouches or {}
+      state.nativeControlsToggleTouches.mouse = {
+        startX = ev.x, startY = ev.y, x = ev.x, y = ev.y,
+      }
+      return true
+    elseif mt and ev.phase == "moved" then
+      mt.x, mt.y = ev.x, ev.y
+      local dx, dy = ev.x - mt.startX, ev.y - mt.startY
+      local slop = ControlsFree.NATIVE_CONTROLS_TOGGLE_SLOP * 1.5
+      if dx * dx + dy * dy > slop * slop then mt.cancelled = true end
+      return true
+    elseif mt and (ev.phase == "released" or ev.phase == "cancelled") then
+      state.nativeControlsToggleTouches.mouse = nil
+      if ev.phase == "released" and not mt.cancelled
+          and ControlsFree.nativeControlsToggleHit(ev.x, ev.y) then
+        ControlsFree.toggleNativeControls(game)
+      end
+      return true
+    end
+  end
+
   local result = nextFn(game, ev)
   if not ev then return result end
   -- Respect another pointer consumer deeper in the chain. If it claims this
@@ -7013,6 +7309,8 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
         gestureId = owns and state.gestureSerial or nil,
         simpleMode = simpleMode and true or false,
         simpleMixAcc = 0,
+        simpleLongPressAction = nil,
+        simpleAvatarHoldCancelled = false,
         -- Snapshot avatar ownership at pointer-DOWN. Camera motion and Voxel
         -- reprojection later in the gesture must not change what was clicked.
         startedOnPlayer = owns and (simpleMode and simpleStartCentered
@@ -7068,7 +7366,13 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
     end
   elseif ev.phase == "moved" then
     local p = state.pointers[id]
-    if p then p.x, p.y = ev.x, ev.y end
+    if p then
+      p.x, p.y = ev.x, ev.y
+      if p.simpleMode and p.startedOnPlayer and not p.simpleLongPressAction
+          and ControlsFree.simplePointerMovedTooFar(p) then
+        p.simpleAvatarHoldCancelled = true
+      end
+    end
     trackTwoFingerPointer(game, ev)
     if p and p.avatarTapDeferred then
       local adx, ady = ev.x - p.startX, ev.y - p.startY
@@ -7117,9 +7421,7 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
     if p and not p.ignored and not p.gestureSuppressed then
       if simpleMode then
         ControlsFree.releaseSimpleHold()
-        -- Centre/avatar taps stay useful even in renderer-agnostic mode: an
-        -- adjacent real interaction can still turn + A without any pathfinder.
-        ControlsFree.queueSimpleAvatarInteraction(game, p)
+        ControlsFree.finishSimpleGesture(game, p)
       else
       -- Ordinary avatar taps were deliberately deferred at pointer-down so
       -- native hidden-object rescue stays release-gated. Resolve them now.
@@ -7252,14 +7554,16 @@ mod.hooks:wrap("input.step", function(nextFn, game, dt)
       state.battleResume = nil
     else
       ControlsFree.releaseSimpleHold()
-      if state.simpleInteraction and state.simpleInteraction.faceHandle then
-        mod.input:release(state.simpleInteraction.faceHandle)
-      end
       state.simpleInteraction = nil
     end
     state.simpleModeLast = simpleNow
   end
   if simpleNow then
+    -- navigationTick owns the normal-mode clock. SIMPLE bypasses that entire
+    -- pathfinder, so advance the shared fixed-step clock here instead; without
+    -- this, long-press timing and blocked-direction retry windows never age.
+    state.tick = state.tick + 1
+    state.game = game
     ControlsFree.simpleMovementTick(game)
   else
     ControlsFree.releaseSimpleHold()
@@ -7399,6 +7703,7 @@ mod.events:on("game.ready", function(ev)
     installRawPinchZoomGuard(game)
     ControlsFree.installTouchDialogueBridge(game)
     ControlsFree.installMouseWheelBridge(game)
+    ControlsFree.installNativeControlsToggle(game)
   end
 end)
 
@@ -7575,6 +7880,7 @@ mod.events:on("save.loading", function()
   state.pinchGraceTouches = {}
   state.rawDispatchedTouches = {}
   state.nativeControlOwnedTouches = {}
+  state.nativeControlsToggleTouches = {}
   state.twoFingerGesture = nil
   state.tapOwner = nil
   state.pendingInteraction = nil
@@ -7870,6 +8176,9 @@ local function drawDebug()
       state.stats.interactionFaceNeutralTicks or 0,
       state.stats.interactionFaceTurns or 0,
       state.stats.interactionFaceVerified or 0),
+    ("NATIVE CTRL %s T%d"):format(
+      ControlsFree.nativeControlsVisible(state.game) and "ON" or "OFF",
+      state.stats.nativeControlsTogglePresses or 0),
     ("EXIT-DIR A/R/H %d/%d/%d"):format(
       state.stats.exitDirectionalAccepts or 0,
       state.stats.exitDirectionalRejects or 0,
@@ -7889,11 +8198,18 @@ local function drawDebug()
   }
   if ControlsFree.simpleTouchEnabled() then
     local p = state.tapOwner and state.pointers[state.tapOwner] or nil
-    lines[#lines + 1] = ("SIMPLE %s X%+d%% Y%+d%%  F%d"):format(
+    lines[#lines + 1] = ("SIMPLE %s X%+d%% Y%+d%% F%d D%d BT%d"):format(
       state.simpleHold and tostring(state.simpleHold.dir):upper() or "IDLE",
       math.floor(((p and p.simpleNX) or 0) * 100 + 0.5),
       math.floor(((p and p.simpleNY) or 0) * 100 + 0.5),
-      state.stats.simpleTouchFallbacks or 0)
+      state.stats.simpleTouchFallbacks or 0,
+      state.stats.simpleTouchDominantCardinals or 0,
+      state.stats.simpleTouchBlockedTurns or 0)
+    local dom = ControlsFree.simpleDominanceRatio()
+    lines[#lines + 1] = ("SIMPLE CFG C%d%% A%d%% R%s"):format(
+      math.floor(ControlsFree.simpleCenterDeadzone() * 100 + 0.5),
+      math.floor(ControlsFree.simpleAxisDeadzone() * 100 + 0.5),
+      dom == math.huge and "OFF" or (tostring(dom) .. "X"))
   end
   if nav then
     lines[#lines + 1] = "STATE " .. tostring(nav.phase)
@@ -7942,6 +8258,7 @@ local function diagnostics()
       ticks = previewRefreshTicks(),
     },
     simpleTouchMovement = ControlsFree.simpleTouchEnabled(),
+    nativeControlsVisible = ControlsFree.nativeControlsVisible(state.game),
     controlsFree = {
       dialogTouchControl = option("dialog_touch_control", false) == true,
       battleTouchControl = option("battle_touch_control", false) == true,
