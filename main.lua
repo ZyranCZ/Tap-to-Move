@@ -1,4 +1,4 @@
--- Tap to Move v1.3.20
+-- Tap to Move v1.3.27
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,10 +9,10 @@
 
 local mod = ...
 
-local VERSION = "1.3.22"
+local VERSION = "1.3.27"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
-local DEFAULT_HOLD_STEER_DELAY_MS = 800 -- delay before a held pointer starts continuous retargeting
+local DEFAULT_HOLD_STEER_DELAY_MS = 150 -- 1X base; scaled by live overworld logic speed
 local DEFAULT_PERFORMANCE_INPUT_FREQUENCY = "balance"
 local DEFAULT_VOXEL_PATH_RATE = "0.25"
 
@@ -64,6 +64,14 @@ local DIALOG_SWIPE_TRIGGER_UNITS = 30
 -- accelerometer-as-joystick disabled, so the mod talks to SDL2's independent
 -- sensor subsystem through FFI instead. iOS/LÖVE 12 can use love.sensor.
 local ControlsFree = {
+  -- Renderer-agnostic direct steering constants. Kept on this table rather
+  -- than as extra chunk locals because this very large mod deliberately stays
+  -- below Lua 5.1's 200-local limit for one compiled function.
+  SIMPLE_TOUCH_DEADZONE = 0.10,
+  SIMPLE_TOUCH_AXIS_DEADZONE = 0.06,
+  SIMPLE_TOUCH_PRESS_FAIL_TICKS = 4,
+  SIMPLE_TOUCH_RETRY_BLOCK_TICKS = 10,
+  SIMPLE_DIR_COMPASS = { up="north", down="south", left="west", right="east" },
   SHAKE_ACCEL_THRESHOLD = 5.5,       -- m/s^2 after gravity removal
   SHAKE_GYRO_THRESHOLD = 3.2,        -- rad/s
   SHAKE_RESET_RATIO = 0.45,          -- motion must relax before next impulse
@@ -122,10 +130,12 @@ for _, d in ipairs(DIRS) do DIR_BY_NAME[d.name] = d end
 
 mod.options:define({
   { key = "enabled", label = "TAP TO MOVE", type = "toggle", default = true },
+  { key = "simple_touch_movement", label = "SIMPLE TOUCH MOVEMENT",
+    type = "toggle", default = false },
   { key = "interact", label = "TAP TO INTERACT", type = "toggle", default = true },
   { key = "hold_steer", label = "HOLD TO STEER", type = "toggle", default = true },
-  { key = "tap_hold_ms", label = "HOLD STEER DELAY", type = "number",
-    default = DEFAULT_HOLD_STEER_DELAY_MS, min = 150, max = 800, step = 50 },
+  { key = "hold_steer_delay_ms", label = "HOLD STEER DELAY", type = "number",
+    default = DEFAULT_HOLD_STEER_DELAY_MS, min = 150, max = 500, step = 50 },
   { key = "performance_input_frequency", label = "PERFORMANCE INPUT FREQUENCY",
     type = "choice", default = DEFAULT_PERFORMANCE_INPUT_FREQUENCY,
     choices = {
@@ -187,6 +197,9 @@ local state = {
   tapOwner = nil,
   nav = nil,
   pulse = nil,
+  simpleHold = nil,
+  simpleInteraction = nil,
+  simpleModeLast = false,
   game = nil,
   lastStop = nil,
   pendingInteraction = nil,
@@ -225,8 +238,22 @@ local state = {
     interactionMisses = 0,
     interactionReleaseWaits = 0,
     interactionHoldDisarms = 0,
+    interactionFaceNeutralTicks = 0,
+    interactionFaceTurns = 0,
+    interactionFaceVerified = 0,
+    interactionFaceRetries = 0,
     immediatePressRoutes = 0,
     holdRetargets = 0,
+    simpleTouchDecisions = 0,
+    simpleTouchSteps = 0,
+    simpleTouchFallbacks = 0,
+    simpleTouchBlocked = 0,
+    simpleTouchDeadzone = 0,
+    simpleTouchUp = 0,
+    simpleTouchDown = 0,
+    simpleTouchLeft = 0,
+    simpleTouchRight = 0,
+    simpleTouchAvatarInteractions = 0,
     seamNeutralTicks = 0,
     seamHeldFastStarts = 0,
     entryGestureSuppressions = 0,
@@ -260,6 +287,7 @@ local state = {
     voxelRayTargets = 0,
     voxelRayOutside = 0,
     voxelSemanticRecoveries = 0,
+    voxelNativeHiddenPathTargets = 0,
     battleResumes = 0,
     battleResumeDrops = 0,
     twoFingerGestures = 0,
@@ -283,7 +311,6 @@ local state = {
     battleCameraTouchesSuppressed = 0,
     playerHoldStartTriggers = 0,
     playerAvatarInteractionProxies = 0,
-    playerAvatarAdjacentInteractionProxies = 0,
     playerAvatarHitDetections = 0,
     systemEdgeCandidates = 0,
     systemEdgeSwipesSuppressed = 0,
@@ -320,9 +347,35 @@ local function msToTicks(ms, fallback)
   return math.max(1, math.floor(value * FIXED_TICKS_PER_SECOND / 1000 + 0.5))
 end
 
-local function holdSteerDelayTicks()
-  return msToTicks(option("tap_hold_ms", DEFAULT_HOLD_STEER_DELAY_MS),
-                   DEFAULT_HOLD_STEER_DELAY_MS)
+function ControlsFree.holdSteerBaseDelayMs()
+  local value = tonumber(option("hold_steer_delay_ms", DEFAULT_HOLD_STEER_DELAY_MS))
+                or DEFAULT_HOLD_STEER_DELAY_MS
+  -- Keep legacy/hand-edited option files inside the supported ladder.
+  value = math.max(150, math.min(500, value))
+  return math.floor((value - 150) / 50 + 0.5) * 50 + 150
+end
+
+function ControlsFree.overworldSpeedMultiplier(game)
+  -- Game:logicSpeed() is the engine's live authority. In a bare overworld it
+  -- resolves speedOverworld, while also respecting --speed/POKEPORT_SPEED and
+  -- core.logic_speed overrides. The saved option is only a compatibility
+  -- fallback for a future/older host that does not expose logicSpeed here.
+  if game and type(game.logicSpeed) == "function" then
+    local ok, value = pcall(game.logicSpeed, game)
+    value = ok and tonumber(value) or nil
+    if value and value >= 1 then return value end
+  end
+  local opts = game and game.save and game.save.options
+  local value = opts and tonumber(opts.speedOverworld) or nil
+  return (value and value >= 1) and value or 1
+end
+
+function ControlsFree.holdSteerDelayMs(game)
+  return ControlsFree.holdSteerBaseDelayMs() * ControlsFree.overworldSpeedMultiplier(game)
+end
+
+local function holdSteerDelayTicks(game)
+  return msToTicks(ControlsFree.holdSteerDelayMs(game), DEFAULT_HOLD_STEER_DELAY_MS)
 end
 
 local function performanceInputProfile()
@@ -682,7 +735,7 @@ local function staticInteractionAt(game, mapId, map, x, y)
     or hit("gym_statue", fieldRows(game, "gymStatues", mapId))
     or hit("trash", fieldRows(game, "printTrash", mapId),
            function() return nil end)
-    or hit("slot", fieldRows(game, "slots", mapId))
+    or hit("slot", fieldRows(game, "slotMachines", mapId))
     or hit("trash_can", fieldRows(game, "trashCans", mapId))
   if out then return out end
 
@@ -767,36 +820,36 @@ local function interactionAt(game, x, y)
   return nil
 end
 
--- Short taps on the visible player have a second-chance interaction scan.
--- This is deliberately independent of 3D picking: when a wall-mounted PC,
--- sign, counter or actor is visually difficult to hit, the player can stand
--- directly beside it and tap their own avatar.  Search exactly one cell away
--- in the user-facing priority UP -> DOWN -> RIGHT -> LEFT.  A directional
--- hidden event is only valid from the side the engine itself accepts; counter
--- proxies likewise require the player to be on the side that faces through
--- the counter toward the actor.
-function ControlsFree.avatarAdjacentInteraction(game, cur)
-  if not cur then return nil end
-  for _, dirName in ipairs({ "up", "down", "right", "left" }) do
-    local d = DIR_BY_NAME[dirName]
-    local ix, iy = cur.x + d.dx, cur.y + d.dy
-    local interaction = interactionAt(game, ix, iy)
-    if interaction then
-      local required = interaction.requiredFacing
-      local requiredOK = not (required and DIR_BY_NAME[required])
-          or required == dirName
-      local preferred = interaction.preferredFacing
-      local counterOK = not interaction.counterProxy
-          or not (preferred and DIR_BY_NAME[preferred])
-          or preferred == dirName
-      if requiredOK and counterOK then
-        interaction.avatarAdjacentProxy = true
-        interaction.avatarAdjacentDir = dirName
-        return interaction, ix, iy, dirName
-      end
+-- Fixed hidden-event surfaces that are safe to expose as explicit tap targets.
+-- These are hidden in the Gen I data model (they are not object_event NPCs),
+-- but they are ordinary visible furniture/fixtures: PCs, benches, gym statues,
+-- trash cans and slot machines. Secret floor items/coins are deliberately NOT
+-- listed here, so Tap to Move never reveals treasure the player has not found.
+function ControlsFree.fixedHiddenInteractionCandidates(game, mapId, map)
+  local out, seen = {}, {}
+  local function add(x, y)
+    x, y = tonumber(x), tonumber(y)
+    if not x or not y then return end
+    local k = key(x, y)
+    if seen[k] then return end
+    local interaction = staticInteractionAt(game, mapId, map, x, y)
+    if not interaction then return end
+    seen[k] = true
+    out[#out + 1] = interaction
+  end
+
+  for _, keyName in ipairs({
+      "pcTiles", "benchGuys", "gymStatues", "printTrash",
+      "slotMachines", "trashCans",
+    }) do
+    for _, row in ipairs(fieldRows(game, keyName, mapId)) do
+      add(row.x, row.y)
     end
   end
-  return nil
+
+  -- Bill's cell-separator PC is hand-ported rather than generic pcTiles.
+  if mapId == "BILLS_HOUSE" then add(1, 4) end
+  return out
 end
 
 local function interactionTarget(game, interaction)
@@ -1470,6 +1523,13 @@ local function buildInteractionPath(game, nav, cur)
   nav.interaction.targetY = best.targetY
   nav.interaction.faceDir = best.faceDir
   nav.interaction.counter = best.counter
+  -- Every freshly planned interaction approach gets a fresh facing finisher.
+  -- Stale turn state from a previous NPC chase/replan must never skip the
+  -- neutral -> turn -> verify sequence at the new approach cell.
+  nav.faceNeutralTick = nil
+  nav.facePressTick = nil
+  nav.faceVerifiedTick = nil
+  nav.faceRetryCount = 0
   nav.targetX, nav.targetY = best.x, best.y
   nav.path = best.path
   nav.index = 1
@@ -1976,6 +2036,86 @@ local function projectedPoint(voxel3d, wx, wy, height)
     return nil
   end
   return { sx, sy, tonumber(depth) }
+end
+
+-- Texture-independent semantic hit for engine hidden-event fixtures in the
+-- active Dramatic Shape scene.  We do NOT inspect a texture or ask the event
+-- to execute.  Instead, project the gameplay cell that owns each known hidden
+-- fixture into screen space and use that only to SELECT the interaction.  The
+-- pathfinder then walks to a legal adjacent cell, faces the required direction
+-- and presses ordinary A; Gen1Recomp's native interaction dispatcher remains
+-- the authority that actually opens the PC/text/menu.
+function ControlsFree.voxelFixedHiddenInteractionFromTap(game, x, y, scene)
+  local voxel3d = scene and scene.voxel3d
+  local ow = game and game.overworld
+  local map = ow and ow.map
+  if not (voxel3d and map and type(voxel3d.project) == "function") then return nil end
+
+  local cur = mod.world and mod.world:current()
+  local overview = mod.world and mod.world:mapOverview()
+  if not cur or not overview or cur.mapId ~= map.id or overview.mapId ~= map.id then
+    return nil
+  end
+
+  local px, py, cw, ch = framebufferPoint(x, y, voxel3d)
+  if type(px) ~= "number" or type(py) ~= "number" then return nil end
+
+  local frame = state.frame or {}
+  local ww, wh = tonumber(frame.ww), tonumber(frame.wh)
+  local scaleX = cw and ww and ww > 0 and cw / ww or tonumber(frame.dpiX) or 1
+  local scaleY = ch and wh and wh > 0 and ch / wh or tonumber(frame.dpiY) or 1
+  local pad = 5 * math.max(1, scaleX, scaleY)
+
+  local best, bestScore
+  for _, interaction in ipairs(ControlsFree.fixedHiddenInteractionCandidates(game, map.id, map)) do
+    local cx, cy = tonumber(interaction.x), tonumber(interaction.y)
+    if cx and cy then
+      local x0, x1 = cx * TILE_SIZE, (cx + 1) * TILE_SIZE
+      local z0, z1 = cy * TILE_SIZE, (cy + 1) * TILE_SIZE
+      local minX, minY, maxX, maxY
+      local okProjection = true
+      for _, wx in ipairs({ x0, x1 }) do
+        for _, wz in ipairs({ z0, z1 }) do
+          for _, h in ipairs({ 0, VOXEL_COLUMN_HEIGHT }) do
+            local q = projectedPoint(voxel3d, wx, wz, h)
+            if q then
+              minX = not minX and q[1] or math.min(minX, q[1])
+              maxX = not maxX and q[1] or math.max(maxX, q[1])
+              minY = not minY and q[2] or math.min(minY, q[2])
+              maxY = not maxY and q[2] or math.max(maxY, q[2])
+            else
+              okProjection = false
+            end
+          end
+        end
+      end
+
+      if okProjection and minX and px >= minX - pad and px <= maxX + pad
+          and py >= minY - pad and py <= maxY + pad then
+        local mid = projectedPoint(voxel3d, (cx + 0.5) * TILE_SIZE,
+                                   (cy + 0.5) * TILE_SIZE,
+                                   VOXEL_COLUMN_MID_HEIGHT)
+        local score
+        if mid then
+          local dx, dy = px - mid[1], py - mid[2]
+          score = dx * dx + dy * dy
+        else
+          local mx, my = (minX + maxX) * 0.5, (minY + maxY) * 0.5
+          local dx, dy = px - mx, py - my
+          score = dx * dx + dy * dy
+        end
+        if not best or score < bestScore then
+          best, bestScore = interaction, score
+        end
+      end
+    end
+  end
+
+  if not best then return nil end
+  return {
+    x = best.x, y = best.y, interaction = best,
+    cur = cur, overview = overview,
+  }
 end
 
 local voxelCandidateCache = { map = nil, neighbors = nil, connections = nil, entries = nil }
@@ -2592,6 +2732,24 @@ local function targetFromTap(game, x, y)
   if scene then
     local ray = voxelRayTargetFromTap(game, x, y, scene)
     if ray then
+      -- A live NPC hit stays absolute. Otherwise fixed hidden-event fixtures
+      -- get a direct semantic screen hit before ground/outside-map intent is
+      -- interpreted. This is what makes a visible wall PC a real pathfinding
+      -- target even when the 3D ground ray lands behind the room.
+      if ray.visibleKind ~= "entity" and option("interact", true) ~= false then
+        local hiddenHit = ControlsFree.voxelFixedHiddenInteractionFromTap(game, x, y, scene)
+        if hiddenHit then
+          state.stats.voxelNativeHiddenPathTargets =
+            (state.stats.voxelNativeHiddenPathTargets or 0) + 1
+          return hiddenHit.x, hiddenHit.y, hiddenHit.cur, hiddenHit.overview,
+                 nil, nil, {
+                   forcedInteraction = hiddenHit.interaction,
+                   nativeHiddenPathTarget = true,
+                   intentX = ray.intentX, intentY = ray.intentY,
+                 }
+        end
+      end
+
       -- Raised wall-mounted interaction surfaces are the one place where a
       -- mathematically correct ground ray can still be semantically wrong.
       -- The Pokémon Center PC is the canonical example: its hidden-event cell
@@ -3344,19 +3502,15 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
 
   local tx, ty, cur, overview, targetErr, cross, targetMeta
 
-  -- v1.3.22: avatar rescue is resolved BEFORE any 3D raycast/pathfinding.
-  -- If the press truly began on the rendered player and there is a genuine
-  -- adjacent interaction exactly one cell away, that semantic intent is
-  -- authoritative.  Voxel picking, outside-map classification and Smart Exit
-  -- never get a chance to reinterpret this click.
+  -- Avatar taps no longer run an all-directions "radar".  A short tap on the
+  -- player is now a plain native A press in the direction the player already
+  -- faces.  Fixed hidden-event fixtures are selected directly by the normal
+  -- pathfinding tap pipeline (see ControlsFree.voxelFixedHiddenInteractionFromTap), so the
+  -- avatar no longer needs to guess UP/DOWN/RIGHT/LEFT around itself.
   local gp = gesture
   local sx, sy = gp and gp.startX or screenX, gp and gp.startY or screenY
   local pdx, pdy = screenX - sx, screenY - sy
-  local avatarTap = false
-  local avatarCur = mod.world and mod.world:current() or nil
-  local avatarOverview = mod.world and mod.world:mapOverview() or nil
   if option("interact", true) ~= false and not continuous and gestureId ~= nil
-      and avatarCur and avatarOverview and avatarCur.mapId == avatarOverview.mapId
       and pdx * pdx + pdy * pdy
           <= PLAYER_HOLD_MOVE_SLOP_UNITS * PLAYER_HOLD_MOVE_SLOP_UNITS then
     local startedOnPlayer = gp and gp.startedOnPlayer == true
@@ -3364,54 +3518,17 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       startedOnPlayer = ControlsFree.playerScreenHit(game, sx, sy) == true
     end
     if startedOnPlayer then
-      avatarTap = true
       state.stats.playerAvatarHitDetections =
         (state.stats.playerAvatarHitDetections or 0) + 1
-      local adjacentInteraction, aix, aiy =
-        ControlsFree.avatarAdjacentInteraction(game, avatarCur)
-      if adjacentInteraction then
-        tx, ty, cur, overview = aix, aiy, avatarCur, avatarOverview
-        targetErr, cross = nil, nil
-        targetMeta = {
-          playerAvatarProxy = true,
-          playerAvatarAdjacentProxy = true,
-          forcedInteraction = adjacentInteraction,
-        }
-        state.stats.playerAvatarInteractionProxies =
-          (state.stats.playerAvatarInteractionProxies or 0) + 1
-        state.stats.playerAvatarAdjacentInteractionProxies =
-          (state.stats.playerAvatarAdjacentInteractionProxies or 0) + 1
-      end
+      mod.input:tap(game, "a")
+      state.stats.playerAvatarInteractionProxies =
+        (state.stats.playerAvatarInteractionProxies or 0) + 1
+      return true
     end
   end
 
-  if not (targetMeta and targetMeta.forcedInteraction) then
-    tx, ty, cur, overview, targetErr, cross, targetMeta =
-      targetFromTap(game, screenX, screenY)
-
-    -- Backward-compatible avatar fallback: when the avatar was genuinely hit
-    -- but none of the four adjacent semantic cells is interactable, preserve
-    -- the older current-facing front-cell door/warp proxy. Ordinary avatar
-    -- taps never become an implicit step onto empty floor.
-    if avatarTap and cur and overview then
-      local player = game and game.overworld and game.overworld.player
-      local dir = player and DIR_BY_NAME[player.facing] or nil
-      if dir then
-        local fx, fy = cur.x + dir.dx, cur.y + dir.dy
-        local frontInteraction = interactionAt(game, fx, fy)
-        local frontWarp = warpIntentAt(
-          game, game and game.overworld and game.overworld.map, cur, fx, fy)
-        local frontChar = cellChar(overview, fx, fy)
-        if frontInteraction or frontWarp or frontChar == "+" then
-          tx, ty, targetErr, cross = fx, fy, nil, nil
-          targetMeta = targetMeta or {}
-          targetMeta.playerAvatarProxy = true
-          state.stats.playerAvatarInteractionProxies =
-            (state.stats.playerAvatarInteractionProxies or 0) + 1
-        end
-      end
-    end
-  end
+  tx, ty, cur, overview, targetErr, cross, targetMeta =
+    targetFromTap(game, screenX, screenY)
 
   local exitFallback = false
   local exitIntent = nil
@@ -4002,22 +4119,103 @@ local function interactionAtDestination(game, nav, cur)
     return true
   end
 
+  -- A completed path can arrive with Gen1Recomp's turn-in-place latch spent
+  -- by the final walking direction.  A fresh facing input in that state may
+  -- immediately try to WALK instead of being consumed as a pure turn.  The
+  -- engine re-arms turns only after one input poll with no direction held
+  -- (OverworldController's .noDirectionButtonsPressed path), so interaction
+  -- finishing is deliberately staged:
+  --
+  --   ARRIVE -> one neutral poll -> press desired facing -> verify facing
+  --          -> release direction / let the turn settle -> A
+  --
+  -- This is especially important for fixed hidden-event fixtures such as
+  -- Pokémon Center PCs, whose engine callback rejects A unless player.facing
+  -- exactly matches the event's required direction.
   if player.facing ~= dir then
-    -- Never hold the facing direction for more than one fixed tick.  The first
-    -- tick should only turn in place; if it somehow did not, releasing now is
-    -- safer than letting the turn timer expire into an unintended step.
-    if nav.phase == "FACING_INTERACTION"
-        and nav.facePressTick and nav.facePressTick < state.tick then
+    -- We already issued the turn press on a previous fixed tick.  Keep it for
+    -- a short bounded window so the engine gets a chance to consume it, but
+    -- never long enough to turn a delayed press into sustained navigation.
+    if nav.phase == "FACING_INTERACTION" and nav.facePressTick then
+      if state.tick - nav.facePressTick <= 2 then
+        return true
+      end
       releaseHold(nav)
-      cancelRoute("interaction_face_failed")
+      nav.facePressTick = nil
+      nav.faceNeutralTick = state.tick
+      nav.faceRetryCount = (nav.faceRetryCount or 0) + 1
+      state.stats.interactionFaceRetries =
+        (state.stats.interactionFaceRetries or 0) + 1
+      if nav.faceRetryCount > 2 then
+        cancelRoute("interaction_face_failed")
+        return true
+      end
+      state.stats.interactionFaceNeutralTicks =
+        (state.stats.interactionFaceNeutralTicks or 0) + 1
+      setPhase(nav, "WAITING_INTERACTION_FACE_NEUTRAL",
+               "retry_neutral_before_" .. dir)
       return true
     end
+
+    if nav.phase == "WAITING_INTERACTION_FACE_NEUTRAL"
+        and nav.faceNeutralTick and nav.faceNeutralTick < state.tick then
+      -- The previous nextFn ran with our synthetic directions released, which
+      -- is the poll Gen1Recomp needs to set player.turnArmed again.  Now the
+      -- requested direction is guaranteed to be a turn-in-place attempt.
+      releaseHold(nav)
+      nav.holdDir = dir
+      nav.hold = mod.input:press(game, dir)
+      nav.facePressTick = state.tick
+      state.stats.interactionFaceTurns =
+        (state.stats.interactionFaceTurns or 0) + 1
+      setPhase(nav, "FACING_INTERACTION", "turn_to_" .. dir)
+      return true
+    end
+
+    -- First arrival with the wrong facing: do NOT press the direction yet.
+    -- Give vanilla one complete neutral fixed step to re-arm its turn latch.
     releaseHold(nav)
-    nav.holdDir = dir
-    nav.hold = mod.input:press(game, dir)
-    nav.facePressTick = state.tick
-    setPhase(nav, "FACING_INTERACTION", "face_" .. dir)
+    nav.facePressTick = nil
+    nav.faceVerifiedTick = nil
+    nav.faceNeutralTick = state.tick
+    nav.faceRetryCount = nav.faceRetryCount or 0
+    state.stats.interactionFaceNeutralTicks =
+      (state.stats.interactionFaceNeutralTicks or 0) + 1
+    setPhase(nav, "WAITING_INTERACTION_FACE_NEUTRAL",
+             "neutral_before_" .. dir)
     return true
+  end
+
+  -- If we just reached the requested facing through our synthetic turn, stop
+  -- holding the direction BEFORE doing anything else.  Waiting through the
+  -- remaining turnTimer gives the renderer and vanilla movement state a clean
+  -- settled frame and guarantees A is never mixed with a still-held D-pad.
+  if nav.phase == "FACING_INTERACTION" then
+    releaseHold(nav)
+    nav.facePressTick = nil
+    nav.faceVerifiedTick = state.tick
+    state.stats.interactionFaceVerified =
+      (state.stats.interactionFaceVerified or 0) + 1
+    setPhase(nav, "WAITING_INTERACTION_FACE_SETTLE",
+             "facing_verified_" .. dir)
+    return true
+  end
+
+  if nav.phase == "WAITING_INTERACTION_FACE_SETTLE" then
+    releaseHold(nav)
+    if player.facing ~= dir then
+      nav.faceNeutralTick = state.tick
+      setPhase(nav, "WAITING_INTERACTION_FACE_NEUTRAL",
+               "facing_changed_before_a")
+      return true
+    end
+    -- Player:turnTimer is engine-owned and counts down during the fixed update.
+    -- Waiting for it to clear is conservative (~4 frames in vanilla) and makes
+    -- the visible avatar finish the turn before the interaction button fires.
+    if tonumber(player.turnTimer or 0) > 0 then return true end
+    if nav.faceVerifiedTick and nav.faceVerifiedTick >= state.tick then
+      return true
+    end
   end
 
   releaseHold(nav)
@@ -5943,7 +6141,15 @@ function ControlsFree.beginPlayerHoldTouch(game, id, x, y)
       or ControlsFree.dialogueActive(game) or state.twoFingerGesture then
     return false
   end
-  if not ControlsFree.playerScreenHit(game, x, y) then return false end
+  local hitPlayer
+  if ControlsFree.simpleTouchEnabled and ControlsFree.simpleTouchEnabled()
+      and ControlsFree.simpleTouchComponents then
+    local comps = ControlsFree.simpleTouchComponents({ x = x, y = y })
+    hitPlayer = comps and #comps == 0 or false
+  else
+    hitPlayer = ControlsFree.playerScreenHit(game, x, y) == true
+  end
+  if not hitPlayer then return false end
   state.playerHoldTouches = state.playerHoldTouches or {}
   state.playerHoldTouches[id] = {
     startX = x, startY = y, x = x, y = y, pressTick = state.tick,
@@ -6364,6 +6570,332 @@ local function disarmInteractionForGesture(gestureId, reason)
   return changed
 end
 
+-- SIMPLE TOUCH MOVEMENT -----------------------------------------------------
+--
+-- This deliberately lives completely outside targetFromTap()/Voxel/pathfinding.
+-- It is the compatibility mode for renderers whose visual geometry Tap to Move
+-- cannot understand.  The only screen-space assumption is the one the user can
+-- rely on across those renderers: the player is framed around the screen centre.
+function ControlsFree.simpleTouchEnabled()
+  return option("enabled", true) ~= false
+      and option("simple_touch_movement", false) == true
+end
+
+function ControlsFree.releaseSimpleHold()
+  local h = state.simpleHold
+  if h and h.handle then mod.input:release(h.handle) end
+  state.simpleHold = nil
+end
+
+function ControlsFree.simpleTouchWindowSize()
+  -- input.pointer coordinates are LOVE window units, so getDimensions is the
+  -- renderer-independent source of truth.  render.compose data is fallback only.
+  if love and love.graphics and type(love.graphics.getDimensions) == "function" then
+    local ok, w, h = pcall(love.graphics.getDimensions)
+    if ok and tonumber(w) and tonumber(h) and w > 0 and h > 0 then
+      return tonumber(w), tonumber(h)
+    end
+  end
+  local f = state.frame or {}
+  local w, h = tonumber(f.ww), tonumber(f.wh)
+  if w and h and w > 0 and h > 0 then return w, h end
+  local dx, dy = tonumber(f.dpiX) or 1, tonumber(f.dpiY) or 1
+  if tonumber(f.pw) and tonumber(f.ph) then
+    return tonumber(f.pw) / math.max(dx, 1e-6),
+           tonumber(f.ph) / math.max(dy, 1e-6)
+  end
+  return nil
+end
+
+function ControlsFree.clampUnit(v)
+  if v < -1 then return -1 end
+  if v > 1 then return 1 end
+  return v
+end
+
+-- Return the two directional components represented by a pointer.  Magnitudes
+-- are literal percentages of centre->screen-edge distance on each axis: e.g.
+-- 70% up + 30% left becomes weights 0.70/0.30.
+function ControlsFree.simpleTouchComponents(p)
+  local w, h = ControlsFree.simpleTouchWindowSize()
+  if not p or not w or not h then return nil end
+  local cx, cy = w * 0.5, h * 0.5
+  local nx = ControlsFree.clampUnit(((tonumber(p.x) or cx) - cx) / math.max(w * 0.5, 1))
+  local ny = ControlsFree.clampUnit(((tonumber(p.y) or cy) - cy) / math.max(h * 0.5, 1))
+  local ax, ay = math.abs(nx), math.abs(ny)
+  if math.sqrt(nx * nx + ny * ny) < ControlsFree.SIMPLE_TOUCH_DEADZONE then return {} end
+  if ax < ControlsFree.SIMPLE_TOUCH_AXIS_DEADZONE then ax = 0 end
+  if ay < ControlsFree.SIMPLE_TOUCH_AXIS_DEADZONE then ay = 0 end
+  local out = {}
+  if ay > 0 then
+    out[#out + 1] = { dir = ny < 0 and "up" or "down", weight = ay, axis = "v" }
+  end
+  if ax > 0 then
+    out[#out + 1] = { dir = nx < 0 and "left" or "right", weight = ax, axis = "h" }
+  end
+  table.sort(out, function(a, b)
+    if a.weight ~= b.weight then return a.weight > b.weight end
+    return a.axis == "v" -- deterministic tie: vertical first
+  end)
+  return out, nx, ny
+end
+
+function ControlsFree.simplePairBlocked(game, map, player, sx, sy, tx, ty)
+  local pairs = game and game.data and game.data.field and game.data.field.tilePairs
+  local list = pairs and (player and player.surfing and pairs.water or pairs.land)
+  if not list or type(map.cellTile) ~= "function" then return false end
+  local okA, a = pcall(map.cellTile, map, sx, sy)
+  local okB, b = pcall(map.cellTile, map, tx, ty)
+  if not (okA and okB) then return false end
+  local tileset = map.def and map.def.tileset
+  for _, pair in ipairs(list) do
+    if pair.tileset == tileset
+        and ((pair.a == a and pair.b == b) or (pair.a == b and pair.b == a)) then
+      return true
+    end
+  end
+  return false
+end
+
+function ControlsFree.simplePushableLegal(game, ow, map, tx, ty, dir)
+  if not (ow and ow.strengthActive and type(ow.pushableAtCell) == "function") then
+    return false
+  end
+  local ok, boulder = pcall(ow.pushableAtCell, ow, tx, ty)
+  if not (ok and boulder) then return false end
+  local d = DIR_BY_NAME[dir]
+  local bx, by = tx + d.dx, ty + d.dy
+  if not map:inBounds(bx, by) or not map:isWalkableCell(bx, by) then return false end
+  for _, e in ipairs(ow.npcs or {}) do
+    if e ~= boulder and not e.passable
+        and ((e.cellX == bx and e.cellY == by)
+          or (e.targetX == bx and e.targetY == by)) then
+      return false
+    end
+  end
+  return true
+end
+
+-- A cheap *preference* legality check, not a replacement for engine collision.
+-- The real movement still goes through Gen1Recomp.  We only use this to avoid
+-- repeatedly choosing an obviously blocked primary component when the finger
+-- also points toward a legal secondary component.
+function ControlsFree.simpleDirectionLikelyLegal(game, p, dirName)
+  local free = overworldGate(game)
+  if not free then return false end
+  local ow, player = game.overworld, game.overworld.player
+  local map = ow and ow.map
+  local d = DIR_BY_NAME[dirName]
+  if not map or not player or not d then return false end
+  local sx, sy = player.cellX, player.cellY
+  local cellK = key(sx, sy)
+  local failed = p and p.simpleFailed
+  if failed and failed.cell == cellK and failed.dir == dirName
+      and state.tick <= (failed.untilTick or -1) then
+    return false
+  end
+
+  -- A directional warp under the player is a legal manual input even when the
+  -- cell in front is solid/out-of-bounds (exit carpets, wall openings, edges).
+  local dirs = warpActivationDirections(game, map, sx, sy)
+  if listHas(dirs, dirName) and type(map.warpAtCell) == "function"
+      and map:warpAtCell(sx, sy) then return true end
+
+  local tx, ty = sx + d.dx, sy + d.dy
+  if not map:inBounds(tx, ty) then
+    local compass = ControlsFree.SIMPLE_DIR_COMPASS[dirName]
+    local conn = map.def and map.def.connections and map.def.connections[compass]
+    return conn ~= nil -- engine remains authoritative for exact seam landing
+  end
+
+  local overview = mod.world and mod.world:mapOverview() or overviewFromLoadedMap(map)
+  if overview then
+    local topo = ledgeTopology(game, map, overview)
+    for _, jump in ipairs((topo.jumps and topo.jumps[cellK]) or {}) do
+      if jump.dir == dirName then return true end
+    end
+    if topo.blockedEdges and topo.blockedEdges[edgeKey(sx, sy, tx, ty)] then
+      return false
+    end
+  end
+
+  if ControlsFree.simplePushableLegal(game, ow, map, tx, ty, dirName) then return true end
+
+  if not map:isWalkableCell(tx, ty) then
+    if not (player.surfing and type(map.isWaterCell) == "function"
+        and map:isWaterCell(tx, ty)) then
+      return false
+    end
+  end
+  if ControlsFree.simplePairBlocked(game, map, player, sx, sy, tx, ty) then return false end
+  for _, e in ipairs(ow.npcs or {}) do
+    if not e.passable
+        and ((e.cellX == tx and e.cellY == ty)
+          or (e.targetX == tx and e.targetY == ty)) then
+      return false
+    end
+  end
+  return true
+end
+
+-- Bresenham-like weighted mixer. With 0.70 UP / 0.30 LEFT it yields seven UP
+-- decisions and three LEFT decisions per ten opportunities, distributed across
+-- the sequence. If the primary component is blocked, the legal secondary wins
+-- immediately instead of wasting presses against the wall.
+function ControlsFree.chooseSimpleDirection(game, p)
+  local comps, nx, ny = ControlsFree.simpleTouchComponents(p)
+  p.simpleNX, p.simpleNY = nx or 0, ny or 0
+  if not comps or #comps == 0 then
+    state.stats.simpleTouchDeadzone = (state.stats.simpleTouchDeadzone or 0) + 1
+    return nil
+  end
+  local primary, secondary = comps[1], comps[2]
+  local pOK = primary and ControlsFree.simpleDirectionLikelyLegal(game, p, primary.dir)
+  local sOK = secondary and ControlsFree.simpleDirectionLikelyLegal(game, p, secondary.dir)
+  if primary and not pOK and secondary and sOK then
+    state.stats.simpleTouchFallbacks = (state.stats.simpleTouchFallbacks or 0) + 1
+    p.simpleMixAcc = 0
+    return secondary.dir
+  end
+  if primary and pOK and (not secondary or not sOK) then return primary.dir end
+  if not pOK and not sOK then
+    state.stats.simpleTouchBlocked = (state.stats.simpleTouchBlocked or 0) + 1
+    return nil
+  end
+
+  local total = primary.weight + secondary.weight
+  local pairKey = primary.dir .. "/" .. secondary.dir
+  if p.simpleMixPair ~= pairKey then
+    p.simpleMixPair, p.simpleMixAcc = pairKey, 0
+  end
+  p.simpleMixAcc = (p.simpleMixAcc or 0) + secondary.weight
+  if p.simpleMixAcc + 1e-9 >= total then
+    p.simpleMixAcc = p.simpleMixAcc - total
+    return secondary.dir
+  end
+  return primary.dir
+end
+
+function ControlsFree.queueSimpleAvatarInteraction(game, p)
+  if not p or option("interact", true) == false then return false end
+  -- SIMPLE mode uses the screen centre as a renderer-independent avatar
+  -- proxy.  No four-direction scan: a stationary centre tap is just native A
+  -- in the player's current facing, exactly like pressing the real A button.
+  local probe = { x = p.startX, y = p.startY }
+  local centred = ControlsFree.simpleTouchComponents(probe)
+  centred = centred and #centred == 0
+  if not p.startedOnPlayer and not centred then return false end
+  local dx, dy = (p.x or p.startX) - p.startX, (p.y or p.startY) - p.startY
+  if dx * dx + dy * dy > PLAYER_HOLD_MOVE_SLOP_UNITS * PLAYER_HOLD_MOVE_SLOP_UNITS then
+    return false
+  end
+  mod.input:tap(game, "a")
+  state.stats.simpleTouchAvatarInteractions =
+    (state.stats.simpleTouchAvatarInteractions or 0) + 1
+  return true
+end
+
+function ControlsFree.simpleInteractionTick(game)
+  local a = state.simpleInteraction
+  if not a then return false end
+  local free = overworldGate(game)
+  local cur = mod.world and mod.world:current()
+  local player = game and game.overworld and game.overworld.player
+  if not free or not cur or not player or cur.mapId ~= a.mapId
+      or cur.x ~= a.x or cur.y ~= a.y then
+    if a.faceHandle then mod.input:release(a.faceHandle) end
+    state.simpleInteraction = nil
+    return false
+  end
+  if player.facing == a.dir then
+    if a.faceHandle then mod.input:release(a.faceHandle) end
+    mod.input:tap(game, "a")
+    state.simpleInteraction = nil
+    return true
+  end
+  if not a.faceHandle then
+    a.faceHandle = mod.input:press(game, a.dir)
+    a.faceTick = state.tick
+    return true
+  end
+  if state.tick > (a.faceTick or state.tick) then
+    mod.input:release(a.faceHandle)
+    a.faceHandle = nil
+    if player.facing ~= a.dir then state.simpleInteraction = nil end
+  end
+  return true
+end
+
+function ControlsFree.simpleMovementTick(game)
+  if not ControlsFree.simpleTouchEnabled() then
+    ControlsFree.releaseSimpleHold()
+    return
+  end
+  if ControlsFree.simpleInteractionTick(game) then
+    ControlsFree.releaseSimpleHold()
+    return
+  end
+  local id = state.tapOwner
+  local p = id and state.pointers[id]
+  if not p or not p.simpleMode or p.ignored or p.manualSuppressed
+      or p.gestureSuppressed or p.playerHoldCandidate then
+    ControlsFree.releaseSimpleHold()
+    return
+  end
+  if pointerOverTouchControl(game, p.x, p.y) then
+    ControlsFree.releaseSimpleHold()
+    return
+  end
+  local free = overworldGate(game)
+  local player = game and game.overworld and game.overworld.player
+  if not free or not player then
+    ControlsFree.releaseSimpleHold()
+    return
+  end
+  -- Never queue a second weighted direction in the middle of an engine-owned
+  -- walking animation. A new mix decision belongs to the next idle cell.
+  if player.moving then
+    if state.simpleHold then
+      state.stats.simpleTouchSteps = (state.stats.simpleTouchSteps or 0) + 1
+      p.simpleFailed = nil
+    end
+    ControlsFree.releaseSimpleHold()
+    return
+  end
+
+  local h = state.simpleHold
+  if h then
+    if player.cellX ~= h.startX or player.cellY ~= h.startY then
+      mod.input:release(h.handle)
+      state.simpleHold = nil
+      p.simpleFailed = nil
+      state.stats.simpleTouchSteps = (state.stats.simpleTouchSteps or 0) + 1
+      return
+    end
+    if state.tick - (h.startedTick or state.tick) >= ControlsFree.SIMPLE_TOUCH_PRESS_FAIL_TICKS then
+      mod.input:release(h.handle)
+      state.simpleHold = nil
+      p.simpleFailed = {
+        cell = key(player.cellX, player.cellY), dir = h.dir,
+        untilTick = state.tick + ControlsFree.SIMPLE_TOUCH_RETRY_BLOCK_TICKS,
+      }
+      state.stats.simpleTouchBlocked = (state.stats.simpleTouchBlocked or 0) + 1
+    else
+      return -- keep the same direction through turn-in-place + move attempt
+    end
+  end
+
+  local dir = ControlsFree.chooseSimpleDirection(game, p)
+  if not dir then return end
+  state.stats.simpleTouchDecisions = (state.stats.simpleTouchDecisions or 0) + 1
+  state.stats["simpleTouch" .. dir:sub(1,1):upper() .. dir:sub(2)] =
+    (state.stats["simpleTouch" .. dir:sub(1,1):upper() .. dir:sub(2)] or 0) + 1
+  state.simpleHold = {
+    dir = dir, handle = mod.input:press(game, dir),
+    startX = player.cellX, startY = player.cellY, startedTick = state.tick,
+  }
+end
+
 -- Gameplay touch/mouse outside virtual controls. TouchControls has first
 -- refusal in Game before input.pointer, so its D-pad/A/B/START/SELECT cannot
 -- become destinations. One world pointer owns navigation at a time.
@@ -6458,12 +6990,18 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
   local eligible = ev.source == "touch"
     or (ev.source == "mouse" and ev.button == 1 and option("mouse", false) == true)
   local id = ev.id
+  local simpleMode = ControlsFree.simpleTouchEnabled()
 
   if ev.phase == "pressed" then
     if eligible then
       local owns = state.tapOwner == nil and state.twoFingerGesture == nil
       if owns then state.tapOwner = id end
       if owns then state.gestureSerial = (state.gestureSerial or 0) + 1 end
+      local simpleStartCentered = false
+      if owns and simpleMode then
+        local comps = ControlsFree.simpleTouchComponents({ x = ev.x, y = ev.y })
+        simpleStartCentered = comps and #comps == 0 or false
+      end
       local p = {
         startX = ev.x, startY = ev.y,
         x = ev.x, y = ev.y,
@@ -6473,10 +7011,13 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
         feedbackShown = owns,
         ignored = not owns,
         gestureId = owns and state.gestureSerial or nil,
+        simpleMode = simpleMode and true or false,
+        simpleMixAcc = 0,
         -- Snapshot avatar ownership at pointer-DOWN. Camera motion and Voxel
         -- reprojection later in the gesture must not change what was clicked.
-        startedOnPlayer = owns and ControlsFree.playerScreenHit
-          and ControlsFree.playerScreenHit(game, ev.x, ev.y) == true or false,
+        startedOnPlayer = owns and (simpleMode and simpleStartCentered
+          or (ControlsFree.playerScreenHit
+            and ControlsFree.playerScreenHit(game, ev.x, ev.y) == true)) or false,
       }
       state.pointers[id] = p
       local playerHold = state.playerHoldTouches and state.playerHoldTouches[id]
@@ -6499,11 +7040,29 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
       -- A on this gesture no longer being down.
       if owns and not p.playerHoldCandidate
           and not pointerOverTouchControl(game, ev.x, ev.y) then
-        local accepted = startRoute(game, ev.x, ev.y, false, true, p.gestureId)
-        p.initialAccepted = accepted and true or false
-        if accepted then
-          state.stats.immediatePressRoutes =
-            (state.stats.immediatePressRoutes or 0) + 1
+        if simpleMode then
+          -- Mutual exclusion: no world target acquisition, Voxel picking or A*.
+          if state.nav then cancelRoute("simple_touch_enabled") end
+          state.exitJourney = nil
+          p.simpleMode = true
+          p.initialAccepted = true
+        else
+          -- Avatar taps are semantic interactions, not urgent locomotion.
+          -- Defer avatar A to RELEASE so a drag can still promote back into
+          -- ordinary navigation instead of firing A on touch-down. A drag
+          -- that leaves the avatar slop below promotes
+          -- back into ordinary immediate navigation in the moved branch.
+          if p.startedOnPlayer then
+            p.avatarTapDeferred = true
+            p.initialAccepted = true
+          else
+            local accepted = startRoute(game, ev.x, ev.y, false, true, p.gestureId)
+            p.initialAccepted = accepted and true or false
+            if accepted then
+              state.stats.immediatePressRoutes =
+                (state.stats.immediatePressRoutes or 0) + 1
+            end
+          end
         end
       end
     end
@@ -6511,10 +7070,11 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
     local p = state.pointers[id]
     if p then p.x, p.y = ev.x, ev.y end
     trackTwoFingerPointer(game, ev)
-    if p and p.playerHoldCandidate then
-      local ph = state.playerHoldTouches and state.playerHoldTouches[id]
-      if not ph or ph.cancelled then
-        p.playerHoldCandidate = false
+    if p and p.avatarTapDeferred then
+      local adx, ady = ev.x - p.startX, ev.y - p.startY
+      if adx * adx + ady * ady
+          > PLAYER_HOLD_MOVE_SLOP_UNITS * PLAYER_HOLD_MOVE_SLOP_UNITS then
+        p.avatarTapDeferred = false
         p.pressTick = state.tick
         p.lastRetargetTick = state.tick
         if not p.ignored and not p.gestureSuppressed
@@ -6528,16 +7088,56 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
         end
       end
     end
+    if p and p.playerHoldCandidate then
+      local ph = state.playerHoldTouches and state.playerHoldTouches[id]
+      if not ph or ph.cancelled then
+        p.playerHoldCandidate = false
+        p.pressTick = state.tick
+        p.lastRetargetTick = state.tick
+        if not p.ignored and not p.gestureSuppressed
+            and not pointerOverTouchControl(game, ev.x, ev.y) then
+          if simpleMode then
+            p.simpleMode = true
+            p.initialAccepted = true
+          else
+            local accepted = startRoute(game, ev.x, ev.y, false, true, p.gestureId)
+            p.initialAccepted = accepted and true or false
+            if accepted then
+              state.stats.immediatePressRoutes =
+                (state.stats.immediatePressRoutes or 0) + 1
+            end
+          end
+        end
+      end
+    end
   elseif ev.phase == "released" then
     local p = state.pointers[id]
     if p then p.x, p.y = ev.x, ev.y end
     trackTwoFingerPointer(game, ev)
     if p and not p.ignored and not p.gestureSuppressed then
+      if simpleMode then
+        ControlsFree.releaseSimpleHold()
+        -- Centre/avatar taps stay useful even in renderer-agnostic mode: an
+        -- adjacent real interaction can still turn + A without any pathfinder.
+        ControlsFree.queueSimpleAvatarInteraction(game, p)
+      else
+      -- Ordinary avatar taps were deliberately deferred at pointer-down so
+      -- native hidden-object rescue stays release-gated. Resolve them now.
+      if p.avatarTapDeferred then
+        p.avatarTapDeferred = false
+        if not pointerOverTouchControl(game, p.startX, p.startY) then
+          local accepted = startRoute(game, p.startX, p.startY, false, true, p.gestureId)
+          p.initialAccepted = accepted and true or false
+          if accepted then
+            state.stats.immediatePressRoutes =
+              (state.stats.immediatePressRoutes or 0) + 1
+          end
+        end
       -- HOLD PLAYER SPRITE reserves a stationary avatar touch for START. If it
       -- is released before the one-second START threshold, reinterpret that
       -- short touch now as an ordinary avatar tap. startRoute's avatar proxy
       -- can then target the interaction/door directly in front of the player.
-      if p.playerHoldCandidate then
+      elseif p.playerHoldCandidate then
         local ph = state.playerHoldTouches and state.playerHoldTouches[id]
         if ph and not ph.fired and not ph.cancelled
             and not pointerOverTouchControl(game, p.startX, p.startY) then
@@ -6561,11 +7161,13 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
       -- Non-hold release intentionally does NOT start a second route. The
       -- press already did that; removing the pointer is itself the signal that
       -- an armed interaction may execute when its approach cell is reached.
+      end -- not SIMPLE TOUCH MOVEMENT
     end
     state.pointers[id] = nil
     if state.tapOwner == id then state.tapOwner = nil end
   elseif ev.phase == "cancelled" then
     local p = state.pointers[id]
+    if p and p.simpleMode then ControlsFree.releaseSimpleHold() end
     trackTwoFingerPointer(game, ev)
     if state.playerHoldTouches and state.playerHoldTouches[id] then
       state.playerHoldTouches[id] = nil
@@ -6583,6 +7185,7 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
 end)
 
 local function pointerSteeringTick(game)
+  if ControlsFree.simpleTouchEnabled() then return end
   -- A semantic "leave this interior" command owns its route across internal
   -- floors. The original held finger must not reinterpret the new room camera
   -- every performance tick and accidentally replace that journey. A fresh
@@ -6595,7 +7198,7 @@ local function pointerSteeringTick(game)
   if p.playerHoldCandidate then return end
   if pointerOverTouchControl(game, p.x, p.y) then return end
   local age = state.tick - (p.pressTick or state.tick)
-  local startTicks = holdSteerDelayTicks()
+  local startTicks = holdSteerDelayTicks(game)
   if age < startTicks then return end
 
   -- HOLD STEER DELAY controls only when continuous steering begins. The
@@ -6640,8 +7243,29 @@ mod.hooks:wrap("input.step", function(nextFn, game, dt)
   -- START/SELECT TOUCH CONTROL is independent from the TAP TO MOVE switch.
   -- Its own OFF/HOLD/PINCH-SPREAD choice is authoritative.
   ControlsFree.playerHoldStartTick(game)
-  pointerSteeringTick(game)
-  navigationTick(game)
+
+  local simpleNow = ControlsFree.simpleTouchEnabled()
+  if simpleNow ~= state.simpleModeLast then
+    if simpleNow then
+      if state.nav then cancelRoute("simple_touch_enabled") end
+      state.exitJourney = nil
+      state.battleResume = nil
+    else
+      ControlsFree.releaseSimpleHold()
+      if state.simpleInteraction and state.simpleInteraction.faceHandle then
+        mod.input:release(state.simpleInteraction.faceHandle)
+      end
+      state.simpleInteraction = nil
+    end
+    state.simpleModeLast = simpleNow
+  end
+  if simpleNow then
+    ControlsFree.simpleMovementTick(game)
+  else
+    ControlsFree.releaseSimpleHold()
+    pointerSteeringTick(game)
+    navigationTick(game)
+  end
   return nextFn(game, dt)
 end)
 
@@ -6835,6 +7459,8 @@ local function enteringBuildingInterior(ev)
 end
 
 mod.events:on("map.entered", function(ev)
+  ControlsFree.releaseSimpleHold()
+  state.simpleInteraction = nil
   state.view = nil
   invalidateLoadedMapOverviewCache()
   invalidateVoxelCandidateCache()
@@ -6884,6 +7510,8 @@ mod.events:on("map.entered", function(ev)
 end)
 
 mod.events:on("battle.started", function(ev)
+  ControlsFree.releaseSimpleHold()
+  state.simpleInteraction = nil
   local nav = state.nav
   local battle = ev and ev.battle
   if option("battle_resume", false) == true and nav and nav.goalKind == "move"
@@ -6930,6 +7558,8 @@ mod.events:on("battle.ended", function()
 end)
 
 mod.events:on("save.loading", function()
+  ControlsFree.releaseSimpleHold()
+  state.simpleInteraction = nil
   cancelRoute("save_loading")
   invalidateLedgeTopologyCache()
   invalidateLoadedMapOverviewCache()
@@ -7213,9 +7843,9 @@ local function drawDebug()
   local nav = state.nav
   local lines = {
     "TAP TO MOVE " .. VERSION,
-    ("HOLD DELAY %dMS  PERF %s"):format(
-      tonumber(option("tap_hold_ms", DEFAULT_HOLD_STEER_DELAY_MS)) or DEFAULT_HOLD_STEER_DELAY_MS,
-      (select(1, performanceInputProfile()).label)),
+    ("HOLD BASE %dMS X%s = %dMS  PERF %s"):format(
+      ControlsFree.holdSteerBaseDelayMs(), tostring(ControlsFree.overworldSpeedMultiplier(state.game)),
+      ControlsFree.holdSteerDelayMs(state.game), (select(1, performanceInputProfile()).label)),
     ("INPUT %dMS  PREVIEW /%d"):format(
       select(1, performanceInputProfile()).holdMs, previewRefreshTicks()),
     "TICK " .. tostring(state.tick),
@@ -7233,9 +7863,13 @@ local function drawDebug()
     ("CARPET-DOWN %d  CLICK-EXIT %d"):format(
       state.stats.carpetDownIntents or 0,
       state.stats.exitClickBiasedSelections or 0),
-    ("AVATAR-HIT %d  ADJ %d"):format(
+    ("AVATAR-HIT %d  HID-PATH %d"):format(
       state.stats.playerAvatarHitDetections or 0,
-      state.stats.playerAvatarAdjacentInteractionProxies or 0),
+      state.stats.voxelNativeHiddenPathTargets or 0),
+    ("IFACE N/T/V %d/%d/%d"):format(
+      state.stats.interactionFaceNeutralTicks or 0,
+      state.stats.interactionFaceTurns or 0,
+      state.stats.interactionFaceVerified or 0),
     ("EXIT-DIR A/R/H %d/%d/%d"):format(
       state.stats.exitDirectionalAccepts or 0,
       state.stats.exitDirectionalRejects or 0,
@@ -7253,6 +7887,14 @@ local function drawDebug()
       state.stats.overviewCacheHits or 0, state.stats.overviewCacheMisses or 0,
       state.stats.entryGestureSuppressions or 0),
   }
+  if ControlsFree.simpleTouchEnabled() then
+    local p = state.tapOwner and state.pointers[state.tapOwner] or nil
+    lines[#lines + 1] = ("SIMPLE %s X%+d%% Y%+d%%  F%d"):format(
+      state.simpleHold and tostring(state.simpleHold.dir):upper() or "IDLE",
+      math.floor(((p and p.simpleNX) or 0) * 100 + 0.5),
+      math.floor(((p and p.simpleNY) or 0) * 100 + 0.5),
+      state.stats.simpleTouchFallbacks or 0)
+  end
   if nav then
     lines[#lines + 1] = "STATE " .. tostring(nav.phase)
     lines[#lines + 1] = ("TARGET %s %d,%d"):format(
@@ -7299,6 +7941,7 @@ local function diagnostics()
                        or DEFAULT_VOXEL_PATH_RATE),
       ticks = previewRefreshTicks(),
     },
+    simpleTouchMovement = ControlsFree.simpleTouchEnabled(),
     controlsFree = {
       dialogTouchControl = option("dialog_touch_control", false) == true,
       battleTouchControl = option("battle_touch_control", false) == true,

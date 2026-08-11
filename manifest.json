@@ -1,7 +1,7 @@
 {
   "id": "tap_to_move",
   "name": "Tap to Move",
-  "version": "1.3.22",
+  "version": "1.3.27",
   "entry": "main.lua",
   "api": 2,
   "category": "GAMEPLAY",
@@ -11,7 +11,7 @@
     "DRAMATIC_SHAPE"
   ],
   "conflicts": [],
-  "description": "Mobile-first tap/hold navigation with Voxel support, smart exits, seamless routing and controls-free touch/motion shortcuts.",
+  "description": "Mobile-first pathfinding plus optional renderer-agnostic Simple Touch Movement, smart exits and controls-free touch/motion shortcuts.",
   "github": "ZyranCZ/Tap-to-Move",
   "permissions": [
     "engine_internals"

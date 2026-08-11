@@ -1,5 +1,15 @@
 # Tap to Move
 
+> **v1.3.27:** HOLD STEER DELAY is now a 1X base delay that automatically scales with Gen1Recomp's live overworld logic speed. The default is 150 ms; at 2X/3X/4X it becomes 300/450/600 logic-ms respectively, preserving the same real-time grace before a held pointer is allowed to retarget and overwrite the initial semantic route. Available base values are 150/200/250/300/350/400/450/500 ms.
+
+> **v1.3.26:** Fixed interaction finishing for PCs and other facing-gated targets. After pathfinding reaches the interaction position, Tap to Move now gives Gen1Recomp one neutral input poll to re-arm turn-in-place, performs a dedicated turn toward the target, verifies the live player facing, waits for the short vanilla turn timer to settle, and only then presses A. This prevents hidden-event interactions from firing while the avatar is still facing the wrong direction.
+
+> **v1.3.25:** Removed the avatar-adjacent UP → DOWN → RIGHT → LEFT interaction radar. Fixed hidden-event fixtures such as Pokémon Center PCs are now first-class pathfinding interaction targets: in Dramatic Shape, Tap to Move projects the engine-owned hidden-event cell itself into screen space, routes to a legal adjacent tile, faces the required direction and presses ordinary A. The hidden event is never executed remotely; Gen1Recomp's normal interaction dispatcher fires it only after the player actually reaches it. Secret hidden items/coins remain excluded. A short avatar/centre tap is now simply native A in the player's current facing. Debug overlay adds `HID-PATH`.
+
+> **v1.3.24:** Fixed avatar-adjacent rescue for Pokémon Center PCs and other engine hidden-object surfaces. The normal semantic scan remains first, but when an adjacent hidden-object cell is usable by the running engine and the mod-side semantic mirror misses it, Tap to Move now asks the live `tryHiddenObject` routine directly in the same UP → DOWN → RIGHT → LEFT priority. Hidden floor treasure is explicitly excluded from this fallback. Debug overlay adds `NATIVE-HID`.
+
+> **v1.3.23:** Added **SIMPLE TOUCH MOVEMENT** (default OFF), a renderer-agnostic alternative to Tap-to-Move pathfinding. While ON, world touches never use 2D/3D target picking or A*: the finger vector from screen centre becomes weighted D-pad input. A 70% UP / 30% LEFT vector produces an approximately 7:3 interleaved UP/LEFT sequence; if the preferred next tile is obviously blocked, the legal secondary direction is used instead. Normal Gen1Recomp movement/collision still decides every actual step.
+>
 > **v1.3.22:** Fixed avatar-click rescue in Dramatic Shape/Voxel mode. Player hit-testing now follows Dramatic Shape's actual live 16x16 leaning billboard instead of approximating the avatar as a vertical column. Avatar ownership is snapshotted on pointer-down, and a confirmed adjacent interaction is resolved before 3D raycasting/Smart Exit, so tapping the player beside a PC can reliably turn toward it and press A.
 >
 > **v1.3.21:** A short tap on the player now performs a one-tile interaction rescue scan in strict **UP → DOWN → RIGHT → LEFT** priority. If a genuine adjacent NPC/PC/sign/bookshelf/counter or other supported interaction exists, Tap to Move turns toward it and presses A; this bypasses unreliable 3D object picking while never probing empty cells. If no adjacent interaction exists, the previous front-cell avatar proxy remains available.
@@ -18,13 +28,15 @@ The mod does **not** write player coordinates or invent destinations. It drives 
 
 ## Features
 
+- **Simple Touch Movement (optional)** — renderer-agnostic direct steering from the finger vector relative to screen centre. It is mutually exclusive with world pathfinding while enabled and works without reading scene textures or Voxel geometry.
 - **Tap to walk** — movement normally starts immediately on pointer press. With **PINCH OR SPREAD** selected, the first mobile world touch gets a brief 0.20 s two-finger pairing tolerance (quick single taps are replayed on release).
-- **Hold to steer** — keep your finger down and the destination updates as the world moves under it.
+- **Hold to steer** — keep your finger down and the destination updates as the world moves under it. **HOLD STEER DELAY** is a configurable 1X base (150–500 ms in 50 ms steps, default 150 ms) and automatically multiplies with the live Overworld Speed, so 150 ms becomes 300/450/600 at 2X/3X/4X before retargeting is allowed.
 - **A\* pathfinding** around walls, buildings, NPCs and other obstacles.
 - **Nearest legal destination** — tapping/holding an unreachable wall, building or object still moves you as close to it as the game legally allows.
 - **Sticky doors** — once a real door/warp is targeted, temporary invalid samples caused by camera movement do not cancel the route.
 - **NPC targeting** — tapping or holding over an NPC makes the player approach that NPC, including moving NPCs.
-- **Release-gated interactions** — reaching an NPC while the finger is still held does not accidentally press A; interaction occurs only once the gesture has been released.
+- **Release-gated interactions** — reaching an NPC or fixed hidden-event fixture while the finger is still held does not accidentally press A; interaction occurs only once the gesture has been released.
+- **Native hidden-event pathfinding** — visible engine fixtures such as Pokémon Center PCs are treated as interaction destinations; Tap to Move approaches them and lets the game itself handle the final A interaction. Secret hidden items/coins are never exposed by this targeting layer.
 - Optional **START/SELECT touch control** — choose either a one-second hold on the player sprite for START, or two-finger pinch/spread controls for SELECT/START.
 - Optional **Dialogue Touch Control** — a catch-all for every non-overworld, non-battle UI screen: tap-and-release sends A, a stationary one-second hold sends B, and swiping sends UP/DOWN/LEFT/RIGHT. In the overworld START menu specifically, a tap outside the visible menu box sends B to close it instead of A.
 - Optional **Battle Touch Control** — the same tap/hold/swipe scheme throughout battles: release tap = A, stationary one-second hold = B, swipe = D-pad; battle touches are reserved for controls instead of 3D battle camera dragging.
@@ -61,6 +73,8 @@ Voxel support includes:
 - directly connected map targeting.
 
 Dramatic Shape is an **optional dependency**. If it is not installed or Voxel mode is disabled, Tap to Move automatically uses its normal 2D targeting path.
+
+For other visual/Voxel mods whose geometry cannot be interpreted reliably, enable **SIMPLE TOUCH MOVEMENT**. That mode ignores renderer geometry entirely and steers only from the finger position relative to screen centre.
 
 ## Tap, hold and interactions
 
@@ -190,6 +204,12 @@ Mouse features are independent. For example, wheel navigation can be enabled whi
 ### TAP TO MOVE
 Enable or disable the mod.
 
+### SIMPLE TOUCH MOVEMENT
+**Default: OFF**
+
+Alternative renderer-agnostic world movement. While ON, the normal Tap-to-Move/pathfinding system is disabled for world pointer movement. The mod reads only the finger/mouse vector from the centre of the screen and converts its vertical/horizontal components into a weighted sequence of real D-pad inputs. If the preferred component is obviously blocked but the secondary component is legal, the secondary direction is used. A small centre dead zone stops movement.
+
+The game remains authoritative for collisions, ledges, warps, map connections and Strength pushes; Simple Touch Movement never writes player coordinates. A short centre/avatar tap remains a native A press in the player's current facing.
 
 ### TAP TO INTERACT
 Allow interactive world targets to be approached and activated after release.
@@ -198,9 +218,13 @@ Allow interactive world targets to be approached and activated after release.
 Enable continuous destination retargeting while a world touch remains held.
 
 ### HOLD STEER DELAY
-How long a touch must remain held before continuous retargeting starts.
+Base delay before a held touch is allowed to replace the initial destination with continuous steering.
 
-**Default: 800 ms**
+**Default: 150 ms at 1X**
+
+Options: **150 / 200 / 250 / 300 / 350 / 400 / 450 / 500 ms**.
+
+The selected value automatically scales with the live Overworld Speed. For example, the default 150 ms base becomes **300 ms at 2X, 450 ms at 3X and 600 ms at 4X**. Because Gen1Recomp executes that many more fixed logic steps per real frame, this preserves approximately the same real-time grace for releasing the pointer before Hold to Steer may retarget the route.
 
 This does **not** delay the initial movement. Walking begins immediately on press.
 
