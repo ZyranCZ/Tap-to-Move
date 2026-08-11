@@ -1,4 +1,4 @@
--- Tap to Move v1.5.0
+-- Tap to Move v1.5.4
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,7 +9,7 @@
 
 local mod = ...
 
-local VERSION = "1.5.0"
+local VERSION = "1.5.4"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 150 -- 1X base; scaled by live overworld logic speed
@@ -55,9 +55,15 @@ local ControlsFree = {
   -- Performance/search tuning lives on this namespace table instead of as
   -- extra chunk locals. FULL exactly preserves the pre-budget search scope.
   pathBudgetProfiles = {
-    very_low = { label = "VERY LOW", nodes = 128, seams = 2, exits = 2 },
-    medium   = { label = "MEDIUM",   nodes = 256, seams = 4, exits = 4 },
-    full     = { label = "FULL",     nodes = nil, seams = nil, exits = nil },
+    very_low = {
+      label = "VERY LOW", nodes = 128, seams = 2, exits = 2, crossTargets = 4,
+    },
+    medium = {
+      label = "MEDIUM", nodes = 256, seams = 4, exits = 4, crossTargets = 8,
+    },
+    full = {
+      label = "FULL", nodes = nil, seams = nil, exits = nil, crossTargets = nil,
+    },
   },
   DEFAULT_PATH_BUDGET = "full",
   -- Voxel Path Preview live reprojection is intentionally fixed at 0.25/s.
@@ -65,6 +71,7 @@ local ControlsFree = {
   engineWarpModule = false,
   occupancyCache = nil,
   warpCellsCache = setmetatable({}, { __mode = "k" }),
+  neighborLookupCache = nil,
 
   -- Renderer-agnostic direct steering constants. Kept on this table rather
   -- than as extra chunk locals because this very large mod deliberately stays
@@ -236,6 +243,7 @@ local state = {
   battleResume = nil,
   exitJourney = nil,
   previewCache = nil,
+  mapTransition = nil,
   gestureTouches = {},
   twoFingerGesture = nil,
   zoomGuardInstalled = false,
@@ -270,6 +278,16 @@ local state = {
     occupancyCacheMisses = 0,
     warpCacheHits = 0,
     warpCacheMisses = 0,
+    occupancyCopiesAvoided = 0,
+    occupancyCopiesRequired = 0,
+    neighborLookupHits = 0,
+    neighborLookupMisses = 0,
+    mapTransitionFlushes = 0,
+    mapTransitionWaitTicks = 0,
+    mapTransitionReady = 0,
+    crossFallbackCellsTested = 0,
+    crossFallbackBudgetStops = 0,
+    crossFallbackBudgetExhaustedSkips = 0,
     exitCandidatesCheap = 0,
     exitCandidatesPathScored = 0,
     exitCandidatesDeferred = 0,
@@ -332,6 +350,9 @@ local state = {
     feedbackPulses = 0,
     previewProjectionRefreshes = 0,
     previewProjectionCacheHits = 0,
+    flatPreviewContextBuilds = 0,
+    flatPreviewPointTransforms = 0,
+    holdRetargetSkips = 0,
     voxelTargets = 0,
     voxelColumnTargets = 0,
     voxelRayTargets = 0,
@@ -1205,8 +1226,20 @@ local function findPath(overview, sx, sy, gx, gy, waterMode,
   if not overview then return nil end
   if sx == gx and sy == gy then return {} end
 
-  occupied = copyFlat(occupied)
-  occupied[key(sx, sy)] = nil -- the player occupies the start cell
+  -- liveOccupancy normally contains NPCs only, so the player's start cell
+  -- is almost never present. Older builds cloned the whole occupancy table for
+  -- every search solely to delete that one key. Copy only in the exceptional
+  -- case where something actually claims the start cell.
+  local startOccupiedKey = key(sx, sy)
+  if occupied and occupied[startOccupiedKey] then
+    occupied = copyFlat(occupied)
+    occupied[startOccupiedKey] = nil
+    state.stats.occupancyCopiesRequired =
+      (state.stats.occupancyCopiesRequired or 0) + 1
+  else
+    state.stats.occupancyCopiesAvoided =
+      (state.stats.occupancyCopiesAvoided or 0) + 1
+  end
 
   if not passable(overview, gx, gy, gx, gy, waterMode,
                   occupied, tempBlocked, blockedEdges, blockedCells,
@@ -1214,7 +1247,7 @@ local function findPath(overview, sx, sy, gx, gy, waterMode,
     return nil
   end
 
-  local startKey = key(sx, sy)
+  local startKey = startOccupiedKey
   local goalKey = key(gx, gy)
   local open = {}
   local gScore = { [startKey] = 0 }
@@ -1303,8 +1336,16 @@ local function findClosestReachablePath(overview, sx, sy, desiredX, desiredY,
                                         waterMode, occupied, tempBlocked,
                                         blockedEdges, blockedCells, specialEdges)
   if not overview then return nil end
-  occupied = copyFlat(occupied)
-  occupied[key(sx, sy)] = nil
+  local startOccupiedKey = key(sx, sy)
+  if occupied and occupied[startOccupiedKey] then
+    occupied = copyFlat(occupied)
+    occupied[startOccupiedKey] = nil
+    state.stats.occupancyCopiesRequired =
+      (state.stats.occupancyCopiesRequired or 0) + 1
+  else
+    state.stats.occupancyCopiesAvoided =
+      (state.stats.occupancyCopiesAvoided or 0) + 1
+  end
 
   local function terrainOK(x, y)
     local ch = cellChar(overview, x, y)
@@ -1322,7 +1363,7 @@ local function findClosestReachablePath(overview, sx, sy, desiredX, desiredY,
     return true
   end
 
-  local startKey = key(sx, sy)
+  local startKey = startOccupiedKey
   local open, cameFrom, cameVia = {}, {}, {}
   local gScore = { [startKey] = 0 }
   local seq = 0
@@ -2096,6 +2137,8 @@ local function nearestReachableCrossTarget(game, cur, cross, desiredX, desiredY,
   local waterMode = ControlsFree.routeWaterMode(game, source, cur)
   local all, _, static = liveOccupancy(game)
   local maxR = (tonumber(dest.width) or 0) + (tonumber(dest.height) or 0)
+  local candidateLimit = ControlsFree.crossTargetCandidateLimit()
+  local candidatesTested = 0
 
   local function legal(cx, cy)
     if cx < 0 or cy < 0 or cx >= dest.width or cy >= dest.height then return false end
@@ -2128,6 +2171,15 @@ local function nearestReachableCrossTarget(game, cur, cross, desiredX, desiredY,
         if not seen[k] then
           seen[k] = true
           if legal(cx, cy) then
+            if candidateLimit and candidatesTested >= candidateLimit then
+              state.stats.crossFallbackBudgetStops =
+                (state.stats.crossFallbackBudgetStops or 0) + 1
+              return nil
+            end
+            candidatesTested = candidatesTested + 1
+            state.stats.crossFallbackCellsTested =
+              (state.stats.crossFallbackCellsTested or 0) + 1
+
             if seamReachable(cx, cy, all) then
               return cx, cy, false
             end
@@ -2203,10 +2255,26 @@ end
 
 local function loadedNeighborMap(game, mapId)
   local ow = game and game.overworld
-  for _, nb in ipairs((ow and ow.neighbors) or {}) do
-    if nb.map and nb.map.id == mapId then return nb.map, nb end
+  if not ow then return nil end
+  local neighbors = ow.neighbors
+  local cache = ControlsFree.neighborLookupCache
+  if not cache or cache.ow ~= ow or cache.neighbors ~= neighbors then
+    local byId = {}
+    for _, nb in ipairs(neighbors or {}) do
+      if nb.map and nb.map.id ~= nil then
+        byId[nb.map.id] = nb
+      end
+    end
+    cache = { ow = ow, neighbors = neighbors, byId = byId }
+    ControlsFree.neighborLookupCache = cache
+    state.stats.neighborLookupMisses =
+      (state.stats.neighborLookupMisses or 0) + 1
+  else
+    state.stats.neighborLookupHits =
+      (state.stats.neighborLookupHits or 0) + 1
   end
-  return nil
+  local nb = cache.byId[mapId]
+  return nb and nb.map or nil, nb
 end
 
 -- Build the same compact terrain alphabet WorldAPI.mapOverview uses, but only
@@ -3914,6 +3982,11 @@ end
 -- '+' cells from mapOverview: Gen I interior exit carpets are warp records on
 -- ordinary-looking floor cells and only fire when the player then walks off
 -- the edge / into the carpet direction.
+function ControlsFree.crossTargetCandidateLimit()
+  local profile = ControlsFree.pathBudgetProfile()
+  return profile and tonumber(profile.crossTargets) or nil
+end
+
 function ControlsFree.smartExitCandidateLimit()
   local profile = ControlsFree.pathBudgetProfile()
   return profile and tonumber(profile.exits) or nil
@@ -4152,6 +4225,9 @@ local function retireForRetarget(oldNav, continuous)
 end
 
 local function startRoute(game, screenX, screenY, continuous, showFeedback, gestureId)
+  if not ControlsFree.mapRuntimeReady(game) then
+    return false
+  end
   if option("enabled", true) == false then return false end
   if showFeedback == nil then showFeedback = not continuous end
 
@@ -4453,13 +4529,18 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     end
     candidate.requestedMapId = cross.destMapId
     candidate.requestedX, candidate.requestedY = rawTx, rawTy
+    local budgetHitsBeforeBuild = state.stats.pathBudgetHits or 0
     buildStatus, buildWhy = rebuildNavigation(game, candidate, cur)
+    local directCrossBudgetExhausted =
+      (state.stats.pathBudgetHits or 0) > budgetHitsBeforeBuild
 
     -- Even an apparently legal neighbour tile can be disconnected from every
     -- usable seam. Fall back toward the requested point rather than making the
     -- held input disappear.
     if not buildStatus and buildWhy ~= "dynamic"
-        and not crossInteraction and semanticKind ~= "door" then
+        and not crossInteraction and semanticKind ~= "door"
+        and not (directCrossBudgetExhausted
+          and ControlsFree.crossTargetCandidateLimit() ~= nil) then
       local nx, ny = nearestReachableCrossTarget(game, cur, cross, rawTx, rawTy, false)
       if nx and (nx ~= cross.targetX or ny ~= cross.targetY) then
         cross = copyFlat(cross)
@@ -4472,6 +4553,12 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
         buildStatus, buildWhy = rebuildNavigation(game, candidate, cur)
         nearestFallback = buildStatus and true or nearestFallback
       end
+    elseif not buildStatus and buildWhy ~= "dynamic"
+        and not crossInteraction and semanticKind ~= "door"
+        and directCrossBudgetExhausted
+        and ControlsFree.crossTargetCandidateLimit() ~= nil then
+      state.stats.crossFallbackBudgetExhaustedSkips =
+        (state.stats.crossFallbackBudgetExhaustedSkips or 0) + 1
     end
   else
     -- A cell may intentionally be BOTH a background interaction and a real
@@ -5166,6 +5253,15 @@ end
 local function navigationTick(game)
   state.tick = state.tick + 1
   state.game = game
+
+  -- map.entered can fire while world/current, mapOverview, neighbours, Voxel
+  -- scene and NPC tables are still converging on the destination. Never run
+  -- interaction completion or route work until the public map authorities
+  -- agree on the new map.
+  if not ControlsFree.mapRuntimeReady(game) then
+    return
+  end
+
   processPendingInteraction()
 
   local nav = state.nav
@@ -8046,6 +8142,7 @@ end)
 
 local function pointerSteeringTick(game)
   if ControlsFree.simpleTouchEnabled() then return end
+  if not ControlsFree.mapRuntimeReady(game) then return end
   -- A semantic "leave this interior" command owns its route across internal
   -- floors. The original held finger must not reinterpret the new room camera
   -- every performance tick and accidentally replace that journey. A fresh
@@ -8073,7 +8170,34 @@ local function pointerSteeringTick(game)
     disarmInteractionForGesture(p.gestureId, "hold_steer")
   end
 
+  -- A stationary held pointer can hit the retarget timer repeatedly while
+  -- absolutely nothing in the navigation state has changed (e.g. standing
+  -- still against a temporary blocker). In that exact case re-projecting the
+  -- same pointer and rebuilding the same A* request is pure duplicate work.
+  -- Do NOT skip while the player changes cell/map or the route needs a replan.
+  local cur = mod.world and mod.world:current()
+  local sameRetargetState = p.lastRetargetScreenX == p.x
+    and p.lastRetargetScreenY == p.y
+    and cur
+    and p.lastRetargetMapId == cur.mapId
+    and p.lastRetargetPlayerX == cur.x
+    and p.lastRetargetPlayerY == cur.y
+    and state.nav
+    and not state.nav.needsReplan
+    and not state.exitJourney
+  if sameRetargetState then
+    p.lastRetargetTick = state.tick
+    state.stats.holdRetargetSkips =
+      (state.stats.holdRetargetSkips or 0) + 1
+    return
+  end
+
   p.lastRetargetTick = state.tick
+  if cur then
+    p.lastRetargetScreenX, p.lastRetargetScreenY = p.x, p.y
+    p.lastRetargetMapId = cur.mapId
+    p.lastRetargetPlayerX, p.lastRetargetPlayerY = cur.x, cur.y
+  end
   local accepted = startRoute(game, p.x, p.y, true, false, p.gestureId)
   if accepted then
     state.stats.holdRetargets = state.stats.holdRetargets + 1
@@ -8318,7 +8442,60 @@ local function enteringBuildingInterior(ev)
   return mapDefIsOutdoor(fromDef) == true and ControlsFree.mapDefIsBuildingInterior(toDef)
 end
 
+function ControlsFree.flushMapSensitiveRuntimeCaches()
+  -- These caches are deliberately cheap to rebuild and are tied to the live
+  -- contents of the current overworld/map. Flush them explicitly at the map
+  -- boundary instead of relying only on table-identity changes; Gen1Recomp may
+  -- repopulate some live tables in place.
+  ControlsFree.occupancyCache = nil
+  ControlsFree.neighborLookupCache = nil
+  state.previewCache = nil
+  state.frame = nil
+  state.lastVoxelPick = nil
+  state.stats.mapTransitionFlushes =
+    (state.stats.mapTransitionFlushes or 0) + 1
+end
+
+function ControlsFree.beginMapTransition(ev)
+  ControlsFree.flushMapSensitiveRuntimeCaches()
+  state.mapTransition = {
+    mapId = ev and ev.mapId or nil,
+    enteredTick = state.tick,
+    via = ev and ev.via or nil,
+  }
+end
+
+function ControlsFree.mapRuntimeReady(game)
+  local pending = state.mapTransition
+  if not pending then return true end
+
+  local cur = mod.world and mod.world:current()
+  local overview = mod.world and mod.world:mapOverview()
+  local liveMap = game and game.overworld and game.overworld.map
+  local expected = pending.mapId
+
+  -- Do not perform path/retarget work against a half-switched world. The
+  -- transition is ready only after every public/live authority that carries a
+  -- map id agrees on the destination.
+  local ready = cur and overview and liveMap
+    and (expected == nil or cur.mapId == expected)
+    and (expected == nil or overview.mapId == expected)
+    and (expected == nil or liveMap.id == expected)
+
+  if not ready then
+    state.stats.mapTransitionWaitTicks =
+      (state.stats.mapTransitionWaitTicks or 0) + 1
+    return false
+  end
+
+  state.mapTransition = nil
+  state.stats.mapTransitionReady =
+    (state.stats.mapTransitionReady or 0) + 1
+  return true
+end
+
 mod.events:on("map.entered", function(ev)
+  ControlsFree.beginMapTransition(ev)
   ControlsFree.releaseSimpleHold()
   state.simpleInteraction = nil
   state.view = nil
@@ -8441,6 +8618,8 @@ mod.events:on("save.loading", function()
   state.pendingInteraction = nil
   state.battleResume = nil
   state.exitJourney = nil
+  state.mapTransition = nil
+  ControlsFree.flushMapSensitiveRuntimeCaches()
 end)
 
 -- Small Game Boy-friendly screen-space feedback.  Accepted destinations get a
@@ -8472,20 +8651,34 @@ local function drawFeedback()
   love.graphics.pop()
 end
 
-local function worldCellToScreen(game, x, y)
+local function flatPreviewContext(game)
   local view = state.view
   local cur = mod.world and mod.world:current()
   if not view or not cur then return nil end
   local ppx, ppy = playerPixel(game, cur)
-  local cameraX = ppx - (view.worldW / 2 - 16)
-  local cameraY = ppy - (view.worldH / 2 - 8)
-  local canvasX = x * TILE_SIZE + TILE_SIZE / 2 - cameraX
-  local canvasY = y * TILE_SIZE + TILE_SIZE / 2 - cameraY
+  state.stats.flatPreviewContextBuilds =
+    (state.stats.flatPreviewContextBuilds or 0) + 1
+  return {
+    view = view,
+    cameraX = ppx - (view.worldW / 2 - 16),
+    cameraY = ppy - (view.worldH / 2 - 8),
+    right = view.ox + view.worldW * view.scale,
+    bottom = view.oy + view.worldH * view.scale,
+  }
+end
+
+local function flatPathCellToScreen(ctx, x, y)
+  if not ctx then return nil end
+  local view = ctx.view
+  local canvasX = x * TILE_SIZE + TILE_SIZE / 2 - ctx.cameraX
+  local canvasY = y * TILE_SIZE + TILE_SIZE / 2 - ctx.cameraY
   local px = view.ox + canvasX * view.scale
   local py = view.oy + canvasY * view.scale
-  local right = view.ox + view.worldW * view.scale
-  local bottom = view.oy + view.worldH * view.scale
-  if px < view.ox or py < view.oy or px >= right or py >= bottom then return nil end
+  if px < view.ox or py < view.oy or px >= ctx.right or py >= ctx.bottom then
+    return nil
+  end
+  state.stats.flatPreviewPointTransforms =
+    (state.stats.flatPreviewPointTransforms or 0) + 1
   return px / view.dpiX, py / view.dpiY
 end
 
@@ -8541,6 +8734,10 @@ local function voxelPathCellToScreen(ctx, x, y)
 end
 
 local function drawPathPreview(game)
+  if state.mapTransition then
+    state.previewCache = nil
+    return
+  end
   local mode = option("path_preview", "off")
   local nav = state.nav
   if mode == "off" or not nav or not nav.previewUntil
@@ -8646,17 +8843,20 @@ local function drawPathPreview(game)
       love.graphics.circle("fill", p.x, p.y, p.r)
     end
   elseif not scene then
-    -- Flat rendering is cheap enough to follow the camera every frame.
+    -- Build the flat camera transform ONCE for the whole preview. Previous
+    -- builds called mod.world:current() + playerPixel() once per marker,
+    -- multiplying identical work by up to PREVIEW_MAX_FULL_DOTS every frame.
+    local flatCtx = flatPreviewContext(game)
     local lastDrawn
     for i = first, last, stride do
       local node = path[i]
-      local sx, sy = worldCellToScreen(game, node.x, node.y)
+      local sx, sy = flatPathCellToScreen(flatCtx, node.x, node.y)
       if sx then love.graphics.circle("fill", sx, sy, 1.8) end
       lastDrawn = i
     end
     if lastDrawn ~= last then
       local node = path[last]
-      local sx, sy = worldCellToScreen(game, node.x, node.y)
+      local sx, sy = flatPathCellToScreen(flatCtx, node.x, node.y)
       if sx then love.graphics.circle("fill", sx, sy, 1.8) end
     end
   end
@@ -8693,10 +8893,28 @@ local function drawDebug()
       state.stats.occupancyCacheMisses or 0,
       state.stats.warpCacheHits or 0,
       state.stats.warpCacheMisses or 0),
+    ("A* OCC COPY SKIP/REQ %d/%d  NB H/M %d/%d"):format(
+      state.stats.occupancyCopiesAvoided or 0,
+      state.stats.occupancyCopiesRequired or 0,
+      state.stats.neighborLookupHits or 0,
+      state.stats.neighborLookupMisses or 0),
+    ("MAP FLUSH/WAIT/READY %d/%d/%d %s"):format(
+      state.stats.mapTransitionFlushes or 0,
+      state.stats.mapTransitionWaitTicks or 0,
+      state.stats.mapTransitionReady or 0,
+      state.mapTransition and "WAIT" or "OK"),
+    ("CROSS FB CELLS/STOP/HIT-SKIP %d/%d/%d"):format(
+      state.stats.crossFallbackCellsTested or 0,
+      state.stats.crossFallbackBudgetStops or 0,
+      state.stats.crossFallbackBudgetExhaustedSkips or 0),
     ("EXIT CHEAP/A*/DEFER %d/%d/%d"):format(
       state.stats.exitCandidatesCheap or 0,
       state.stats.exitCandidatesPathScored or 0,
       state.stats.exitCandidatesDeferred or 0),
+    ("PREVIEW CTX/PTS %d/%d  HOLD-SKIP %d"):format(
+      state.stats.flatPreviewContextBuilds or 0,
+      state.stats.flatPreviewPointTransforms or 0,
+      state.stats.holdRetargetSkips or 0),
     "TICK " .. tostring(state.tick),
     ("VOXEL %d  RAY %d  COLUMN %d"):format(
       state.stats.voxelTargets or 0, state.stats.voxelRayTargets or 0,
@@ -8823,7 +9041,7 @@ local function diagnostics()
       local p, name = ControlsFree.pathBudgetProfile()
       return {
         mode = name, label = p.label, nodes = p.nodes,
-        seams = p.seams, exits = p.exits,
+        seams = p.seams, exits = p.exits, crossTargets = p.crossTargets,
       }
     end)(),
     voxelPathRate = {
