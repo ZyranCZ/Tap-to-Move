@@ -1,4 +1,4 @@
--- Tap to Move v1.5.4
+-- Tap to Move v1.5.7
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,7 +9,7 @@
 
 local mod = ...
 
-local VERSION = "1.5.4"
+local VERSION = "1.5.7"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 150 -- 1X base; scaled by live overworld logic speed
@@ -288,6 +288,11 @@ local state = {
     crossFallbackCellsTested = 0,
     crossFallbackBudgetStops = 0,
     crossFallbackBudgetExhaustedSkips = 0,
+    crossLocalFallbackAttempts = 0,
+    crossLocalFallbackAccepted = 0,
+    crossLocalFallbackRejected = 0,
+    crossLocalDirectPath = 0,
+    crossLocalNearestPath = 0,
     exitCandidatesCheap = 0,
     exitCandidatesPathScored = 0,
     exitCandidatesDeferred = 0,
@@ -2197,6 +2202,115 @@ local function nearestReachableCrossTarget(game, cur, cross, desiredX, desiredY,
     end
   end
   return nil
+end
+
+-- Graceful bounded-preset fallback for a single click into a visible connected
+-- map. If a full cross-map route is too expensive for VERY LOW/MEDIUM, keep
+-- player control by walking toward the corresponding edge point on the CURRENT
+-- map instead of rejecting the click. This performs exactly one bounded
+-- nearest-reachable search and never attempts a map crossing.
+function ControlsFree.currentMapTowardCrossFallback(game, cur, overview, cross,
+                                                    desiredX, desiredY)
+  if not (cur and overview and cross) then return nil end
+  state.stats.crossLocalFallbackAttempts =
+    (state.stats.crossLocalFallbackAttempts or 0) + 1
+
+  local off = (cross.conn and cross.conn.offset or 0) * 2
+  local edgeX, edgeY
+  if cross.dir == "up" then
+    edgeX = desiredX + off
+    edgeY = 0
+  elseif cross.dir == "down" then
+    edgeX = desiredX + off
+    edgeY = overview.height - 1
+  elseif cross.dir == "left" then
+    edgeX = 0
+    edgeY = desiredY + off
+  elseif cross.dir == "right" then
+    edgeX = overview.width - 1
+    edgeY = desiredY + off
+  else
+    state.stats.crossLocalFallbackRejected =
+      (state.stats.crossLocalFallbackRejected or 0) + 1
+    return nil
+  end
+
+  edgeX = math.max(0, math.min((overview.width or 1) - 1,
+    math.floor(edgeX or cur.x)))
+  edgeY = math.max(0, math.min((overview.height or 1) - 1,
+    math.floor(edgeY or cur.y)))
+
+  local map = game and game.overworld and game.overworld.map
+  local topology = ledgeTopology(game, map, overview)
+  local occupied = select(1, liveOccupancy(game))
+  local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
+
+  -- First use normal heuristic A*. This is the crucial difference from
+  -- v1.5.5: a 128-node VERY LOW budget is spent TOWARD the clicked edge rather
+  -- than as an isotropic Dijkstra flood around the player.
+  local path = findPath(
+    overview, cur.x, cur.y, edgeX, edgeY, waterMode,
+    occupied, nil, topology.blockedEdges, nil, topology.jumps)
+
+  local bx, by = edgeX, edgeY
+  if path then
+    state.stats.crossLocalDirectPath =
+      (state.stats.crossLocalDirectPath or 0) + 1
+  else
+    -- If the exact border cell is obstructed/disconnected, allow one bounded
+    -- nearest-reachable search. This is the only secondary search and never
+    -- crosses into the neighbour map.
+    path, bx, by = findClosestReachablePath(
+      overview, cur.x, cur.y, edgeX, edgeY, waterMode,
+      occupied, nil, topology.blockedEdges, nil, topology.jumps)
+    if path and bx and by then
+      state.stats.crossLocalNearestPath =
+        (state.stats.crossLocalNearestPath or 0) + 1
+    end
+  end
+
+  if not path or not bx or not by or #path == 0
+      or (bx == cur.x and by == cur.y) then
+    state.stats.crossLocalFallbackRejected =
+      (state.stats.crossLocalFallbackRejected or 0) + 1
+    return nil
+  end
+
+  -- This helper appears before the normal local navigation constructor,
+  -- so construct the equivalent record here instead of depending on local
+  -- declaration order.
+  local nav = {
+    mapId = cur.mapId,
+    targetX = nil,
+    targetY = nil,
+    path = nil,
+    index = 1,
+    blockedEdges = {},
+    blockedCells = {},
+    tempBlocked = {},
+    lastX = cur.x,
+    lastY = cur.y,
+    lastProgressTick = state.tick,
+    phase = "PLANNING",
+    createdTick = state.tick,
+  }
+  nav.goalKind = "move_nearest"
+  nav.targetX, nav.targetY = bx, by
+  nav.requestedMapId = cross.destMapId
+  nav.requestedX, nav.requestedY = desiredX, desiredY
+  nav.path = path
+  nav.index = 1
+  nav.lastX, nav.lastY = cur.x, cur.y
+  nav.lastProgressTick = state.tick
+  nav.needsReplan = false
+  nav.waitUntil = nil
+  nav.dynamicWaitStarted = nil
+  nav.previewUntil = state.tick + 18
+  setPhase(nav, "WALKING", "cross_budget_local_fallback")
+
+  state.stats.crossLocalFallbackAccepted =
+    (state.stats.crossLocalFallbackAccepted or 0) + 1
+  return nav
 end
 
 local function buildCrossPath(game, nav, cur)
@@ -4497,6 +4611,17 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
         game, cur, cross, rawTx, rawTy,
         continuous and rawInteraction ~= nil)
       if not nx then
+        if not continuous and ControlsFree.crossTargetCandidateLimit() ~= nil then
+          local localFallback = ControlsFree.currentMapTowardCrossFallback(
+            game, cur, overview, cross, rawTx, rawTy)
+          if localFallback then
+            if oldNav then cancelRoute("retargeted") end
+            state.nav = localFallback
+            state.stats.routesStarted = state.stats.routesStarted + 1
+            routeFeedback(showFeedback, "accepted", screenX, screenY)
+            return true
+          end
+        end
         state.stats.invalidTaps = state.stats.invalidTaps + 1
         if continuous and oldNav then
           state.stats.retainedTargets = state.stats.retainedTargets + 1
@@ -4559,6 +4684,22 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
         and ControlsFree.crossTargetCandidateLimit() ~= nil then
       state.stats.crossFallbackBudgetExhaustedSkips =
         (state.stats.crossFallbackBudgetExhaustedSkips or 0) + 1
+    end
+
+    -- A bounded preset is allowed to give up on the expensive cross-map
+    -- interpretation, but a single click must still produce useful movement.
+    -- Fall back to one current-map nearest-reachable search toward the same
+    -- visual direction. HOLD is intentionally excluded; its continuous
+    -- steering behavior already remains responsive.
+    if not buildStatus and not continuous
+        and not crossInteraction and semanticKind ~= "door"
+        and ControlsFree.crossTargetCandidateLimit() ~= nil then
+      local localFallback = ControlsFree.currentMapTowardCrossFallback(
+        game, cur, overview, cross, rawTx, rawTy)
+      if localFallback then
+        candidate = localFallback
+        buildStatus, buildWhy = true, nil
+      end
     end
   else
     -- A cell may intentionally be BOTH a background interaction and a real
@@ -8907,6 +9048,12 @@ local function drawDebug()
       state.stats.crossFallbackCellsTested or 0,
       state.stats.crossFallbackBudgetStops or 0,
       state.stats.crossFallbackBudgetExhaustedSkips or 0),
+    ("CROSS LOCAL TRY/OK/NO %d/%d/%d D/N %d/%d"):format(
+      state.stats.crossLocalFallbackAttempts or 0,
+      state.stats.crossLocalFallbackAccepted or 0,
+      state.stats.crossLocalFallbackRejected or 0,
+      state.stats.crossLocalDirectPath or 0,
+      state.stats.crossLocalNearestPath or 0),
     ("EXIT CHEAP/A*/DEFER %d/%d/%d"):format(
       state.stats.exitCandidatesCheap or 0,
       state.stats.exitCandidatesPathScored or 0,
