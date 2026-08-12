@@ -1,7 +1,7 @@
 {
   "id": "tap_to_move",
   "name": "Tap to Move",
-  "version": "1.5.7",
+  "version": "2.0.0",
   "entry": "main.lua",
   "api": 2,
   "category": "GAMEPLAY",
@@ -16,5 +16,9 @@
   "github": "ZyranCZ/Tap-to-Move",
   "permissions": [
     "engine_internals"
+  ],
+  "games": [
+    "gen1",
+    "gold"
   ]
 }

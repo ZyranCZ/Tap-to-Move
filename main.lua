@@ -1,4 +1,4 @@
--- Tap to Move v1.5.7
+-- Tap to Move v2.0.0
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,7 +9,7 @@
 
 local mod = ...
 
-local VERSION = "1.5.7"
+local VERSION = "2.0.0"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 150 -- 1X base; scaled by live overworld logic speed
@@ -242,6 +242,7 @@ local state = {
   pendingInteraction = nil,
   battleResume = nil,
   exitJourney = nil,
+  pendingRemoteGoal = nil,
   previewCache = nil,
   mapTransition = nil,
   gestureTouches = {},
@@ -293,6 +294,11 @@ local state = {
     crossLocalFallbackRejected = 0,
     crossLocalDirectPath = 0,
     crossLocalNearestPath = 0,
+    remoteConnectionTargets = 0,
+    remoteConnectionLegs = 0,
+    remoteConnectionReplans = 0,
+    remoteConnectionRejects = 0,
+    remoteConnectionStaticChecks = 0,
     exitCandidatesCheap = 0,
     exitCandidatesPathScored = 0,
     exitCandidatesDeferred = 0,
@@ -621,7 +627,62 @@ local function captureView(ctx)
     wh = tonumber(ctx.wh) or (ph and ph / dpiY) or nil,
     worldActive = ctx.worldActive == true,
     worldOverride = ctx.worldOverride and true or false,
+    generation = tonumber(ctx.generation),
   }
+
+  -- Gold's camera is advanced inside World:draw(), before render.compose is
+  -- raised.  Snapshot the exact camera/zoom/perspective geometry that produced
+  -- THIS visible frame instead of re-reading mutable presentation state later
+  -- from input.pointer.  This fixes two alignment hazards at once:
+  --   * flat Gold floors the rendered map origin to an integer screen pixel;
+  --   * TILT grows the ground capture beyond the window, projects inside that
+  --     larger canvas, then crops it back with a negative centred translation.
+  -- A pointer should invert the frame the player actually saw, not a close
+  -- approximation of the next frame's camera.
+  if state.frame.generation == 2 and state.frame.worldActive
+      and not state.frame.worldOverride then
+    local game = state.game
+    local world = game and game.world
+    if world and world.map and world.camera and type(world.zoomScale) == "function" then
+      local okScale, goldScale = pcall(world.zoomScale, world)
+      goldScale = okScale and tonumber(goldScale) or nil
+      local ww, wh = tonumber(state.frame.ww), tonumber(state.frame.wh)
+      if goldScale and goldScale > 0 and ww and wh and ww > 0 and wh > 0 then
+        local captureW, captureH = ww, wh
+        local cropX, cropY = 0, 0
+        local tiltActive, tiltAngle, tiltFocal = false, 0, 1
+        local okTilt, Tilt = pcall(require, "src.render.Tilt")
+        if okTilt and type(Tilt) == "table"
+            and type(Tilt.active) == "function" and Tilt.active() == true then
+          tiltActive = true
+          tiltAngle = tonumber(Tilt.angle) or 0
+          tiltFocal = tonumber(Tilt.FOCAL) or 1
+          if type(Tilt.viewGrowth) == "function" then
+            local okGrowth, growth = pcall(Tilt.viewGrowth)
+            growth = okGrowth and tonumber(growth) or nil
+            if growth and growth > 0 then
+              captureW, captureH = math.ceil(ww * growth), math.ceil(wh * growth)
+              cropX, cropY = (ww - captureW) / 2, (wh - captureH) / 2
+            end
+          end
+        end
+        local cameraX = tonumber(world.camera.x) or 0
+        local cameraY = tonumber(world.camera.y) or 0
+        state.frame.gold = {
+          mapId = world.map.id,
+          scale = goldScale,
+          cameraX = cameraX, cameraY = cameraY,
+          -- World:drawGround uses these exact integer origins.
+          originX = math.floor(-cameraX * goldScale),
+          originY = math.floor(-cameraY * goldScale),
+          windowW = ww, windowH = wh,
+          captureW = captureW, captureH = captureH,
+          cropX = cropX, cropY = cropY,
+          tiltActive = tiltActive, tiltAngle = tiltAngle, tiltFocal = tiltFocal,
+        }
+      end
+    end
+  end
 
   if not ctx.worldActive or not ctx.worldCanvas or ctx.worldOverride then
     state.view = nil
@@ -654,22 +715,190 @@ local function captureView(ctx)
   }
 end
 
-local function overworldGate(game)
+-- Generation boundary ---------------------------------------------------------
+-- Gold is a separate overworld engine. Keep every generation-specific read
+-- behind this narrow adapter so the shared planner never has to know whether
+-- its grid came from Gen I tiles or Gen II COLL_* permissions.
+local WorldBackend = { gen1 = {}, gold = {} }
+
+function WorldBackend.isGold(game)
+  return game ~= nil and game.world ~= nil and game.overworld == nil
+end
+
+function WorldBackend.forGame(game)
+  return WorldBackend.isGold(game) and WorldBackend.gold or WorldBackend.gen1
+end
+
+function WorldBackend.gen1.owner(game) return game and game.overworld or nil end
+function WorldBackend.gen1.player(game)
+  local ow = WorldBackend.gen1.owner(game)
+  return ow and ow.player or nil
+end
+function WorldBackend.gen1.map(game)
+  local ow = WorldBackend.gen1.owner(game)
+  return ow and ow.map or nil
+end
+function WorldBackend.gen1.overview(game)
+  return mod.world and mod.world.mapOverview and mod.world:mapOverview() or nil
+end
+function WorldBackend.gen1.mapDefinitions(game)
+  return game and game.data and game.data.maps or {}
+end
+function WorldBackend.gen1.defLooksOutdoor(_, def)
+  if not def then return false end
+  if def.outdoor ~= nil then return def.outdoor == true end
+  local env = def.environment
+  if env then return env == "TOWN" or env == "ROUTE" or env == "OUTDOOR" end
+  return false
+end
+
+function WorldBackend.gold.owner(game) return game and game.world or nil end
+function WorldBackend.gold.player(game)
+  local world = WorldBackend.gold.owner(game)
+  return world and world.player or nil
+end
+function WorldBackend.gold.map(game)
+  local world = WorldBackend.gold.owner(game)
+  return world and world.map or nil
+end
+function WorldBackend.gold.permissionsModule()
+  if ControlsFree.goldPermissions ~= nil then
+    return ControlsFree.goldPermissions or nil
+  end
+  local ok, module = pcall(require, "src.world.gen2.Permissions")
+  ControlsFree.goldPermissions = ok and module or false
+  return ok and module or nil
+end
+function WorldBackend.gold.fieldMovesModule()
+  if ControlsFree.goldFieldMoves ~= nil then
+    return ControlsFree.goldFieldMoves or nil
+  end
+  local ok, module = pcall(require, "src.world.gen2.FieldMoves")
+  ControlsFree.goldFieldMoves = ok and module or false
+  return ok and module or nil
+end
+function WorldBackend.gold.hiddenItemsModule()
+  if ControlsFree.goldHiddenItems ~= nil then
+    return ControlsFree.goldHiddenItems or nil
+  end
+  local ok, module = pcall(require, "src.world.gen2.HiddenItems")
+  ControlsFree.goldHiddenItems = ok and module or false
+  return ok and module or nil
+end
+function WorldBackend.gold.mapModule()
+  if ControlsFree.goldMapModule ~= nil then
+    return ControlsFree.goldMapModule or nil
+  end
+  local ok, module = pcall(require, "src.world.gen2.Map")
+  ControlsFree.goldMapModule = ok and module or false
+  return ok and module or nil
+end
+function WorldBackend.gold.mapDefinitions(game)
+  local world = WorldBackend.gold.owner(game)
+  return world and world.maps or {}
+end
+function WorldBackend.gold.defLooksOutdoor(_, def)
+  local env = def and def.environment
+  return env == "TOWN" or env == "ROUTE"
+end
+function WorldBackend.gold.isSurfing(game)
+  local world = WorldBackend.gold.owner(game)
+  local field = WorldBackend.gold.fieldMovesModule()
+  if not (world and field and type(field.isSurfing) == "function") then return false end
+  return field.isSurfing(world.playerState) == true
+end
+function ControlsFree.goldNativeForcedDirection(game)
+  if not WorldBackend.isGold(game) then return nil end
+  local world = WorldBackend.gold.owner(game)
+  local player = WorldBackend.gold.player(game)
+  local map = WorldBackend.gold.map(game)
+  local P = WorldBackend.gold.permissionsModule()
+  if not (world and player and map and P and type(map.cellCollision) == "function") then
+    return nil
+  end
+  local ok, coll = pcall(map.cellCollision, map, player.cellX, player.cellY)
+  if not ok then return nil end
+  local dir
+  if type(P.currentDirection) == "function" then dir = P.currentDirection(coll) end
+  if not dir and type(P.doorForcedDirection) == "function" then
+    dir = P.doorForcedDirection(coll)
+  end
+  if not dir and type(P.isIce) == "function" and P.isIce(coll) then
+    dir = world.turningDirection
+  end
+  return dir
+end
+function WorldBackend.gold.warpFiresAt(game, map, x, y)
+  local P = WorldBackend.gold.permissionsModule()
+  if not (P and map and type(map.cellCollision) == "function") then return false end
+  local ok, coll = pcall(map.cellCollision, map, x, y)
+  if not ok then return false end
+  return (type(P.isWarpCollision) == "function" and P.isWarpCollision(coll) == true)
+      or (type(P.carpetDirection) == "function" and P.carpetDirection(coll) ~= nil)
+end
+function WorldBackend.gold.overview(game)
+  local map = WorldBackend.gold.map(game)
+  local P = WorldBackend.gold.permissionsModule()
+  if not (map and P) then return nil end
+  local width = tonumber(map.widthCells) or (tonumber(map.width) and map.width * 2)
+  local height = tonumber(map.heightCells) or (tonumber(map.height) and map.height * 2)
+  if not width or not height or width <= 0 or height <= 0 then return nil end
+  -- Gold's collision grid is integral. Canonicalising avoids textual A* keys
+  -- such as `5` versus `5.0` if a custom/test map supplied float dimensions.
+  width, height = math.floor(width), math.floor(height)
+  local rows = {}
+  for y = 0, height - 1 do
+    local chars = {}
+    for x = 0, width - 1 do
+      local ch = " "
+      local ok, coll = pcall(map.cellCollision, map, x, y)
+      if ok and coll ~= nil then
+        if WorldBackend.gold.warpFiresAt(game, map, x, y)
+            and type(map.warpAt) == "function" and map:warpAt(x, y) then
+          ch = "+"
+        elseif type(P.isWhirlpool) == "function" and P.isWhirlpool(coll) then
+          -- HM06 is deliberately outside the first Gold automation scope.
+          -- Its COLL_* byte has WATER permission, so a plain water test would
+          -- incorrectly route straight through the obstacle.
+          ch = " "
+        elseif type(P.currentDirection) == "function" and P.currentDirection(coll) ~= nil then
+          -- $3x currents (including waterfall/down-current cells) are owned by
+          -- the native forced-movement model below.  Keeping them out of the
+          -- ordinary water grid prevents A* from walking against the current;
+          -- a validated special FORCED edge is the only way through.
+          ch = " "
+        elseif type(P.isWater) == "function" and P.isWater(coll) then
+          ch = "~"
+        elseif type(P.isWalkable) == "function" and P.isWalkable(coll) then
+          ch = "."
+        end
+      end
+      chars[#chars + 1] = ch
+    end
+    rows[#rows + 1] = table.concat(chars)
+  end
+  return { mapId = map.id, width = width, height = height, rows = rows }
+end
+
+function WorldBackend.owner(game) return WorldBackend.forGame(game).owner(game) end
+function WorldBackend.player(game) return WorldBackend.forGame(game).player(game) end
+function WorldBackend.map(game) return WorldBackend.forGame(game).map(game) end
+function WorldBackend.overview(game) return WorldBackend.forGame(game).overview(game) end
+function WorldBackend.mapDefinitions(game)
+  return WorldBackend.forGame(game).mapDefinitions(game)
+end
+function WorldBackend.defLooksOutdoor(game, def)
+  return WorldBackend.forGame(game).defLooksOutdoor(game, def)
+end
+
+function WorldBackend.gen1.isControllable(game)
   if not game or not game.overworld or not game.stack
       or type(game.stack.top) ~= "function" then
     return false, "no_overworld"
   end
-
   local ow = game.overworld
   if game.stack:top() ~= ow then return false, "overlay_or_battle" end
   if ow.transitioning then return false, "transition" end
-
-  -- Cycling Road's slope owns movement whenever the bicycle is mounted and
-  -- the player is not braking.  Competing with that engine-owned forced move
-  -- would make a planned route nondeterministic, so fail closed on any map
-  -- listed in the running data's forcedMovement.slopeMaps.  This is data-
-  -- driven rather than hard-coding Route 16/17/18 names, so modded maps can
-  -- opt into the same rule.
   local fm = game.data and game.data.field and game.data.field.forcedMovement
   if game.save and game.save.onBike and fm and fm.slopeMaps and ow.map then
     for _, mapId in ipairs(fm.slopeMaps) do
@@ -681,12 +910,39 @@ local function overworldGate(game)
   if ow.runner and ow.runner.isRunning and ow.runner:isRunning() then
     return false, "script"
   end
-
   local player = ow.player
   if player and player.inputLocked then return false, "input_locked" end
   if player and player.spinning then return false, "forced_movement" end
   if player and player.fishing then return false, "fishing" end
   return true
+end
+
+function WorldBackend.gold.isControllable(game)
+  local world = WorldBackend.gold.owner(game)
+  local player = WorldBackend.gold.player(game)
+  if not (game and world and world.map and player) then return false, "no_gold_world" end
+  if game.phase ~= nil and game.phase ~= "play" then return false, "not_play_phase" end
+  if game.stack and type(game.stack.top) == "function" and game.stack:top() ~= nil then
+    return false, "overlay_or_battle"
+  end
+  if type(world.busy) == "function" then
+    local ok, busy = pcall(world.busy, world)
+    if not ok then return false, "busy_unknown" end
+    if busy then return false, "world_busy" end
+  end
+  if world.mapSetup or world.pendingWarp or world.pendingSceneScript then
+    return false, "transition"
+  end
+  if world.fishing or world.headbutt or world.fieldMove or world.queuedFieldMove
+      or world.queuedScript or world.moveState then
+    return false, "native_action"
+  end
+  return true
+end
+
+local function overworldGate(game)
+  local backend = WorldBackend.forGame(game)
+  return backend.isControllable(game)
 end
 
 local function releaseHold(nav)
@@ -734,6 +990,22 @@ local function finishRoute()
   local nav = state.nav
   if not nav then return end
   releaseHold(nav)
+
+  -- Gold endpoint interaction is deliberately a SECOND-STAGE decision.  The
+  -- proven test7 movement core first reaches its ordinary destination.  Only
+  -- after the player is genuinely stationary do we ask whether the original
+  -- tap was probably aimed at an adjacent native interaction surface (PC, NPC,
+  -- sign/fixture/counter, item ball or hidden treasure).  Keeping this out of
+  -- initial route classification means a missed semantic hit can never break
+  -- ordinary Tap to Move or Smart Exit.
+  if ControlsFree.goldPromoteEndpointInteraction and state.game and WorldBackend.isGold(state.game) then
+    local cur = mod.world and mod.world:current()
+    if cur and cur.mapId == nav.mapId
+        and ControlsFree.goldPromoteEndpointInteraction(state.game, nav, cur) then
+      return
+    end
+  end
+
   state.stats.routesArrived = state.stats.routesArrived + 1
   markStop("arrived", nav)
   state.nav = nil
@@ -764,44 +1036,50 @@ end
 -- Returns three sets: all occupied cells, cells occupied by actors that can
 -- move away (wandering or currently moving), and static blocking entities.
 local function liveOccupancy(game)
-  local ow = game and game.overworld
+  local backend = WorldBackend.forGame(game)
+  local owner = backend.owner(game)
+  local entities = owner and (owner.npcs or owner.entities) or nil
   local cache = ControlsFree.occupancyCache
-  if cache and cache.tick == state.tick and cache.ow == ow
-      and cache.npcs == (ow and ow.npcs) then
+  if cache and cache.tick == state.tick and cache.ow == owner
+      and cache.npcs == entities then
     state.stats.occupancyCacheHits = (state.stats.occupancyCacheHits or 0) + 1
     return cache.all, cache.dynamic, cache.static
   end
 
   local all, dynamic, static = {}, {}, {}
-  for _, entity in ipairs((ow and ow.npcs) or {}) do
-    if not entity.passable then
+  for _, entity in ipairs(entities or {}) do
+    if entity ~= WorldBackend.player(game) and not entity.passable then
       local isDynamic = entity.wanders == true or entity.moving == true
+          or entity.pattern == "walk"
       local dst = isDynamic and dynamic or static
       local function add(x, y)
         if type(x) == "number" and type(y) == "number" then
-          local k = key(x, y)
-          all[k] = true
-          dst[k] = true
+          local function put(px, py)
+            local k = key(px, py)
+            all[k] = true; dst[k] = true
+          end
+          put(x, y)
+          if WorldBackend.isGold(game) and entity.bigObject then
+            put(x + 1, y); put(x, y + 1); put(x + 1, y + 1)
+          end
         end
       end
       add(entity.cellX, entity.cellY)
       add(entity.targetX, entity.targetY)
     end
   end
-
   ControlsFree.occupancyCache = {
-    tick = state.tick, ow = ow, npcs = ow and ow.npcs,
+    tick = state.tick, ow = owner, npcs = entities,
     all = all, dynamic = dynamic, static = static,
   }
-  state.stats.occupancyCacheMisses =
-    (state.stats.occupancyCacheMisses or 0) + 1
+  state.stats.occupancyCacheMisses = (state.stats.occupancyCacheMisses or 0) + 1
   return all, dynamic, static
 end
 
 local function entityById(game, id)
-  local ow = game and game.overworld
-  for _, entity in ipairs((ow and ow.npcs) or {}) do
-    if entity.id == id then return entity end
+  local owner = WorldBackend.owner(game)
+  for _, entity in ipairs((owner and (owner.npcs or owner.entities)) or {}) do
+    if entity.id == id or (entity.def and entity.def.index == id) then return entity end
   end
   return nil
 end
@@ -810,14 +1088,21 @@ local function entityIsInteractable(entity)
   if not entity or entity.passable then return false end
   if entity.pikachuFollower then return true end
   local def = entity.def or {}
-  -- Strength boulders are movement puzzles, not tap-to-talk targets.
   if def.pushable == true or def.sprite == "SPRITE_BOULDER" then return false end
   return def.text ~= nil or def.item ~= nil or def.pokemon ~= nil
       or def.trainer ~= nil or def.trainerClass ~= nil or def.script ~= nil
 end
 
+function WorldBackend.gold.entityIsInteractable(entity)
+  if not entity or entity.passable then return false end
+  local def = entity.def or {}
+  if def.pushable == true or def.movement == 0x19 then return false end
+  return def.trainer ~= nil or def.itemball ~= nil or def.scriptKey ~= nil
+      or def.script ~= nil or def.std ~= nil
+end
+
 local function counterAt(game, x, y)
-  local map = game and game.overworld and game.overworld.map
+  local map = WorldBackend.map(game)
   if not map or type(map.isCounterCell) ~= "function" then return false end
   local ok, yes = pcall(map.isCounterCell, map, x, y)
   return ok and yes == true
@@ -842,6 +1127,7 @@ local function fieldRows(game, keyName, mapId)
 end
 
 local function staticInteractionAt(game, mapId, map, x, y)
+  if WorldBackend.isGold(game) then return nil end
   local function hit(kind, rows, facingFn)
     for _, row in ipairs(rows or {}) do
       if tonumber(row.x) == x and tonumber(row.y) == y then
@@ -915,7 +1201,108 @@ end
 -- This mirrors OverworldState:tryHiddenObject without calling it remotely:
 -- normal A at arrival is still what actually awards the item/coins and marks
 -- save.hiddenTaken.
+function WorldBackend.gold.bgInteractionAt(game, x, y)
+  local world = WorldBackend.gold.owner(game)
+  local map = world and world.map
+  local required = { [1] = "up", [2] = "down", [3] = "right", [4] = "left" }
+  for _, ev in ipairs((map and map.def and map.def.bgEvents) or {}) do
+    if tonumber(ev.x) == x and tonumber(ev.y) == y then
+      local kind = tonumber(ev.kind or 0) or 0
+      -- Item bg events are secret treasure and are intentionally handled only
+      -- by the exact-tap hidden-item path below.
+      if kind == 7 or kind == 8 or not (ev.scriptKey or ev.script) then return nil end
+      if kind == 5 or kind == 6 then
+        if not ev.event then return nil end
+        local set = false
+        if world.events and type(world.events.get) == "function" then
+          local ok, value = pcall(world.events.get, world.events, ev.event)
+          set = ok and value == true
+        end
+        if (kind == 5) ~= set then return nil end
+      elseif kind ~= 0 and not required[kind] then
+        return nil
+      end
+      return { kind = "gold_bg", x = x, y = y, mapId = map.id,
+               requiredFacing = required[kind], clickedX = x, clickedY = y,
+               goldBgEvent = true }
+    end
+  end
+  return nil
+end
+
+-- Gold TileCollisionStdScripts (data/collision/collision_stdscripts.asm).
+-- These are NOT bgEvents.  Pokecenter PCs in particular exist only through
+-- COLL_PC -> PCScript, so a semantic picker that scans objects/bgEvents alone
+-- can never recognize the computer the player is visibly tapping.
+WorldBackend.gold.stdCollisionSemantics = {
+  [0x91] = "bookshelf",       -- COLL_BOOKSHELF
+  [0x93] = "pc",              -- COLL_PC
+  [0x94] = "radio",           -- COLL_RADIO
+  [0x95] = "town_map",        -- COLL_TOWN_MAP
+  [0x96] = "mart_shelf",      -- COLL_MART_SHELF
+  [0x97] = "tv",              -- COLL_TV
+  [0x9d] = "window",          -- COLL_WINDOW
+  [0x9f] = "incense_burner",  -- COLL_INCENSE_BURNER
+}
+
+function WorldBackend.gold.stdCollisionInteractionAt(game, x, y)
+  local world = WorldBackend.gold.owner(game)
+  local map = world and world.map
+  if not (map and type(map.cellCollision) == "function") then return nil end
+  local ok, coll = pcall(map.cellCollision, map, x, y)
+  if not ok then return nil end
+  coll = tonumber(coll)
+  local semantic = coll and WorldBackend.gold.stdCollisionSemantics[coll % 256] or nil
+  if not semantic then return nil end
+  return { kind = "gold_std_collision", semantic = semantic,
+           collision = coll % 256, x = x, y = y, mapId = map.id,
+           clickedX = x, clickedY = y, goldStdCollision = true }
+end
+
+function WorldBackend.gold.interactionAt(game, x, y)
+  local world = WorldBackend.gold.owner(game)
+  local map = world and world.map
+  if not (world and map) then return nil end
+  local entity
+  if type(world.npcAt) == "function" then
+    local ok, found = pcall(world.npcAt, world, x, y)
+    if ok then entity = found end
+  end
+  if entity and WorldBackend.gold.entityIsInteractable(entity) then
+    return entityInteraction(entity, x, y)
+  end
+  local std = WorldBackend.gold.stdCollisionInteractionAt(game, x, y)
+  if std then return std end
+  local fixed = WorldBackend.gold.bgInteractionAt(game, x, y)
+  if fixed then return fixed end
+  if counterAt(game, x, y) and type(world.npcAt) == "function" then
+    for _, d in ipairs(DIRS) do
+      local ok, found = pcall(world.npcAt, world, x + d.dx, y + d.dy)
+      if ok and found and WorldBackend.gold.entityIsInteractable(found) then
+        local out = entityInteraction(found, x, y)
+        out.counterProxy = true
+        out.preferredFacing = d.name
+        return out
+      end
+    end
+  end
+  return nil
+end
+
 local function hiddenTreasureInteractionAt(game, mapId, x, y)
+  if WorldBackend.isGold(game) then
+    local world = WorldBackend.gold.owner(game)
+    local map = world and world.map
+    if not (map and map.id == mapId) then return nil end
+    local Hidden = WorldBackend.gold.hiddenItemsModule()
+    if not (Hidden and type(Hidden.at) == "function") then return nil end
+    local ok, row = pcall(Hidden.at, map.def, x, y, world.events)
+    if not ok or not row then return nil end
+    return { kind = "hidden_item", x = x, y = y, mapId = mapId,
+             clickedX = x, clickedY = y, hiddenTreasure = true,
+             goldHiddenItem = true }
+  end
+
   local field = game and game.data and game.data.field
   local save = game and game.save
   if not (field and save and mapId and type(x) == "number" and type(y) == "number") then
@@ -923,32 +1310,26 @@ local function hiddenTreasureInteractionAt(game, mapId, x, y)
   end
   local takenKey = mapId .. "_" .. x .. "_" .. y
   if save.hiddenTaken and save.hiddenTaken[takenKey] then return nil end
-
   local function exact(bucket, kind)
     local rows = type(bucket) == "table" and bucket[mapId] or nil
     if type(rows) ~= "table" then return nil end
     for _, row in ipairs(rows) do
       if tonumber(row.x) == x and tonumber(row.y) == y then
-        return {
-          kind = kind,
-          x = x, y = y, mapId = mapId,
-          clickedX = x, clickedY = y,
-          hiddenTreasure = true,
-        }
+        return { kind = kind, x = x, y = y, mapId = mapId,
+                 clickedX = x, clickedY = y, hiddenTreasure = true }
       end
     end
   end
-
   return exact(field.hiddenItems, "hidden_item")
       or exact(field.hiddenCoins, "hidden_coins")
 end
 
 local function interactionAt(game, x, y)
+  if WorldBackend.isGold(game) then
+    return WorldBackend.gold.interactionAt(game, x, y)
+  end
   local ow = game and game.overworld
   if not ow then return nil end
-
-  -- The actor itself wins when the user taps its cell (or its reserved
-  -- landing cell while walking).
   for _, entity in ipairs(ow.npcs or {}) do
     if entityIsInteractable(entity)
         and ((entity.cellX == x and entity.cellY == y)
@@ -956,14 +1337,8 @@ local function interactionAt(game, x, y)
       return entityInteraction(entity, x, y)
     end
   end
-
   local fixed = staticInteractionAt(game, ow.map and ow.map.id, ow.map, x, y)
   if fixed then return fixed end
-
-  -- Counter context: the visible activation surface is often the counter
-  -- tile, while the clerk/nurse actor is one cell farther away.  Tapping the
-  -- counter itself therefore resolves to the actor behind it, exactly as the
-  -- vanilla interact routine performs its second-cell lookup.
   if counterAt(game, x, y) then
     for _, d in ipairs(DIRS) do
       local bx, by = x + d.dx, y + d.dy
@@ -972,10 +1347,7 @@ local function interactionAt(game, x, y)
             and ((entity.cellX == bx and entity.cellY == by)
               or (entity.targetX == bx and entity.targetY == by)) then
           local out = entityInteraction(entity, x, y)
-          out.counterProxy = true
-          -- From the player's side the actor lies in d, so the required
-          -- facing through this counter is d.name.
-          out.preferredFacing = d.name
+          out.counterProxy = true; out.preferredFacing = d.name
           return out
         end
       end
@@ -985,11 +1357,13 @@ local function interactionAt(game, x, y)
 end
 
 -- Fixed hidden-event surfaces that are safe to expose as explicit tap targets.
+-- Fixed hidden-event surfaces that are safe to expose as explicit tap targets.
 -- These are hidden in the Gen I data model (they are not object_event NPCs),
 -- but they are ordinary visible furniture/fixtures: PCs, benches, gym statues,
 -- trash cans and slot machines. Secret floor items/coins are deliberately NOT
 -- listed here, so Tap to Move never reveals treasure the player has not found.
 function ControlsFree.fixedHiddenInteractionCandidates(game, mapId, map)
+  if WorldBackend.isGold(game) then return {} end
   local out, seen = {}, {}
   local function add(x, y)
     x, y = tonumber(x), tonumber(y)
@@ -1052,12 +1426,14 @@ ControlsFree.cutGeometryCache = ControlsFree.cutGeometryCache
   or setmetatable({}, { __mode = "k" })
 
 function ControlsFree.cutEligible(game)
+  if WorldBackend.isGold(game) then return false end
   local ow = game and game.overworld
   return ow and type(ow.partyKnows) == "function"
       and ow:partyKnows("CUT") ~= nil
 end
 
 function ControlsFree.cuttableCells(game, map, overview)
+  if WorldBackend.isGold(game) then return nil end
   if not (ControlsFree.cutEligible(game) and map and overview
       and map.def and type(map.cellTile) == "function"
       and type(map.blockAt) == "function"
@@ -1113,14 +1489,23 @@ function ControlsFree.cuttableAt(game, map, overview, x, y)
   return cells and cells[key(x, y)] == true or false
 end
 
+function WorldBackend.gold.cutTargetAt(game, map, x, y)
+  local P = WorldBackend.gold.permissionsModule()
+  if not (P and map and type(map.cellCollision) == "function"
+      and type(P.isCutTree) == "function") then return false end
+  local ok, coll = pcall(map.cellCollision, map, x, y)
+  return ok and P.isCutTree(coll) == true
+end
+
 function ControlsFree.cutInteractionAt(game, map, overview, x, y)
+  if WorldBackend.isGold(game) then
+    if not WorldBackend.gold.cutTargetAt(game, map, x, y) then return nil end
+    return { kind = "cut_tree", x = x, y = y, mapId = map and map.id,
+             clickedX = x, clickedY = y, cutTarget = true, goldNativeCut = true }
+  end
   if not ControlsFree.cuttableAt(game, map, overview, x, y) then return nil end
-  return {
-    kind = "cut_tree", x = x, y = y,
-    mapId = map and map.id,
-    clickedX = x, clickedY = y,
-    cutTarget = true,
-  }
+  return { kind = "cut_tree", x = x, y = y, mapId = map and map.id,
+           clickedX = x, clickedY = y, cutTarget = true }
 end
 
 local function passable(overview, x, y, goalX, goalY, waterMode,
@@ -1218,6 +1603,9 @@ local function reconstruct(cameFrom, cameVia, goalKey)
     local via = node.via
     if via and via.kind == "ledge" then
       out[#out + 1] = { x = via.midX, y = via.midY, forced = "ledge", dir = via.dir }
+    elseif via and via.kind == "forced" and via.entryX ~= nil then
+      out[#out + 1] = { x = via.entryX, y = via.entryY,
+                        forced = "forced_entry", dir = via.dir }
     end
     out[#out + 1] = { x = node.x, y = node.y, forced = via and via.kind or nil,
                       dir = via and via.dir or nil }
@@ -1306,7 +1694,9 @@ local function findPath(overview, sx, sy, gx, gy, waterMode,
         local nx, ny = jump.x, jump.y
         local nk = key(nx, ny)
         local ch = cellChar(overview, nx, ny)
-        local targetBlocked = not ch
+        local terrainOK = ch == "." or (ch == "~" and waterMode)
+        local targetBlocked = not terrainOK
+          or (jump.requiresWater and not waterMode)
           or (occupied and occupied[nk])
           or (blockedCells and blockedCells[nk])
           or (tempBlocked and tempBlocked[nk] and tempBlocked[nk] > state.tick)
@@ -1408,7 +1798,7 @@ local function findClosestReachablePath(overview, sx, sy, desiredX, desiredY,
 
       for _, jump in ipairs((specialEdges and specialEdges[cur.k]) or {}) do
         local nx, ny = jump.x, jump.y
-        if terrainOK(nx, ny) then
+        if terrainOK(nx, ny) and not (jump.requiresWater and not waterMode) then
           local nk = key(nx, ny)
           local blocked = (occupied and occupied[nk])
             or (blockedCells and blockedCells[nk])
@@ -1469,7 +1859,151 @@ end
 -- explicitly blocked so the planner understands the one-way topology before
 -- runtime collision has to teach it.  Cross-map ledge landings remain owned
 -- by the seam planner; this helper intentionally handles in-map jumps only.
+function WorldBackend.gold.topology(game, map, overview)
+  local topology = { jumps = {}, blockedEdges = {}, seamJumps = {} }
+  local P = WorldBackend.gold.permissionsModule()
+  if not (map and overview and P and type(map.cellCollision) == "function") then
+    return topology
+  end
+
+  local function addJump(x, y, jump)
+    local k = key(x, y)
+    topology.jumps[k] = topology.jumps[k] or {}
+    topology.jumps[k][#topology.jumps[k] + 1] = jump
+  end
+  local function terrain(x, y)
+    local ok, coll = pcall(map.cellCollision, map, x, y)
+    if not ok or coll == nil then return nil end
+    if type(P.isWalkable) == "function" and P.isWalkable(coll) then return "land", coll end
+    if type(P.isWater) == "function" and P.isWater(coll) then return "water", coll end
+    return nil, coll
+  end
+  local function permitted(x, y, dir)
+    if type(map.stepPermitted) ~= "function" then return false end
+    local ok, yes = pcall(map.stepPermitted, map, x, y, dir)
+    return ok and yes == true
+  end
+
+  -- Directed side-wall permissions and native two-cell ledges.
+  for y = 0, overview.height - 1 do
+    for x = 0, overview.width - 1 do
+      local _, coll = terrain(x, y)
+      local ledge = type(P.ledgeFacings) == "function" and P.ledgeFacings(coll) or nil
+      for _, d in ipairs(DIRS) do
+        local nx, ny = x + d.dx, y + d.dy
+        if not permitted(x, y, d.name) then
+          topology.blockedEdges[edgeKey(x, y, nx, ny)] = true
+        end
+        if ledge and ledge[d.name] then
+          local lx, ly = x + d.dx * 2, y + d.dy * 2
+          local kind = terrain(lx, ly)
+          if kind == "land" then
+            addJump(x, y, { kind = "ledge", dir = d.name,
+              x = lx, y = ly, midX = nx, midY = ny, cost = 2 })
+            topology.blockedEdges[edgeKey(lx, ly, nx, ny)] = true
+          end
+        end
+      end
+    end
+  end
+
+  -- A current owns the d-pad. Compress the native forced run into one planner
+  -- edge; the executable path still contains its entry cell, so the mod only
+  -- presses the direction that enters the mechanic and then releases control.
+  local function traceForced(sx, sy, firstDir, fromLand)
+    local d = DIR_BY_NAME[firstDir]
+    if not d then return nil end
+    local x, y = sx, sy
+    local entryX, entryY = sx + d.dx, sy + d.dy
+    local tx, ty = entryX, entryY
+    local steps, requiresWater = 0, false
+    while steps < 128 do
+      local kind, coll = terrain(tx, ty)
+      if not kind then break end
+      if kind == "water" then requiresWater = true end
+      x, y = tx, ty; steps = steps + 1
+      local current = type(P.currentDirection) == "function" and P.currentDirection(coll) or nil
+      if current then
+        local cd = DIR_BY_NAME[current]
+        if not cd or not permitted(x, y, current) then break end
+        tx, ty = x + cd.dx, y + cd.dy
+      elseif type(P.isIce) == "function" and P.isIce(coll) then
+        if not permitted(x, y, firstDir) then break end
+        tx, ty = x + d.dx, y + d.dy
+      else
+        break
+      end
+    end
+    if steps <= 1 then return nil end
+    return { kind = "forced", dir = firstDir, x = x, y = y,
+             entryX = entryX, entryY = entryY, cost = steps,
+             requiresWater = requiresWater }
+  end
+
+  for y = 0, overview.height - 1 do
+    for x = 0, overview.width - 1 do
+      local _, coll = terrain(x, y)
+      local current = type(P.currentDirection) == "function" and P.currentDirection(coll) or nil
+      if current then
+        local jump = traceForced(x - (DIR_BY_NAME[current] and DIR_BY_NAME[current].dx or 0),
+                                 y - (DIR_BY_NAME[current] and DIR_BY_NAME[current].dy or 0),
+                                 current, false)
+        -- The source computed above is only meaningful when it is in-bounds;
+        -- ordinary entry-side construction below handles the general case.
+      end
+      for _, d in ipairs(DIRS) do
+        local ex, ey = x + d.dx, y + d.dy
+        local _, ecoll = terrain(ex, ey)
+        local isIce = type(P.isIce) == "function" and P.isIce(ecoll) or false
+        local forcedDir = type(P.currentDirection) == "function" and P.currentDirection(ecoll) or nil
+        if permitted(x, y, d.name) and (isIce or forcedDir) then
+          -- Current direction overrides entry direction; if they disagree the
+          -- first landing immediately bends. Conservative planner support only
+          -- claims the straight/native direction case; the rest fail closed.
+          local dir = forcedDir or d.name
+          if dir == d.name then
+            local jump = traceForced(x, y, dir, true)
+            if jump then
+              topology.blockedEdges[edgeKey(x, y, ex, ey)] = true
+              addJump(x, y, jump)
+            end
+          end
+        end
+      end
+    end
+  end
+
+  -- If a route is recomputed while the player is already on ice, preserve the
+  -- native latched direction instead of inventing a turn on the ice tile.
+  local world = WorldBackend.gold.owner(game)
+  local player = world and world.player
+  if player and world and world.turningDirection then
+    local _, coll = terrain(player.cellX, player.cellY)
+    if type(P.isIce) == "function" and P.isIce(coll) then
+      local d = DIR_BY_NAME[world.turningDirection]
+      if d then
+        local pseudoX, pseudoY = player.cellX - d.dx, player.cellY - d.dy
+        local jump = traceForced(pseudoX, pseudoY, world.turningDirection, false)
+        if jump then
+          jump.entryX, jump.entryY = player.cellX, player.cellY
+          addJump(player.cellX, player.cellY, jump)
+          for _, od in ipairs(DIRS) do
+            if od.name ~= world.turningDirection then
+              topology.blockedEdges[edgeKey(player.cellX, player.cellY,
+                player.cellX + od.dx, player.cellY + od.dy)] = true
+            end
+          end
+        end
+      end
+    end
+  end
+  return topology
+end
+
 local function ledgeTopology(game, map, overview)
+  if WorldBackend.isGold(game) then
+    return WorldBackend.gold.topology(game, map, overview)
+  end
   local ledges = game and game.data and game.data.field and game.data.field.ledges
   if map and overview then
     local cached = ledgeTopologyCache[map]
@@ -1542,6 +2076,7 @@ local function ledgeTopology(game, map, overview)
 end
 
 local function currentWaterMode(game, overview, cur)
+  if WorldBackend.isGold(game) and WorldBackend.gold.isSurfing(game) then return true end
   local player = game and game.overworld and game.overworld.player
   if player and player.surfing then return true end
   return cellChar(overview, cur.x, cur.y) == "~"
@@ -1551,7 +2086,41 @@ end
 -- Delegate eligibility to Gen1Recomp: partyKnows("SURF") owns the badge +
 -- learned-move check (and fieldmove.eligibility hooks), while the overworld
 -- owns forced-bike and Seafoam-current restrictions.
+function WorldBackend.gold.surfResult(game)
+  local world = WorldBackend.gold.owner(game)
+  local Field = WorldBackend.gold.fieldMovesModule()
+  if not (world and Field and type(world.fieldContext) == "function"
+      and type(Field.trySurfOW) == "function") then return nil end
+  local okCtx, ctx = pcall(world.fieldContext, world)
+  if not okCtx or type(ctx) ~= "table" then return nil end
+  local ok, result = pcall(Field.trySurfOW, ctx)
+  if not ok or type(result) ~= "table" then return nil end
+  if result.ok == true and result.action == "surf" then return result end
+  return nil
+end
+
+function WorldBackend.gold.startNativeSurf(game)
+  local world = WorldBackend.gold.owner(game)
+  local result = WorldBackend.gold.surfResult(game)
+  if not (world and result and type(world.runFieldMove) == "function") then
+    return false, "ineligible"
+  end
+  local ok, ran = pcall(world.runFieldMove, world, result)
+  if not ok or ran == false then return false, "native_rejected" end
+  return true, "native_wait"
+end
+
+function ControlsFree.playerIsSurfing(game)
+  if WorldBackend.isGold(game) then return WorldBackend.gold.isSurfing(game) end
+  local p = game and game.overworld and game.overworld.player
+  return p and p.surfing == true or false
+end
+
 function ControlsFree.seamlessSurfEligible(game)
+  if WorldBackend.isGold(game) then
+    if WorldBackend.gold.isSurfing(game) then return true end
+    return WorldBackend.gold.surfResult(game) ~= nil
+  end
   local ow = game and game.overworld
   local p = ow and ow.player
   if not (ow and p) then return false end
@@ -1571,31 +2140,28 @@ function ControlsFree.routeWaterMode(game, overview, cur)
       or ControlsFree.seamlessSurfEligible(game)
 end
 
--- Mount Surf without the party-menu text/white-flash ceremony. This is called
--- only after the next planned cell is water and the normal direction-facing
--- sequence has settled. The engine's own side-effect-free field-move check is
--- asked one last time, then we apply the same persistent Surf state that
--- OverworldState:trySurf applies before its automatic first step.
 function ControlsFree.mountSurfSeamlessly(game)
+  if WorldBackend.isGold(game) then
+    if WorldBackend.gold.isSurfing(game) then return true end
+    local ok, why = WorldBackend.gold.startNativeSurf(game)
+    if ok then
+      state.stats.seamlessSurfMounts = (state.stats.seamlessSurfMounts or 0) + 1
+    end
+    return ok, why
+  end
   local ow = game and game.overworld
   local p = ow and ow.player
   if not (ow and p) then return false, "no_overworld" end
   if p.surfing then return true end
-  if not ControlsFree.seamlessSurfEligible(game) then
-    return false, "ineligible"
-  end
-
+  if not ControlsFree.seamlessSurfEligible(game) then return false, "ineligible" end
   if type(ow.useSurfFieldMove) == "function" then
     local ok, status = pcall(ow.useSurfFieldMove, ow)
     if not ok then return false, "check_error" end
     if status ~= "ok" then return false, tostring(status or "rejected") end
   end
-
   p.surfing = true
   if game.save then game.save.onBike = false end
-  if type(ow.syncSurfingPikachu) == "function" then
-    pcall(ow.syncSurfingPikachu, ow)
-  end
+  if type(ow.syncSurfingPikachu) == "function" then pcall(ow.syncSurfingPikachu, ow) end
   local okMusic, Music = pcall(require, "src.core.Music")
   if okMusic and Music then
     if ow.map and type(Music.playMap) == "function" then
@@ -1604,20 +2170,15 @@ function ControlsFree.mountSurfSeamlessly(game)
       pcall(Music.setSurfing, game.data, true)
     end
   end
-  state.stats.seamlessSurfMounts =
-    (state.stats.seamlessSurfMounts or 0) + 1
+  state.stats.seamlessSurfMounts = (state.stats.seamlessSurfMounts or 0) + 1
   return true
 end
 
--- PC-style facing discipline for the first land -> water edge:
--- neutral poll -> turn -> verify -> settle -> mount. No D-pad is left held
--- while the player is still on land, so the engine never gets a chance to
--- bonk into water and teach the route a false blocked edge.
 function ControlsFree.prepareSeamlessSurfStep(game, nav, dir)
-  local ow = game and game.overworld
-  local p = ow and ow.player
+  local ow = WorldBackend.owner(game)
+  local p = WorldBackend.player(game)
   if not (p and nav and dir) then return "failed", "no_player" end
-  if p.surfing then
+  if ControlsFree.playerIsSurfing(game) then
     nav.surfFaceNeutralTick, nav.surfFacePressTick = nil, nil
     return "ready"
   end
@@ -1689,12 +2250,16 @@ function ControlsFree.prepareSeamlessSurfStep(game, nav, dir)
   releaseHold(nav)
   local ok, why = ControlsFree.mountSurfSeamlessly(game)
   if not ok then
-    state.stats.seamlessSurfDenied =
-      (state.stats.seamlessSurfDenied or 0) + 1
+    state.stats.seamlessSurfDenied = (state.stats.seamlessSurfDenied or 0) + 1
     return "failed", why
   end
   nav.surfFaceNeutralTick, nav.surfFacePressTick = nil, nil
   nav.surfFaceVerifiedTick, nav.surfFaceRetries = nil, nil
+  if WorldBackend.isGold(game) and why == "native_wait" then
+    nav.goldSurfStartedTick = state.tick
+    setPhase(nav, "WAITING_GOLD_SURF", "gold_native_surf")
+    return "waiting"
+  end
   setPhase(nav, "WALKING", "surf_mounted")
   return "ready"
 end
@@ -1757,13 +2322,13 @@ function ControlsFree.directionalExitTerminalPath(game, nav, cur, overview,
 end
 
 local function buildPath(game, nav, cur)
-  local overview = mod.world and mod.world:mapOverview()
+  local overview = WorldBackend.overview(game)
   if not overview or overview.mapId ~= nav.mapId then return nil, "map" end
 
   local occupied, dynamic, static = liveOccupancy(game)
   cleanupTempBlocks(nav, dynamic)
   local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
-  local activeMap = game.overworld and game.overworld.map
+  local activeMap = WorldBackend.map(game)
   local topology = ledgeTopology(game, activeMap, overview)
   local blockedEdges = mergeBlockedEdges(nav.blockedEdges, topology.blockedEdges)
   local allowExitGoal = nav.goalKind == "exit" and nav.exitIntent ~= nil
@@ -1798,8 +2363,7 @@ local function buildPath(game, nav, cur)
   end
 
   nav.path = path
-  if game and game.overworld and game.overworld.player
-      and not game.overworld.player.surfing then
+  if not ControlsFree.playerIsSurfing(game) then
     for _, node in ipairs(path or {}) do
       if cellChar(overview, node.x, node.y) == "~" then
         state.stats.seamlessSurfPlans =
@@ -1820,13 +2384,13 @@ local function buildPath(game, nav, cur)
 end
 
 local function buildNearestLegalPath(game, nav, cur, desiredX, desiredY)
-  local overview = mod.world and mod.world:mapOverview()
+  local overview = WorldBackend.overview(game)
   if not overview or overview.mapId ~= nav.mapId then return nil, "map" end
 
   local occupied, dynamic, static = liveOccupancy(game)
   cleanupTempBlocks(nav, dynamic)
   local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
-  local activeMap = game.overworld and game.overworld.map
+  local activeMap = WorldBackend.map(game)
   local topology = ledgeTopology(game, activeMap, overview)
   local blockedEdges = mergeBlockedEdges(nav.blockedEdges, topology.blockedEdges)
 
@@ -1941,12 +2505,12 @@ local function bestInteractionApproach(game, nav, cur, overview, occupied, topol
 end
 
 local function buildInteractionPath(game, nav, cur)
-  local overview = mod.world and mod.world:mapOverview()
+  local overview = WorldBackend.overview(game)
   if not overview or overview.mapId ~= nav.mapId then return nil, "map" end
 
   local occupied, dynamic, static = liveOccupancy(game)
   cleanupTempBlocks(nav, dynamic)
-  local topology = ledgeTopology(game, game.overworld and game.overworld.map, overview)
+  local topology = ledgeTopology(game, WorldBackend.map(game), overview)
   local best, why = bestInteractionApproach(game, nav, cur, overview, occupied, topology)
   if not best then
     if why == "gone" then return nil, "gone" end
@@ -2048,10 +2612,10 @@ end
 
 local function chooseCrossSeam(game, nav, cur, occupancy)
   local cross = nav.cross
-  local overview = mod.world and mod.world:mapOverview()
+  local overview = WorldBackend.overview(game)
   if not cross or not overview or overview.mapId ~= cross.sourceMapId then return nil end
   local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
-  local sourceMap = game.overworld and game.overworld.map
+  local sourceMap = WorldBackend.map(game)
   local sourceTopology = ledgeTopology(game, sourceMap, overview)
   local sourceBlockedEdges = mergeBlockedEdges(nav.blockedEdges, sourceTopology.blockedEdges)
   local destTopology = ledgeTopology(game, cross.destMap, cross.destOverview)
@@ -2081,11 +2645,19 @@ local function chooseCrossSeam(game, nav, cur, occupancy)
           -- crossing through a seam that leads into a dead pocket. Runtime
           -- NPC occupancy is intentionally not baked in; it may move before
           -- the crossing and the active-map replan will handle it.
-          local pathThere = findPath(cross.destOverview, lx, ly,
-            cross.targetX, cross.targetY, waterMode, {}, {},
-            destTopology.blockedEdges, {}, destTopology.jumps)
-          if pathThere then
-            local score = #pathHere + 1 + #pathThere
+          local tailScore
+          if nav.remoteGoal and ControlsFree.remoteConnectionTailScore then
+            tailScore = ControlsFree.remoteConnectionTailScore(
+              game, nav.remoteGoal, cross.destMapId, lx, ly,
+              (nav.remoteGoal.routeIndex or 1) + 1, waterMode)
+          else
+            local pathThere = findPath(cross.destOverview, lx, ly,
+              cross.targetX, cross.targetY, waterMode, {}, {},
+              destTopology.blockedEdges, {}, destTopology.jumps)
+            tailScore = pathThere and #pathThere or nil
+          end
+          if tailScore then
+            local score = #pathHere + 1 + tailScore
             if not best or score < best.score then
               best = { score=score, path=pathHere, sourceX=sx, sourceY=sy,
                        entryX=lx, entryY=ly }
@@ -2110,11 +2682,19 @@ local function chooseCrossSeam(game, nav, cur, occupancy)
           jump.sourceX, jump.sourceY, waterMode, occupancy, nav.tempBlocked,
           sourceBlockedEdges, nav.blockedCells, sourceTopology.jumps)
         if pathHere then
-          local pathThere = findPath(cross.destOverview, lx, ly,
-            cross.targetX, cross.targetY, waterMode, {}, {},
-            destTopology.blockedEdges, {}, destTopology.jumps)
-          if pathThere then
-            local score = #pathHere + (jump.cost or 2) + #pathThere
+          local tailScore
+          if nav.remoteGoal and ControlsFree.remoteConnectionTailScore then
+            tailScore = ControlsFree.remoteConnectionTailScore(
+              game, nav.remoteGoal, cross.destMapId, lx, ly,
+              (nav.remoteGoal.routeIndex or 1) + 1, waterMode)
+          else
+            local pathThere = findPath(cross.destOverview, lx, ly,
+              cross.targetX, cross.targetY, waterMode, {}, {},
+              destTopology.blockedEdges, {}, destTopology.jumps)
+            tailScore = pathThere and #pathThere or nil
+          end
+          if tailScore then
+            local score = #pathHere + (jump.cost or 2) + tailScore
             if not best or score < best.score then
               best = { score=score, path=pathHere,
                        sourceX=jump.sourceX, sourceY=jump.sourceY,
@@ -2137,7 +2717,7 @@ end
 local function nearestReachableCrossTarget(game, cur, cross, desiredX, desiredY,
                                            excludeDesired)
   local dest = cross and cross.destOverview
-  local source = mod.world and mod.world:mapOverview()
+  local source = WorldBackend.overview(game)
   if not dest or not source then return nil end
   local waterMode = ControlsFree.routeWaterMode(game, source, cur)
   local all, _, static = liveOccupancy(game)
@@ -2240,7 +2820,7 @@ function ControlsFree.currentMapTowardCrossFallback(game, cur, overview, cross,
   edgeY = math.max(0, math.min((overview.height or 1) - 1,
     math.floor(edgeY or cur.y)))
 
-  local map = game and game.overworld and game.overworld.map
+  local map = WorldBackend.map(game)
   local topology = ledgeTopology(game, map, overview)
   local occupied = select(1, liveOccupancy(game))
   local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
@@ -2315,9 +2895,11 @@ end
 
 local function buildCrossPath(game, nav, cur)
   local all, dynamic, static = liveOccupancy(game)
-  local best = chooseCrossSeam(game, nav, cur, all)
+  local simpleGold = WorldBackend.isGold(game) and nav and nav.goldSimpleRemote
+  local chooser = simpleGold and ControlsFree.chooseGoldSimpleCrossSeam or chooseCrossSeam
+  local best = chooser(game, nav, cur, all)
   if not best then
-    local withoutDynamic = chooseCrossSeam(game, nav, cur, static)
+    local withoutDynamic = chooser(game, nav, cur, static)
     if withoutDynamic then return nil, "dynamic" end
     return nil, "no_route"
   end
@@ -2348,7 +2930,7 @@ local function rebuildNavigation(game, nav, cur)
 end
 
 local function playerPixel(game, cur)
-  local player = game and game.overworld and game.overworld.player
+  local player = WorldBackend.player(game)
   local px = player and tonumber(player.px) or cur.x * TILE_SIZE
   local py = player and tonumber(player.py) or cur.y * TILE_SIZE
   return px, py
@@ -2367,30 +2949,57 @@ local function mapCellSize(def, loaded)
          tonumber(def.height) and def.height * 2 or nil
 end
 
+function WorldBackend.gold.neighborMap(game, mapId)
+  local world = WorldBackend.gold.owner(game)
+  if not (world and mapId) then return nil end
+  if world.map and world.map.id == mapId then return world.map end
+  ControlsFree.goldNeighborMaps = ControlsFree.goldNeighborMaps or {}
+  local cached = ControlsFree.goldNeighborMaps[mapId]
+  if cached and cached.def == (world.maps and world.maps[mapId]) then return cached end
+  local def = world.maps and world.maps[mapId]
+  local Map = WorldBackend.gold.mapModule()
+  if not (def and Map and type(Map.new) == "function") then return nil end
+  local tilesets = world.tilesets or (game and game.data and game.data.gen2Tilesets)
+      or (game and game.data and game.data.tilesets)
+  local ts = tilesets and (tilesets[def.tileset] or tilesets[def.tilesetId]
+      or (tonumber(def.tilesetId) and tilesets[def.tilesetId + 1]))
+  if not ts then return nil end
+  local ok, map = pcall(Map.new, def, ts)
+  if not ok then return nil end
+  ControlsFree.goldNeighborMaps[mapId] = map
+  return map
+end
+
 local function loadedNeighborMap(game, mapId)
-  local ow = game and game.overworld
-  if not ow then return nil end
-  local neighbors = ow.neighbors
+  local owner = WorldBackend.owner(game)
+  if not owner then return nil end
+  if WorldBackend.isGold(game) then
+    local map = WorldBackend.gold.neighborMap(game, mapId)
+    local nbHit
+    for _, nb in ipairs(owner.neighbors or {}) do
+      local id = (nb.map and nb.map.id) or nb.id
+      if id == mapId then nbHit = nb; break end
+    end
+    return map, nbHit
+  end
+  local neighbors = owner.neighbors
   local cache = ControlsFree.neighborLookupCache
-  if not cache or cache.ow ~= ow or cache.neighbors ~= neighbors then
+  if not cache or cache.ow ~= owner or cache.neighbors ~= neighbors then
     local byId = {}
     for _, nb in ipairs(neighbors or {}) do
-      if nb.map and nb.map.id ~= nil then
-        byId[nb.map.id] = nb
-      end
+      if nb.map and nb.map.id ~= nil then byId[nb.map.id] = nb end
     end
-    cache = { ow = ow, neighbors = neighbors, byId = byId }
+    cache = { ow = owner, neighbors = neighbors, byId = byId }
     ControlsFree.neighborLookupCache = cache
-    state.stats.neighborLookupMisses =
-      (state.stats.neighborLookupMisses or 0) + 1
+    state.stats.neighborLookupMisses = (state.stats.neighborLookupMisses or 0) + 1
   else
-    state.stats.neighborLookupHits =
-      (state.stats.neighborLookupHits or 0) + 1
+    state.stats.neighborLookupHits = (state.stats.neighborLookupHits or 0) + 1
   end
   local nb = cache.byId[mapId]
   return nb and nb.map or nil, nb
 end
 
+-- Build the same compact terrain alphabet WorldAPI.mapOverview uses, but only
 -- Build the same compact terrain alphabet WorldAPI.mapOverview uses, but only
 -- for a neighbour map the engine has ALREADY loaded for survey rendering.
 -- This is a read-only fallback used to reject impossible seam choices before
@@ -2407,74 +3016,485 @@ end
 
 local function overviewFromLoadedMap(map)
   if not map or not map.widthCells or not map.heightCells then return nil end
+  -- Grid coordinates are integers even if a test/custom map stores its
+  -- dimensions as 3.0/6.0.  Canonicalise here because A* node keys use the
+  -- textual cell coordinate; mixing `5` and `5.0` would make the same cell
+  -- two different graph nodes and can falsely reject a remote connection leg.
+  local width = math.floor(tonumber(map.widthCells) or 0)
+  local height = math.floor(tonumber(map.heightCells) or 0)
+  if width <= 0 or height <= 0 then return nil end
   local cached = loadedMapOverviewCache[map]
-  if cached and cached.width == map.widthCells and cached.height == map.heightCells then
+  if cached and cached.width == width and cached.height == height then
     state.stats.overviewCacheHits = state.stats.overviewCacheHits + 1
     return cached.overview
   end
   state.stats.overviewCacheMisses = state.stats.overviewCacheMisses + 1
   local rows = {}
-  for y = 0, map.heightCells - 1 do
+  for y = 0, height - 1 do
     local row = {}
-    for x = 0, map.widthCells - 1 do
+    for x = 0, width - 1 do
       row[#row + 1] = map:isWarpTileCell(x, y) and "+"
         or map:isWaterCell(x, y) and "~"
         or map:isWalkableCell(x, y) and "." or " "
     end
     rows[#rows + 1] = table.concat(row)
   end
-  local overview = { mapId = map.id, width = map.widthCells, height = map.heightCells,
-                     rows = rows }
-  loadedMapOverviewCache[map] = { width = map.widthCells, height = map.heightCells,
-                                  overview = overview }
+  local overview = { mapId = map.id, width = width, height = height, rows = rows }
+  loadedMapOverviewCache[map] = { width = width, height = height, overview = overview }
   return overview
+end
+
+-- Reconstruct the exact connection graph represented by Gold's rendered
+-- neighbour placements.  World.computeNeighbors may place maps up to two hops
+-- away in survey view.  A target on one of those maps is therefore legitimate
+-- world intent even when it is not a direct neighbour of the active map.
+--
+-- We do NOT guess a route from map ids alone.  Every edge is accepted only when
+-- applying the source connection's offset reproduces the destination map's
+-- actual `ow.neighbors` render placement.  This mirrors the engine's own
+-- seamless-world geometry and rejects alternate/loop connections that happen
+-- to reach the same map id through a different placement.
+function ControlsFree.goldConnectionPlacedOffset(sourceDef, destDef, compass, conn, ox, oy)
+  if not (sourceDef and destDef and compass and conn) then return nil end
+  local sw, sh = mapCellSize(sourceDef)
+  local dw, dh = mapCellSize(destDef)
+  if not (sw and sh and dw and dh) then return nil end
+  local off = (tonumber(conn.offset) or 0) * 2 * TILE_SIZE
+  ox, oy = tonumber(ox) or 0, tonumber(oy) or 0
+  if compass == "north" then
+    return ox + off, oy - dh * TILE_SIZE
+  elseif compass == "south" then
+    return ox + off, oy + sh * TILE_SIZE
+  elseif compass == "west" then
+    return ox - dw * TILE_SIZE, oy + off
+  elseif compass == "east" then
+    return ox + sw * TILE_SIZE, oy + off
+  end
+  return nil
+end
+
+function ControlsFree.visibleConnectionChain(game, targetMapId)
+  if not WorldBackend.isGold(game) or not targetMapId then return nil end
+  local world = WorldBackend.gold.owner(game)
+  local current = WorldBackend.gold.map(game)
+  local maps = WorldBackend.gold.mapDefinitions(game)
+  if not (world and current and maps and maps[targetMapId]) then return nil end
+  if targetMapId == current.id then return {} end
+
+  local placed = {
+    [current.id] = { id=current.id, ox=0, oy=0, map=current },
+  }
+  for _, nb in ipairs(world.neighbors or {}) do
+    local id = (nb.map and nb.map.id) or nb.id
+    local ox, oy = tonumber(nb.ox), tonumber(nb.oy)
+    if id and ox and oy then
+      placed[id] = { id=id, ox=ox, oy=oy, map=nb.map }
+    end
+  end
+  if not placed[targetMapId] then return nil end
+
+  local queue = { { id=current.id, path={} } }
+  local head, seen = 1, { [current.id]=true }
+  while head <= #queue do
+    local node = queue[head]; head = head + 1
+    if #node.path < 4 then
+      local sourcePlaced = placed[node.id]
+      local sourceDef = maps[node.id]
+      for _, compass in ipairs({ "north", "south", "west", "east" }) do
+        local conn = sourceDef and sourceDef.connections
+          and sourceDef.connections[compass] or nil
+        local destId = conn and (conn.map or conn.mapId) or nil
+        local destPlaced = destId and placed[destId] or nil
+        local destDef = destId and maps[destId] or nil
+        if destPlaced and destDef and not seen[destId] then
+          local ex, ey = ControlsFree.goldConnectionPlacedOffset(
+            sourceDef, destDef, compass, conn, sourcePlaced.ox, sourcePlaced.oy)
+          if ex and math.abs(ex - destPlaced.ox) < 0.01
+              and math.abs(ey - destPlaced.oy) < 0.01 then
+            local destMap = WorldBackend.gold.neighborMap(game, destId)
+            local destOverview = overviewFromLoadedMap(destMap)
+            if destMap and destOverview then
+              local leg = {
+                sourceMapId = node.id, destMapId = destId,
+                dir = COMPASS_TO_DIR[compass], compass = compass, conn = conn,
+                destOverview = destOverview, destMap = destMap,
+                renderOx = destPlaced.ox, renderOy = destPlaced.oy,
+              }
+              local path = {}
+              for i, oldLeg in ipairs(node.path) do path[i] = oldLeg end
+              path[#path + 1] = leg
+              if destId == targetMapId then return path end
+              seen[destId] = true
+              queue[#queue + 1] = { id=destId, path=path }
+            end
+          end
+        end
+      end
+    end
+  end
+  return nil
+end
+
+-- Static tail validation for a remote visible target.  Only the CURRENT map
+-- uses live NPC occupancy; future maps are evaluated from their loaded Gold
+-- collision/ledge topology.  After each real map.entered the next leg is
+-- replanned with the destination's now-live NPCs, so a moving trainer cannot
+-- permanently poison a route planned one map earlier.
+function ControlsFree.remoteConnectionTailScore(
+    game, remote, mapId, startX, startY, nextLegIndex, waterMode, depth)
+  if not (remote and mapId and startX ~= nil and startY ~= nil) then return nil end
+  depth = (depth or 0) + 1
+  if depth > 4 then return nil end
+  state.stats.remoteConnectionStaticChecks =
+    (state.stats.remoteConnectionStaticChecks or 0) + 1
+
+  local map = WorldBackend.gold.neighborMap(game, mapId)
+  local overview = overviewFromLoadedMap(map)
+  if not (map and overview) then return nil end
+  local topology = ledgeTopology(game, map, overview)
+
+  if mapId == remote.mapId then
+    local path = findPath(overview, startX, startY, remote.x, remote.y,
+      waterMode, {}, {}, topology.blockedEdges, {}, topology.jumps)
+    return path and #path or nil
+  end
+
+  local leg = remote.route and remote.route[nextLegIndex or 1] or nil
+  if not (leg and leg.sourceMapId == mapId and leg.destOverview and leg.destMap) then
+    return nil
+  end
+
+  local best
+  local curHint = { x=startX, y=startY }
+  local seamCells = ControlsFree.budgetedSeamSourceCells(
+    leg, overview, curHint, remote.x, remote.y)
+
+  local function consider(sourceX, sourceY, entryX, entryY, crossCost)
+    local sch = cellChar(overview, sourceX, sourceY)
+    if not sch or sch == "+" then return end
+    local lch = cellChar(leg.destOverview, entryX, entryY)
+    if lch ~= "." and not (lch == "~" and waterMode) then return end
+    local pathHere = findPath(overview, startX, startY, sourceX, sourceY,
+      waterMode, {}, {}, topology.blockedEdges, {}, topology.jumps)
+    if not pathHere then return end
+    local tail = ControlsFree.remoteConnectionTailScore(
+      game, remote, leg.destMapId, entryX, entryY,
+      (nextLegIndex or 1) + 1, waterMode, depth)
+    if not tail then return end
+    local score = #pathHere + (crossCost or 1) + tail
+    if not best or score < best then best = score end
+  end
+
+  for _, src in ipairs(seamCells) do
+    local lx, ly = seamLanding(leg, src.x, src.y)
+    consider(src.x, src.y, lx, ly, 1)
+  end
+  for _, jump in ipairs(topology.seamJumps or {}) do
+    if jump.dir == leg.dir then
+      local lx, ly = seamLanding(leg, jump.midX, jump.midY)
+      consider(jump.sourceX, jump.sourceY, lx, ly, jump.cost or 2)
+    end
+  end
+  return best
+end
+
+function ControlsFree.advanceRemoteConnection(game, nav, cur)
+  local remote = nav and nav.remoteGoal
+  if not (remote and cur) then return nil, "missing_remote" end
+  if cur.mapId == remote.mapId then return true end
+  local nextIndex = (remote.routeIndex or 1) + 1
+  local leg = remote.route and remote.route[nextIndex] or nil
+  if not (leg and leg.sourceMapId == cur.mapId) then
+    return nil, "remote_route_mismatch"
+  end
+  remote.routeIndex = nextIndex
+  local cross = copyFlat(leg)
+  if cross.destMapId == remote.mapId then
+    cross.targetX, cross.targetY = remote.x, remote.y
+  end
+  nav.cross = cross
+  nav.path, nav.index = nil, 1
+  nav.targetX, nav.targetY = nil, nil
+  nav.lastX, nav.lastY = cur.x, cur.y
+  nav.lastProgressTick = state.tick
+  nav.needsReplan = false
+  nav.replanReason = nil
+  state.stats.remoteConnectionLegs =
+    (state.stats.remoteConnectionLegs or 0) + 1
+  state.stats.remoteConnectionReplans =
+    (state.stats.remoteConnectionReplans or 0) + 1
+  return rebuildNavigation(game, nav, cur)
+end
+
+
+-- Gold cross-map controller (test10) -----------------------------------------
+--
+-- This is intentionally separate from the older remote-tail planner.  A tap on
+-- a map that Gold itself has already rendered is accepted immediately.  We then
+-- use the cartridge map headers only for MAP-ID connectivity and re-plan one
+-- physical seam at a time from the LIVE map.  No future-map A* proof is needed
+-- before the player is allowed to cross the first edge.
+--
+-- Why this is safer: World:tryConnection() is authoritative.  It validates the
+-- destination landing, calls setMap(..., {seamless=true}), emits map.entered,
+-- parks the player one cell before the landing and lets the real player step
+-- finish.  Tap to Move therefore only has to reach a legal source seam and hold
+-- the normal D-pad direction.  After the real landing we recompute from scratch.
+function ControlsFree.goldSimpleMapRoute(game, startMapId, finalMapId)
+  if not WorldBackend.isGold(game) or not startMapId or not finalMapId then
+    return nil
+  end
+  if startMapId == finalMapId then return {} end
+  local maps = WorldBackend.gold.mapDefinitions(game)
+  if not (maps and maps[startMapId] and maps[finalMapId]) then return nil end
+
+  local queue = { { id = startMapId, route = {} } }
+  local head = 1
+  local seen = { [startMapId] = true }
+  local order = { "north", "south", "west", "east" }
+  local maxDepth = 16 -- far above the two-hop renderer window; still bounded.
+  while head <= #queue do
+    local node = queue[head]
+    head = head + 1
+    if #node.route < maxDepth then
+      local def = maps[node.id]
+      for _, compass in ipairs(order) do
+        local conn = def and def.connections and def.connections[compass] or nil
+        local destId = conn and (conn.mapId or conn.map) or nil
+        if destId and maps[destId] and not seen[destId] then
+          local route = {}
+          for i, leg in ipairs(node.route) do route[i] = leg end
+          route[#route + 1] = {
+            sourceMapId = node.id,
+            destMapId = destId,
+            compass = compass,
+            dir = COMPASS_TO_DIR[compass],
+            conn = conn,
+          }
+          if destId == finalMapId then return route end
+          seen[destId] = true
+          queue[#queue + 1] = { id = destId, route = route }
+        end
+      end
+    end
+  end
+  return nil
+end
+
+function ControlsFree.goldSimpleCrossForLeg(game, leg, finalGoal)
+  if not (leg and leg.sourceMapId and leg.destMapId and leg.dir) then return nil end
+  local destMap = WorldBackend.gold.neighborMap(game, leg.destMapId)
+  local destOverview = overviewFromLoadedMap(destMap)
+  if not (destMap and destOverview) then return nil end
+  return {
+    sourceMapId = leg.sourceMapId,
+    destMapId = leg.destMapId,
+    compass = leg.compass,
+    dir = leg.dir,
+    conn = leg.conn,
+    destMap = destMap,
+    destOverview = destOverview,
+    -- These are only a seam-selection hint.  Intermediate maps are never asked
+    -- to prove a route to the final map's coordinates.
+    targetX = finalGoal and finalGoal.x or nil,
+    targetY = finalGoal and finalGoal.y or nil,
+  }
+end
+
+function ControlsFree.goldSimpleRemoteTarget(game, targetMapId, x, y)
+  local cur = mod.world and mod.world:current()
+  if not (cur and targetMapId and x ~= nil and y ~= nil) then return nil end
+  local route = ControlsFree.goldSimpleMapRoute(game, cur.mapId, targetMapId)
+  if not route or #route == 0 then return nil end
+  local goal = { mapId = targetMapId, x = math.floor(x), y = math.floor(y) }
+  local cross = ControlsFree.goldSimpleCrossForLeg(game, route[1], goal)
+  if not cross then return nil end
+  cross.goldSimpleRemote = goal
+  return cross
+end
+
+-- Pick a physically reachable source seam using ONLY the live source map and
+-- the real destination landing cell.  Unlike chooseCrossSeam(), this never
+-- requires a static path through future maps.  That is exactly the Gen1-style
+-- lifecycle requested for Gold: walk -> cross -> observe -> re-plan.
+function ControlsFree.chooseGoldSimpleCrossSeam(game, nav, cur, occupancy)
+  local cross = nav and nav.cross
+  local overview = WorldBackend.overview(game)
+  if not (cross and overview and overview.mapId == cross.sourceMapId
+      and cross.destOverview and cross.destMap) then return nil end
+
+  local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
+  local sourceMap = WorldBackend.map(game)
+  local topology = ledgeTopology(game, sourceMap, overview)
+  local blockedEdges = mergeBlockedEdges(nav.blockedEdges, topology.blockedEdges)
+  local goal = nav.goldSimpleRemote
+  local best
+
+  local seamCells = ControlsFree.budgetedSeamSourceCells(
+    cross, overview, cur,
+    (cross.destMapId == (goal and goal.mapId)) and goal.x or nil,
+    (cross.destMapId == (goal and goal.mapId)) and goal.y or nil)
+
+  local function scoreCandidate(sx, sy, pathHere, lx, ly, extra, ledge)
+    local score = #pathHere + (extra or 1)
+    -- On the final connection prefer the landing closest to the clicked cell,
+    -- but never reject a valid seam just because the destination path has not
+    -- been proven yet.  Once the map is live, normal A* owns that decision.
+    if goal and cross.destMapId == goal.mapId then
+      score = score + math.abs(lx - goal.x) + math.abs(ly - goal.y)
+    end
+    if not best or score < best.score then
+      best = {
+        score = score, path = pathHere,
+        sourceX = sx, sourceY = sy, entryX = lx, entryY = ly,
+      }
+      if ledge then
+        best.ledgeSeam = true
+        best.ledgeMidX, best.ledgeMidY = ledge.midX, ledge.midY
+      end
+    end
+  end
+
+  for _, src in ipairs(seamCells) do
+    local sx, sy = math.floor(src.x), math.floor(src.y)
+    local sch = cellChar(overview, sx, sy)
+    if sch and sch ~= "+" then
+      local lx, ly = seamLanding(cross, sx, sy)
+      lx, ly = math.floor(lx), math.floor(ly)
+      local lch = cellChar(cross.destOverview, lx, ly)
+      local landingOK = lch == "." or (lch == "~" and waterMode)
+      local ox, oy = sx, sy
+      if cross.dir == "up" then oy = sy - 1
+      elseif cross.dir == "down" then oy = sy + 1
+      elseif cross.dir == "left" then ox = sx - 1
+      else ox = sx + 1 end
+      if landingOK and not nav.blockedEdges[edgeKey(sx, sy, ox, oy)] then
+        local pathHere = findPath(overview, cur.x, cur.y, sx, sy, waterMode,
+          occupancy, nav.tempBlocked, blockedEdges, nav.blockedCells,
+          topology.jumps)
+        if pathHere then scoreCandidate(sx, sy, pathHere, lx, ly, 1) end
+      end
+    end
+  end
+
+  -- Preserve Gold ledge-at-seam support without future-map validation.
+  for _, jump in ipairs(topology.seamJumps or {}) do
+    if jump.dir == cross.dir then
+      local lx, ly = seamLanding(cross, jump.midX, jump.midY)
+      lx, ly = math.floor(lx), math.floor(ly)
+      local lch = cellChar(cross.destOverview, lx, ly)
+      if lch == "." or (lch == "~" and waterMode) then
+        local pathHere = findPath(overview, cur.x, cur.y,
+          jump.sourceX, jump.sourceY, waterMode, occupancy, nav.tempBlocked,
+          blockedEdges, nav.blockedCells, topology.jumps)
+        if pathHere then
+          scoreCandidate(jump.sourceX, jump.sourceY, pathHere, lx, ly,
+            jump.cost or 2, jump)
+        end
+      end
+    end
+  end
+  return best
+end
+
+function ControlsFree.advanceGoldSimpleRemote(game, nav, cur)
+  local goal = nav and nav.goldSimpleRemote
+  if not (goal and cur) then return nil, "missing_goal" end
+
+  nav.mapId = cur.mapId
+  nav.lastX, nav.lastY = cur.x, cur.y
+  nav.lastProgressTick = state.tick
+  nav.path, nav.index = nil, 1
+  nav.needsReplan = false
+  nav.replanReason = nil
+
+  if cur.mapId == goal.mapId then
+    nav.cross = nil
+    nav.goalKind = "move"
+    nav.targetX, nav.targetY = goal.x, goal.y
+    nav.requestedMapId = goal.mapId
+    nav.requestedX, nav.requestedY = goal.x, goal.y
+    -- From this point all intent coordinates are in the live destination map.
+    nav.intentX, nav.intentY = goal.x + 0.5, goal.y + 0.5
+    local ok, why = buildPath(game, nav, cur)
+    if ok then return true end
+    if why ~= "dynamic" then
+      -- Match ordinary local tap semantics: if the clicked remote cell is
+      -- scenery, stop at the closest reachable floor and allow the endpoint
+      -- interaction assist to interpret a nearby PC/NPC/fixture afterwards.
+      local nearest, nwhy = buildNearestLegalPath(game, nav, cur, goal.x, goal.y)
+      if nearest then return true end
+      return nil, nwhy or why
+    end
+    return nil, why
+  end
+
+  local route = ControlsFree.goldSimpleMapRoute(game, cur.mapId, goal.mapId)
+  if not route or #route == 0 then return nil, "no_map_route" end
+  local cross = ControlsFree.goldSimpleCrossForLeg(game, route[1], goal)
+  if not cross then return nil, "missing_next_map" end
+  cross.goldSimpleRemote = goal
+  nav.cross = cross
+  nav.goalKind = "cross_move"
+  return buildCrossPath(game, nav, cur)
 end
 
 -- Resolve a tap against the ACTUAL neighbour rectangles the overworld renderer
 -- has already composed for survey view.  Using ow.neighbors[].ox/oy makes the
 -- pointer hit-test share one source of truth with rendering instead of
--- re-deriving connection placement a second time from offsets.  Only a direct
--- connection is routable in this checkpoint; farther visible neighbours are
--- recognized but safely refused.
+-- re-deriving connection placement a second time from offsets. Gold may render
+-- a second-hop neighbour in survey view; those targets are carried as one
+-- persistent route whose connection legs are revalidated after each native
+-- map transition. Gen 1 keeps its established direct-neighbour behavior.
 local function visibleNeighborTarget(game, worldX, worldY, overview)
-  local ow = game and game.overworld
-  local current = ow and ow.map
+  local ow = WorldBackend.owner(game)
+  local current = WorldBackend.map(game)
   local connections = current and current.def and current.def.connections
   if not ow or not connections then return nil end
-
   local directByMap = {}
   for _, compass in ipairs({ "north", "south", "west", "east" }) do
     local conn = connections[compass]
-    if conn and conn.map then
-      directByMap[conn.map] = { conn = conn, compass = compass,
-                                dir = COMPASS_TO_DIR[compass] }
+    local id = conn and (conn.map or conn.mapId)
+    if id then
+      directByMap[id] = { conn = conn, compass = compass,
+                          dir = COMPASS_TO_DIR[compass] }
     end
   end
-
   local sawVisibleNeighbour = false
   for _, nb in ipairs(ow.neighbors or {}) do
-    local map = nb.map
+    local mapId = (nb.map and nb.map.id) or nb.id
+    local map = nb.map or (WorldBackend.isGold(game)
+      and WorldBackend.gold.neighborMap(game, mapId)) or nil
     local dw, dh = mapCellSize(map and map.def, map)
     local ox, oy = tonumber(nb.ox), tonumber(nb.oy)
     if map and dw and dh and ox and oy
         and worldX >= ox and worldY >= oy
-        and worldX < ox + dw * TILE_SIZE
-        and worldY < oy + dh * TILE_SIZE then
+        and worldX < ox + dw * TILE_SIZE and worldY < oy + dh * TILE_SIZE then
       sawVisibleNeighbour = true
-      local direct = directByMap[map.id]
-      if direct then
-        local lx = math.floor((worldX - ox) / TILE_SIZE)
-        local ly = math.floor((worldY - oy) / TILE_SIZE)
-        local destOverview = overviewFromLoadedMap(map)
-        if destOverview and lx >= 0 and ly >= 0
-            and lx < destOverview.width and ly < destOverview.height then
-          return {
-            sourceMapId = overview.mapId, destMapId = map.id,
-            dir = direct.dir, compass = direct.compass, conn = direct.conn,
-            targetX = lx, targetY = ly,
-            destOverview = destOverview, destMap = map,
-            renderOx = ox, renderOy = oy,
-          }, true
+      local lx = math.floor((worldX - ox) / TILE_SIZE)
+      local ly = math.floor((worldY - oy) / TILE_SIZE)
+      local destOverview = overviewFromLoadedMap(map)
+      if destOverview and lx >= 0 and ly >= 0
+          and lx < destOverview.width and ly < destOverview.height then
+        if WorldBackend.isGold(game) then
+          -- The renderer has already proven this map is part of the visible
+          -- seamless world.  Do not make a second geometry proof here.  Build
+          -- a map-id route and let each physical Gold connection validate its
+          -- own landing at runtime.
+          local cross = ControlsFree.goldSimpleRemoteTarget(game, mapId, lx, ly)
+          if cross then
+            state.stats.remoteConnectionTargets =
+              (state.stats.remoteConnectionTargets or 0) + 1
+            return cross, true
+          end
+        else
+          local direct = directByMap[mapId]
+          if direct then
+            return { sourceMapId = overview.mapId, destMapId = mapId,
+              dir = direct.dir, compass = direct.compass, conn = direct.conn,
+              targetX = lx, targetY = ly, destOverview = destOverview,
+              destMap = map, renderOx = ox, renderOy = oy }, true
+          end
         end
       end
       return nil, true
@@ -2484,6 +3504,7 @@ local function visibleNeighborTarget(game, worldX, worldY, overview)
 end
 
 local function neighbourInteractionAt(game, cross, x, y)
+  if WorldBackend.isGold(game) then return nil end
   if not cross then return nil end
   local ow = game and game.overworld
   local ghosts = {}
@@ -2546,6 +3567,12 @@ function VoxelAdapter.module(lib, name)
 end
 
 function VoxelAdapter.discover()
+  if WorldBackend.isGold(state.game) then
+    -- Gold stays renderer-independent until a provider exposes an explicit,
+    -- verified Gold scene contract. Never feed Gen I voxel assumptions into it.
+    VoxelAdapter.cache = { id = nil, peer = nil, lib = nil }
+    return nil
+  end
   if type(mod.find) ~= "function" then
     VoxelAdapter.cache = { id = nil, peer = nil, lib = nil }
     return nil
@@ -2783,7 +3810,7 @@ function ControlsFree.voxelFixedHiddenInteractionFromTap(game, x, y, scene)
   if not (voxel3d and map and type(voxel3d.project) == "function") then return nil end
 
   local cur = mod.world and mod.world:current()
-  local overview = mod.world and mod.world:mapOverview()
+  local overview = WorldBackend.overview(game)
   if not cur or not overview or cur.mapId ~= map.id or overview.mapId ~= map.id then
     return nil
   end
@@ -2875,7 +3902,7 @@ local function voxelCandidateMaps(game, overview)
   }
   local direct = {}
   for _, conn in pairs(connections or {}) do
-    if conn and conn.map then direct[conn.map] = true end
+    if conn and (conn.map or conn.mapId) then direct[conn.map] = true end
   end
   for _, nb in ipairs(ow.neighbors or {}) do
     if nb.map and direct[nb.map.id] then
@@ -3218,7 +4245,7 @@ local function voxelRayTargetFromTap(game, x, y, scene)
   local free=overworldGate(game)
   if not free then return { error="busy" } end
   local cur=mod.world and mod.world:current()
-  local overview=mod.world and mod.world:mapOverview()
+  local overview=WorldBackend.overview(game)
   if not cur or not overview or cur.mapId~=overview.mapId then return { error="no_map" } end
   local ray=voxelRayFromPointer(x,y,voxel3d)
   if not ray then return nil end
@@ -3325,7 +4352,7 @@ local function voxelTargetFromTap(game, x, y, voxel3d)
   local free = overworldGate(game)
   if not free then return nil, nil, nil, nil, "busy" end
   local cur = mod.world and mod.world:current()
-  local overview = mod.world and mod.world:mapOverview()
+  local overview = WorldBackend.overview(game)
   if not cur or not overview or cur.mapId ~= overview.mapId then
     return nil, nil, nil, nil, "no_map"
   end
@@ -3458,6 +4485,180 @@ local function voxelTargetFromTap(game, x, y, voxel3d)
   return nil, nil, cur, overview, saw and "connected_map" or "outside_map"
 end
 
+-- Gold draws TILT by warping the already-scaled window-sized ground plane
+-- through Tilt.groundPoint(). The upstream helper is forward-only, but its
+-- perspective equation has a closed-form inverse, so touch picking can use
+-- the exact same presentation transform instead of guessing or disabling
+-- Tap to Move whenever TILT is enabled.
+function ControlsFree.goldWindowSize()
+  local frame = state.frame or {}
+  local w, h = tonumber(frame.ww), tonumber(frame.wh)
+  if w and h and w > 0 and h > 0 then return w, h end
+  if love and love.graphics and type(love.graphics.getDimensions) == "function" then
+    local ok, ww, wh = pcall(love.graphics.getDimensions)
+    if ok and tonumber(ww) and tonumber(wh) and ww > 0 and wh > 0 then
+      return ww, wh
+    end
+  end
+  return nil, nil
+end
+
+function ControlsFree.goldTiltState()
+  local ok, Tilt = pcall(require, "src.render.Tilt")
+  if not ok or type(Tilt) ~= "table" then return nil, false end
+  local active = type(Tilt.active) == "function" and Tilt.active() == true
+  return Tilt, active
+end
+
+function ControlsFree.goldTiltScreenToFlat(x, y, vw, vh)
+  local Tilt, active = ControlsFree.goldTiltState()
+  if not active then return x, y, false end
+  local a = tonumber(Tilt.angle) or 0
+  if a <= 0 then return x, y, false end
+  vw, vh = tonumber(vw), tonumber(vh)
+  if not (vw and vh and vw > 0 and vh > 0) then return nil, nil, true end
+
+  -- Forward upstream equation:
+  --   scale = d / (d - w*sin(a))
+  --   sy-Cy = w*cos(a)*scale
+  -- Solving the second line for w gives the exact inverse below.
+  local d = (tonumber(Tilt.FOCAL) or 1) * vh
+  local sinA, cosA = math.sin(a), math.cos(a)
+  local screenY = y - vh * 0.5
+  local denom = cosA * d + screenY * sinA
+  if math.abs(denom) < 1e-7 then return nil, nil, true end
+  local row = screenY * d / denom
+  local scaleDenom = d - row * sinA
+  if math.abs(scaleDenom) < 1e-7 then return nil, nil, true end
+  local scale = d / scaleDenom
+  if scale <= 0 or scale ~= scale then return nil, nil, true end
+  local flatX = vw * 0.5 + (x - vw * 0.5) / scale
+  local flatY = vh * 0.5 + row
+  return flatX, flatY, true
+end
+
+function ControlsFree.goldTiltFlatToScreen(x, y, vw, vh)
+  local Tilt, active = ControlsFree.goldTiltState()
+  if not active then return x, y, false end
+  if type(Tilt.groundPoint) ~= "function" then return nil, nil, true end
+  local ok, sx, sy = pcall(Tilt.groundPoint, x, y, vw, vh)
+  if not ok or type(sx) ~= "number" or type(sy) ~= "number"
+      or sx ~= sx or sy ~= sy then
+    return nil, nil, true
+  end
+  return sx, sy, true
+end
+
+-- Exact Gold frame transforms.  Prefer the geometry captured after the world
+-- was rendered; fall back to the live helpers only during the first frame after
+-- boot/resize where no render.compose snapshot exists yet.
+function ControlsFree.goldFrameGeometry(game, expectedMapId)
+  local frame = state.frame or {}
+  local g = frame.gold
+  if g and (expectedMapId == nil or g.mapId == expectedMapId)
+      and tonumber(g.scale) and g.scale > 0 then
+    return g
+  end
+
+  local world = game and game.world
+  if not (world and world.camera and type(world.zoomScale) == "function") then
+    return nil
+  end
+  local okScale, scale = pcall(world.zoomScale, world)
+  scale = okScale and tonumber(scale) or nil
+  local ww, wh = ControlsFree.goldWindowSize()
+  if not (scale and scale > 0 and ww and wh) then return nil end
+  local captureW, captureH, cropX, cropY = ww, wh, 0, 0
+  local tiltAngle, tiltFocal, tiltActive = 0, 1, false
+  local Tilt, active = ControlsFree.goldTiltState()
+  if active and Tilt then
+    tiltActive = true
+    tiltAngle = tonumber(Tilt.angle) or 0
+    tiltFocal = tonumber(Tilt.FOCAL) or 1
+    if type(Tilt.viewGrowth) == "function" then
+      local okGrowth, growth = pcall(Tilt.viewGrowth)
+      growth = okGrowth and tonumber(growth) or nil
+      if growth and growth > 0 then
+        captureW, captureH = math.ceil(ww * growth), math.ceil(wh * growth)
+        cropX, cropY = (ww - captureW) / 2, (wh - captureH) / 2
+      end
+    end
+  end
+  local cameraX, cameraY = tonumber(world.camera.x) or 0, tonumber(world.camera.y) or 0
+  return {
+    mapId = world.map and world.map.id or expectedMapId,
+    scale = scale, cameraX = cameraX, cameraY = cameraY,
+    originX = math.floor(-cameraX * scale),
+    originY = math.floor(-cameraY * scale),
+    windowW = ww, windowH = wh,
+    captureW = captureW, captureH = captureH,
+    cropX = cropX, cropY = cropY,
+    tiltActive = tiltActive, tiltAngle = tiltAngle, tiltFocal = tiltFocal,
+  }
+end
+
+function ControlsFree.goldFrameScreenToFlat(game, x, y, expectedMapId)
+  local g = ControlsFree.goldFrameGeometry(game, expectedMapId)
+  if not g then return nil, nil, nil end
+  if not g.tiltActive or (g.tiltAngle or 0) <= 0 then return x, y, g end
+
+  -- World:drawTilted draws the projected capture translated by cropX/cropY.
+  -- Undo that crop before inverting Tilt.groundPoint in capture coordinates.
+  local sx, sy = x - (g.cropX or 0), y - (g.cropY or 0)
+  local vw, vh = tonumber(g.captureW), tonumber(g.captureH)
+  if not (vw and vh and vw > 0 and vh > 0) then return nil, nil, g end
+  local a, focal = tonumber(g.tiltAngle) or 0, tonumber(g.tiltFocal) or 1
+  local d = focal * vh
+  local sinA, cosA = math.sin(a), math.cos(a)
+  local screenY = sy - vh * 0.5
+  local denom = cosA * d + screenY * sinA
+  if math.abs(denom) < 1e-7 then return nil, nil, g end
+  local row = screenY * d / denom
+  local scaleDenom = d - row * sinA
+  if math.abs(scaleDenom) < 1e-7 then return nil, nil, g end
+  local perspective = d / scaleDenom
+  if perspective <= 0 or perspective ~= perspective then return nil, nil, g end
+  local flatX = vw * 0.5 + (sx - vw * 0.5) / perspective
+  local flatY = vh * 0.5 + row
+  return flatX, flatY, g
+end
+
+function ControlsFree.goldFrameFlatToScreen(game, x, y, expectedMapId)
+  local g = ControlsFree.goldFrameGeometry(game, expectedMapId)
+  if not g then return nil, nil end
+  if not g.tiltActive or (g.tiltAngle or 0) <= 0 then return x, y end
+  local vw, vh = tonumber(g.captureW), tonumber(g.captureH)
+  if not (vw and vh and vw > 0 and vh > 0) then return nil, nil end
+  local a, focal = tonumber(g.tiltAngle) or 0, tonumber(g.tiltFocal) or 1
+  local u, row = x - vw * 0.5, y - vh * 0.5
+  local d = focal * vh
+  local denom = d - row * math.sin(a)
+  if math.abs(denom) < 1e-7 then return nil, nil end
+  local perspective = d / denom
+  if perspective <= 0 or perspective ~= perspective then return nil, nil end
+  local sx = vw * 0.5 + u * perspective + (g.cropX or 0)
+  local sy = vh * 0.5 + row * math.cos(a) * perspective + (g.cropY or 0)
+  return sx, sy
+end
+
+-- Project the visual centre of one Gold collision cell back onto the window.
+-- This is intentionally the exact reverse of targetFromTap's Gold transform
+-- and is used only for diagnostics/preview alignment, never as movement data.
+function ControlsFree.goldCellCenterToScreen(game, mapId, cellX, cellY)
+  local g = ControlsFree.goldFrameGeometry(game, mapId)
+  local scale = g and tonumber(g.scale) or nil
+  if not (g and scale and scale > 0 and cellX ~= nil and cellY ~= nil) then
+    return nil, nil
+  end
+  local originX = tonumber(g.originX)
+    or math.floor(-(tonumber(g.cameraX) or 0) * scale)
+  local originY = tonumber(g.originY)
+    or math.floor(-(tonumber(g.cameraY) or 0) * scale)
+  local flatX = originX + (tonumber(cellX) * TILE_SIZE + TILE_SIZE / 2) * scale
+  local flatY = originY + (tonumber(cellY) * TILE_SIZE + TILE_SIZE / 2) * scale
+  return ControlsFree.goldFrameFlatToScreen(game, flatX, flatY, mapId)
+end
+
 local function targetFromTap(game, x, y)
   local scene = voxelContext()
   if scene then
@@ -3526,13 +4727,56 @@ local function targetFromTap(game, x, y)
     return voxelTargetFromTap(game, x, y, scene.voxel3d)
   end
 
-  local view = state.view
   local free = overworldGate(game)
-  if not view then return nil, nil, nil, nil, "no_view" end
   if not free then return nil, nil, nil, nil, "busy" end
 
   local cur = mod.world and mod.world:current()
-  local overview = mod.world and mod.world:mapOverview()
+  local overview = WorldBackend.overview(game)
+  if WorldBackend.isGold(game) then
+    local world = WorldBackend.owner(game)
+    if not (world and world.camera and type(world.zoomScale) == "function"
+        and cur and overview and cur.mapId == overview.mapId) then
+      return nil, nil, cur, overview, "no_map"
+    end
+    -- Gold's world fills the window, but the exact render is not simply
+    -- `camera + screen/zoom`: drawGround floors the map origin, and TILT first
+    -- renders into a grown capture which is later cropped back to the window.
+    -- Invert the frame snapshot captured by render.compose so flat and tilted
+    -- targeting both resolve against the pixels the player actually saw.
+    local pickX, pickY, goldFrame =
+      ControlsFree.goldFrameScreenToFlat(game, x, y, overview.mapId)
+    if not pickX or not goldFrame then
+      return nil, nil, cur, overview, "no_view"
+    end
+    local scale = tonumber(goldFrame.scale)
+    if not scale or scale <= 0 then
+      return nil, nil, cur, overview, "no_view"
+    end
+    local originX = tonumber(goldFrame.originX)
+      or math.floor(-(tonumber(goldFrame.cameraX) or 0) * scale)
+    local originY = tonumber(goldFrame.originY)
+      or math.floor(-(tonumber(goldFrame.cameraY) or 0) * scale)
+    local worldX = (pickX - originX) / scale
+    local worldY = (pickY - originY) / scale
+    local tiltActive = goldFrame.tiltActive == true
+    local meta = { intentX = worldX / TILE_SIZE, intentY = worldY / TILE_SIZE,
+                   generation = 2, flatGold = not tiltActive,
+                   tiltedGold = tiltActive and true or false,
+                   exactGoldFrame = true }
+    local tx, ty = math.floor(worldX / TILE_SIZE), math.floor(worldY / TILE_SIZE)
+    if tx < 0 or ty < 0 or tx >= overview.width or ty >= overview.height then
+      local cross, sawNeighbour = visibleNeighborTarget(game, worldX, worldY, overview)
+      if cross then
+        return cross.targetX, cross.targetY, cur, overview, nil, cross, meta
+      end
+      return nil, nil, cur, overview,
+        sawNeighbour and "connected_map" or "outside_map", nil, meta
+    end
+    return tx, ty, cur, overview, nil, nil, meta
+  end
+
+  local view = state.view
+  if not view then return nil, nil, nil, nil, "no_view" end
   if not cur or not overview or cur.mapId ~= overview.mapId then
     return nil, nil, nil, nil, "no_map"
   end
@@ -3602,7 +4846,7 @@ local function newNavigation(cur)
 end
 
 local function deferUntilCurrentStepLands(game, nav)
-  local player = game and game.overworld and game.overworld.player
+  local player = WorldBackend.player(game)
   if not player or player.moving ~= true then return false end
   if type(player.targetX) ~= "number" or type(player.targetY) ~= "number" then
     return false
@@ -3685,23 +4929,60 @@ end
 -- though Warp.onEdge would accept it. Return the UNION instead: edge direction
 -- is always authoritative, with any valid carpet directions added afterwards.
 function ControlsFree.engineWarpExtraCheck(game, map, x, y, dir)
-  if ControlsFree.engineWarpModule == false then
-    local ok, Warp = pcall(require, "src.world.Warp")
-    ControlsFree.engineWarpModule = ok and Warp or nil
-  end
-  local Warp = ControlsFree.engineWarpModule
-  if type(Warp) ~= "table" or type(Warp.extraCheck) ~= "function" then
-    return nil
-  end
+  -- Gold has its own COLL_* warp vocabulary. Never route it through a Gen I
+  -- warp-carpet mirror.
+  if WorldBackend.isGold(game) then return nil end
+  if not map then return nil end
+
+  -- Exact local mirror of current Gen1Recomp Warp.extraCheck. Keeping the
+  -- already-proven rules here avoids a Gen1-only src.world.Warp require in a
+  -- package that is being audited for Gold, while preserving the baseline
+  -- decision for every edge/carpet source.
+  local facingEdge =
+    (dir == "up" and y == 0)
+    or (dir == "down" and y == map.heightCells - 1)
+    or (dir == "left" and x == 0)
+    or (dir == "right" and x == map.widthCells - 1)
   local carpets = game and game.data and game.data.field
       and game.data.field.warpCarpets
-  local ok, result = pcall(Warp.extraCheck, map, carpets, x, y, dir)
-  if not ok then return nil end
-  return result == true
+  if not carpets then return facingEdge end
+
+  local useCarpet
+  if listHas(carpets.edgeMaps, map.id) then
+    useCarpet = false
+  elseif listHas(carpets.function2Maps, map.id) then
+    useCarpet = true
+  else
+    useCarpet = listHas(carpets.function2Tilesets, map.def and map.def.tileset)
+  end
+  if not useCarpet then return facingEdge end
+
+  local d = DIR_BY_NAME[dir]
+  if not d or type(map.cellTile) ~= "function" then return false end
+  local okFront, front = pcall(map.cellTile, map, x + d.dx, y + d.dy)
+  if not okFront then return false end
+  local ss = carpets.ssAnneBow
+  if ss and map.id == ss.map then return front == ss.tile end
+  return listHas(carpets.tiles and carpets.tiles[dir], front)
 end
 
 local function warpActivationDirections(game, map, x, y)
   if not map then return {} end
+
+  if WorldBackend.isGold(game) then
+    local Permissions = WorldBackend.gold.permissionsModule()
+    if not (Permissions and type(map.cellCollision) == "function") then
+      return {}
+    end
+    local ok, coll = pcall(map.cellCollision, map, x, y)
+    if not ok then return {} end
+    local dir = Permissions.carpetDirection
+        and Permissions.carpetDirection(coll) or nil
+    -- Immediate Gold warps fire on landing. Directional carpets alone require
+    -- an extra held direction while standing on the source cell.
+    return dir and { dir } or {}
+  end
+
   local dirs, seen = {}, {}
 
   local function add(dir)
@@ -3770,22 +5051,18 @@ local function warpActivationDirections(game, map, x, y)
   return dirs
 end
 
+local function defLooksOutdoor(game, def)
+  if type(def) ~= "table" then return false end
+  return WorldBackend.defLooksOutdoor(game, def)
+end
+
 local function warpExitRank(game, warpDef)
   if not warpDef then return 2 end
   if warpDef.destMap == "LAST_MAP" then return 0 end
-  local dest = game and game.data and game.data.maps
-      and game.data.maps[warpDef.destMap]
-  if dest and (dest.outdoor == true or dest.tileset == "OVERWORLD"
-      or dest.tileset == "PLATEAU") then
-    return 0
-  end
+  local maps = WorldBackend.mapDefinitions(game)
+  local dest = maps and maps[warpDef.destMap]
+  if dest and defLooksOutdoor(game, dest) then return 0 end
   return 1
-end
-
-local function defLooksOutdoor(def)
-  if type(def) ~= "table" then return false end
-  if def.outdoor ~= nil then return def.outdoor == true end
-  return def.tileset == "OVERWORLD" or def.tileset == "PLATEAU"
 end
 
 -- Cheap map-graph distance to the outside. This is deliberately topological:
@@ -3795,10 +5072,10 @@ end
 -- multi-floor interior without loading or pathfinding every remote floor.
 local function mapExitHopDistance(game, startMapId)
   if not startMapId or startMapId == "LAST_MAP" then return 0 end
-  local maps = game and game.data and game.data.maps
+  local maps = WorldBackend.mapDefinitions(game)
   local start = maps and maps[startMapId]
   if not start then return nil end
-  if defLooksOutdoor(start) then return 0 end
+  if defLooksOutdoor(game, start) then return 0 end
 
   local queue = { { id = startMapId, d = 0 } }
   local head, seen = 1, { [startMapId] = true }
@@ -3808,18 +5085,27 @@ local function mapExitHopDistance(game, startMapId)
       local def = maps[node.id]
       if def then
         local nextIds = {}
+        local runtimeMap = WorldBackend.isGold(game)
+          and WorldBackend.gold.neighborMap(game, node.id) or nil
         for _, w in ipairs(def.warps or {}) do
-          local dest = w.destMap
-          if dest == "LAST_MAP" then return node.d + 1 end
-          if type(dest) == "string" and dest ~= "" then nextIds[#nextIds+1] = dest end
+          local usable = true
+          if WorldBackend.isGold(game) then
+            usable = runtimeMap ~= nil
+              and WorldBackend.gold.warpFiresAt(game, runtimeMap, w.x, w.y)
+          end
+          if usable then
+            local dest = w.destMap
+            if dest == "LAST_MAP" then return node.d + 1 end
+            if type(dest) == "string" and dest ~= "" then nextIds[#nextIds+1] = dest end
+          end
         end
         for _, conn in pairs(def.connections or {}) do
-          local dest = conn and conn.map
+          local dest = conn and (conn.map or conn.mapId)
           if type(dest) == "string" and dest ~= "" then nextIds[#nextIds+1] = dest end
         end
         for _, dest in ipairs(nextIds) do
           local ddef = maps[dest]
-          if ddef and defLooksOutdoor(ddef) then return node.d + 1 end
+          if ddef and defLooksOutdoor(game, ddef) then return node.d + 1 end
           if ddef and not seen[dest] then
             seen[dest] = true
             queue[#queue+1] = { id = dest, d = node.d + 1 }
@@ -3835,24 +5121,24 @@ local function warpExitHops(game, warpDef)
   if not warpDef then return nil end
   local dest = warpDef.destMap
   if dest == "LAST_MAP" then return 1 end
-  local maps = game and game.data and game.data.maps
+  local maps = WorldBackend.mapDefinitions(game)
   local ddef = maps and maps[dest]
-  if ddef and defLooksOutdoor(ddef) then return 1 end
+  if ddef and defLooksOutdoor(game, ddef) then return 1 end
   local tail = mapExitHopDistance(game, dest)
   return tail and (tail + 1) or nil
 end
 
 local function mapTransitionExitHops(game, destMapId)
-  local maps = game and game.data and game.data.maps
+  local maps = WorldBackend.mapDefinitions(game)
   local ddef = maps and maps[destMapId]
-  if ddef and defLooksOutdoor(ddef) then return 1 end
+  if ddef and defLooksOutdoor(game, ddef) then return 1 end
   local tail = mapExitHopDistance(game, destMapId)
   return tail and (tail + 1) or nil
 end
 
 local function actualWarpCells(map)
   if not map then return {} end
-  local defs = map.def and map.def.warps or nil
+  local defs = map.warps or (map.def and map.def.warps) or nil
   local cache = ControlsFree.warpCellsCache[map]
   if cache and cache.defs == defs and cache.count == #(defs or {}) then
     state.stats.warpCacheHits = (state.stats.warpCacheHits or 0) + 1
@@ -3867,7 +5153,7 @@ local function actualWarpCells(map)
       local k = key(x, y)
       if not seen[k] then
         seen[k] = true
-        out[#out + 1] = { x=x, y=y, def=w, index=i }
+        out[#out + 1] = { x=x, y=y, def=(w.def or w), index=i }
       end
     end
   end
@@ -3881,6 +5167,12 @@ end
 local function warpIntentAt(game, map, cur, x, y)
   for _, w in ipairs(actualWarpCells(map)) do
     if w.x == x and w.y == y then
+      if WorldBackend.isGold(game)
+          and not WorldBackend.gold.warpFiresAt(game, map, x, y) then
+        -- Gold extraction also carries arrival-only warp coordinates sitting
+        -- on ordinary floor. They are destinations, not exits.
+        goto continue_warp_intent
+      end
       local dirs = warpActivationDirections(game, map, x, y)
       -- A directional ExtraWarpCheck source needs one final D-pad press after
       -- Tap to Move reaches the warp record.  v1.3.11 originally kept this
@@ -3907,6 +5199,7 @@ local function warpIntentAt(game, map, cur, x, y)
         carpetDown = exitDir == "down", edgeWarp = edgeWarp,
       }
     end
+    ::continue_warp_intent::
   end
   return nil
 end
@@ -3955,6 +5248,278 @@ function ControlsFree.directionalWarpIntentAt(game, map, cur, x, y)
   return nil
 end
 
+
+-- Gold door/stair targeting assist.  The activation cell is the authoritative
+-- target, but the visible doorway artwork often extends one 16px cell ABOVE
+-- that source.  A raw tap on that graphic used to select the wall cell and then
+-- either fail or route beside the building.  Snap only to a REAL Gold warp
+-- record whose native COLL_* semantics actually fire; arrival-only warp rows
+-- and ordinary floor can never become magnets.
+function ControlsFree.goldDoorMagnet(game, map, cur, overview, tx, ty, meta)
+  if not WorldBackend.isGold(game) or not map or not overview
+      or type(tx) ~= "number" or type(ty) ~= "number" then return nil end
+  if warpIntentAt(game, map, cur, tx, ty) then return nil end
+  if interactionAt(game, tx, ty) ~= nil then return nil end
+  if hiddenTreasureInteractionAt(game, cur and cur.mapId, tx, ty) ~= nil then return nil end
+  if ControlsFree.cutInteractionAt(game, map, overview, tx, ty) ~= nil then return nil end
+
+  local intentX = meta and tonumber(meta.intentX) or (tx + 0.5)
+  local intentY = meta and tonumber(meta.intentY) or (ty + 0.5)
+  local clickedChar = cellChar(overview, tx, ty)
+  local clickedSolid = clickedChar ~= "." and clickedChar ~= "~" and clickedChar ~= "+"
+  local best, bestScore
+  for _, w in ipairs(actualWarpCells(map)) do
+    if WorldBackend.gold.warpFiresAt(game, map, w.x, w.y) then
+      local cx, cy = w.x + 0.5, w.y + 0.5
+      local dx, dy = intentX - cx, intentY - cy
+      local score = dx * dx + dy * dy
+      local accept = score <= (0.72 * 0.72)
+      local visualDoor = clickedSolid and tx == w.x and ty == w.y - 1
+          and math.abs(intentX - cx) <= 0.72
+          and intentY >= (w.y - 1.0) and intentY <= (w.y + 0.15)
+      if visualDoor then
+        -- Prefer the visually aligned source over a merely nearby stair/warp.
+        score = score * 0.35
+        accept = true
+      end
+      if accept and (not bestScore or score < bestScore) then
+        bestScore = score
+        best = warpIntentAt(game, map, cur, w.x, w.y)
+      end
+    end
+  end
+  if best then
+    best.doorMagnet = true
+    best.clickedX, best.clickedY = tx, ty
+  end
+  return best
+end
+
+
+-- Gold smart-door barrier inference.  A user can deliberately tap well past a
+-- building/facade instead of on the tiny door sprite itself.  Do NOT solve
+-- that by making the door magnet huge: that would let unrelated doors steal
+-- ordinary floor taps.  Instead prove a semantic barrier first.
+--
+-- 1) The requested point must already be non-walkable / outside the local
+--    graph, or a nominally walkable local point must have no static A* path.
+-- 2) March the user's intent ray from the player and find its FIRST static
+--    solid cell.
+-- 3) Flood only that connected solid component (the facade/building/fence).
+-- 4) A real active Gold warp may win only if it borders THAT component, lies
+--    ahead of the player near the intent ray, and is itself reachable through
+--    the normal movement graph.
+--
+-- This is deliberately a "door through the barrier I am aiming past" rule,
+-- not "nearest door in roughly that direction".  It therefore handles a tap
+-- high above a building while refusing to pull a click across an unrelated
+-- wall toward some other entrance elsewhere on the map.
+function ControlsFree.goldBarrierDoorIntent(game, map, cur, overview,
+    intentX, intentY, tx, ty, targetErr, cross)
+  if not WorldBackend.isGold(game) or not map or not cur or not overview then
+    return nil
+  end
+  if cross then return nil end -- a validated connected-map target is stronger
+  intentX, intentY = tonumber(intentX), tonumber(intentY)
+  if not intentX or not intentY then
+    if type(tx) ~= "number" or type(ty) ~= "number" then return nil end
+    intentX, intentY = tx + 0.5, ty + 0.5
+  end
+
+  -- Never steal an explicit semantic target.
+  if type(tx) == "number" and type(ty) == "number" then
+    if warpIntentAt(game, map, cur, tx, ty) then return nil end
+    if interactionAt(game, tx, ty) ~= nil then return nil end
+    if hiddenTreasureInteractionAt(game, cur.mapId, tx, ty) ~= nil then return nil end
+    if ControlsFree.cutInteractionAt(game, map, overview, tx, ty) ~= nil then return nil end
+  end
+
+  local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
+  local topology = ledgeTopology(game, map, overview)
+  local _, _, staticOccupied = liveOccupancy(game)
+
+  -- The rule is a fallback, not a shortcut through an otherwise valid route.
+  local eligible = false
+  if targetErr == "outside_world" or targetErr == "outside_map"
+      or targetErr == "connected_map" then
+    eligible = true
+  elseif targetErr ~= nil then
+    return nil
+  elseif type(tx) == "number" and type(ty) == "number" then
+    local ch = cellChar(overview, tx, ty)
+    local legal = ch == "." or (ch == "~" and waterMode)
+    if not legal then
+      eligible = true
+    else
+      local direct = findPath(overview, cur.x, cur.y, tx, ty, waterMode,
+        staticOccupied, nil, topology.blockedEdges, nil, topology.jumps)
+      if direct then return nil end
+      eligible = true
+    end
+  end
+  if not eligible then return nil end
+
+  local activeWarps, activeByKey = {}, {}
+  for _, w in ipairs(actualWarpCells(map)) do
+    if WorldBackend.gold.warpFiresAt(game, map, w.x, w.y) then
+      activeWarps[#activeWarps + 1] = w
+      activeByKey[key(w.x, w.y)] = w
+    end
+  end
+  if #activeWarps == 0 then return nil end
+
+  local function legalCell(cx, cy)
+    local ch = cellChar(overview, cx, cy)
+    return ch == "." or (ch == "~" and waterMode)
+  end
+  local function staticSolid(cx, cy)
+    if cx < 0 or cy < 0 or cx >= overview.width or cy >= overview.height then
+      return false
+    end
+    if activeByKey[key(cx, cy)] then return false end
+    return not legalCell(cx, cy)
+  end
+
+  -- Intent ownership is TAP-centric, not PLAYER-centric.  The old algorithm
+  -- marched from the player and committed to the first facade on that ray.
+  -- That made a nearby building steal a slightly skewed click intended for a
+  -- farther building.  Instead find the solid surface/component whose geometry
+  -- is closest to the actual tap.  If that component has no door, do not jump
+  -- to an unrelated building merely because it has a reachable entrance.
+  local function pointToCellDistanceSq(wx, wy, cx, cy)
+    local dx, dy = 0, 0
+    if wx < cx then dx = cx - wx
+    elseif wx > cx + 1 then dx = wx - (cx + 1) end
+    if wy < cy then dy = cy - wy
+    elseif wy > cy + 1 then dy = wy - (cy + 1) end
+    return dx * dx + dy * dy
+  end
+
+  local seedX, seedY, seedDist
+  -- An explicit solid clicked cell is the strongest possible component seed.
+  if type(tx) == "number" and type(ty) == "number" and staticSolid(tx, ty) then
+    seedX, seedY, seedDist = tx, ty, 0
+  else
+    -- Only runs on semantic fallback/no-route taps, never on the normal hot
+    -- movement path.  A full map scan is deterministic and cheap enough here,
+    -- and importantly works even when the tap lies outside the current map.
+    for cy = 0, overview.height - 1 do
+      for cx = 0, overview.width - 1 do
+        if staticSolid(cx, cy) then
+          local dist = pointToCellDistanceSq(intentX, intentY, cx, cy)
+          if seedDist == nil or dist < seedDist then
+            seedX, seedY, seedDist = cx, cy, dist
+          end
+        end
+      end
+    end
+  end
+  if seedX == nil then return nil end
+
+  -- Do not reinterpret a genuine local interaction/CUT surface as a building
+  -- just because the nearest geometric component also has a door somewhere.
+  if interactionAt(game, seedX, seedY) ~= nil
+      or ControlsFree.cutInteractionAt(game, map, overview, seedX, seedY) ~= nil then
+    return nil
+  end
+
+  -- Flood exactly the tap-nearest obstacle component.  This is what gives the
+  -- click ownership to the intended building rather than the building nearest
+  -- to the player.
+  local component = {}
+  local queue = { { seedX, seedY } }
+  local head, componentSize = 1, 0
+  component[key(seedX, seedY)] = true
+  local COMPONENT_LIMIT = 320
+  while head <= #queue and componentSize < COMPONENT_LIMIT do
+    local node = queue[head]; head = head + 1
+    componentSize = componentSize + 1
+    for _, d in ipairs(DIRS) do
+      local nx, ny = node[1] + d.dx, node[2] + d.dy
+      local nk = key(nx, ny)
+      if not component[nk] and staticSolid(nx, ny) then
+        component[nk] = true
+        queue[#queue + 1] = { nx, ny }
+      end
+    end
+  end
+
+  local function componentDistance(wx, wy)
+    local best = nil
+    for dy = -2, 2 do
+      for dx = -2, 2 do
+        local md = math.abs(dx) + math.abs(dy)
+        if md <= 2 and component[key(wx + dx, wy + dy)] then
+          if not best or md < best then best = md end
+        end
+      end
+    end
+    return best
+  end
+
+  local px, py = cur.x + 0.5, cur.y + 0.5
+  local ivx, ivy = intentX - px, intentY - py
+  local best, bestTapDist, bestCompDist, bestPathCost
+  for _, w in ipairs(activeWarps) do
+    local compDist = componentDistance(w.x, w.y)
+    if compDist ~= nil then
+      local cx, cy = w.x + 0.5, w.y + 0.5
+      -- Keep obviously backwards entrances from stealing a forward intent, but
+      -- do not use player distance as a score.  Zero/near-zero intent vectors
+      -- simply skip this half-plane guard.
+      local rpx, rpy = cx - px, cy - py
+      local forward = ivx * ivx + ivy * ivy < 0.25
+        or (rpx * ivx + rpy * ivy) > -0.10
+      if forward then
+        local wk = key(w.x, w.y)
+        local blocked = {}
+        for other in pairs(activeByKey) do
+          if other ~= wk then blocked[other] = true end
+        end
+        local dirs = warpActivationDirections(game, map, w.x, w.y)
+        local path = findPath(overview, cur.x, cur.y, w.x, w.y, waterMode,
+          staticOccupied, nil, topology.blockedEdges, blocked, topology.jumps,
+          #dirs > 0)
+        if path then
+          local dx, dy = cx - intentX, cy - intentY
+          local tapDist = dx * dx + dy * dy
+          local pathCost = #path
+          -- Strict lexicographic priority:
+          --   1. closest door to the CLICK,
+          --   2. tightest attachment to that component,
+          --   3. only then the player's route cost as a tie-breaker.
+          -- This guarantees that a closer player-side shop cannot beat the
+          -- building the pointer is actually nearest to.
+          local better = bestTapDist == nil or tapDist < bestTapDist - 1e-9
+          if not better and bestTapDist ~= nil
+              and math.abs(tapDist - bestTapDist) <= 1e-9 then
+            better = bestCompDist == nil or compDist < bestCompDist
+            if not better and bestCompDist == compDist then
+              better = bestPathCost == nil or pathCost < bestPathCost
+            end
+          end
+          if better then
+            local intent = warpIntentAt(game, map, cur, w.x, w.y)
+            if intent then
+              intent.barrierDoor = true
+              intent.barrierDirectRay = false
+              intent.barrierX, intent.barrierY = seedX, seedY
+              intent.barrierComponentSize = componentSize
+              intent.barrierComponentDistance = compDist
+              intent.barrierPathCost = pathCost
+              intent.barrierTapDistance = math.sqrt(tapDist)
+              intent.barrierSeedDistance = math.sqrt(seedDist or 0)
+              best, bestTapDist = intent, tapDist
+              bestCompDist, bestPathCost = compDist, pathCost
+            end
+          end
+        end
+      end
+    end
+  end
+  return best
+end
+
 -- Scripted dungeon holes are a different transition class: they can be
 -- ordinary walkable collision cells with NO map warp record at all; the map's
 -- onStep script performs the transition after Red actually steps onto them
@@ -4000,8 +5565,7 @@ end
 ControlsFree.carpetDownIntentAt = ControlsFree.directionalWarpIntentAt
 
 local function directConnectionExitIntents(game, overview, cur)
-  local ow = game and game.overworld
-  local current = ow and ow.map
+  local current = WorldBackend.map(game)
   local out = {}
   if not current or not current.def or not current.def.connections then
     return out
@@ -4011,10 +5575,15 @@ local function directConnectionExitIntents(game, overview, cur)
   local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
   local sourceTopology = ledgeTopology(game, current, overview)
   local warpKeys = {}
-  for _, w in ipairs(actualWarpCells(current)) do warpKeys[key(w.x,w.y)] = true end
+  for _, w in ipairs(actualWarpCells(current)) do
+    if not WorldBackend.isGold(game)
+        or WorldBackend.gold.warpFiresAt(game, current, w.x, w.y) then
+      warpKeys[key(w.x,w.y)] = true
+    end
+  end
 
   local function scanConnection(compass, conn, occupancy, dynamicOnly)
-    local destMap, nb = loadedNeighborMap(game, conn.map)
+    local destMap, nb = loadedNeighborMap(game, conn.map or conn.mapId)
     local destOverview = overviewFromLoadedMap(destMap)
     local dir = COMPASS_TO_DIR[compass]
     if not destMap or not destOverview or not dir then return false end
@@ -4091,7 +5660,7 @@ local function directConnectionExitIntents(game, overview, cur)
 end
 
 -- When the pointer is aimed at space that belongs to neither the current map
--- nor a rendered direct neighbour, interpret it as "leave this area". This
+-- nor a routable rendered neighbour, interpret it as "leave this area". This
 -- deliberately uses ACTUAL warp records (map.def.warps), not only the visual
 -- '+' cells from mapOverview: Gen I interior exit carpets are warp records on
 -- ordinary-looking floor cells and only fire when the player then walks off
@@ -4143,8 +5712,7 @@ function ControlsFree.rankSmartExitWarpsCheap(game, map, warps, cur,
 end
 
 local function nearestExitTarget(game, overview, cur, intentX, intentY)
-  local ow = game and game.overworld
-  local map = ow and ow.map
+  local map = WorldBackend.map(game)
   if not map or not overview or not cur then return nil end
 
   -- Supplying intent coordinates means this is the INITIAL off-map click, not
@@ -4158,6 +5726,15 @@ local function nearestExitTarget(game, overview, cur, intentX, intentY)
 
   local candidates = {}
   local warps = actualWarpCells(map)
+  if WorldBackend.isGold(game) then
+    local usable = {}
+    for _, w in ipairs(warps) do
+      if WorldBackend.gold.warpFiresAt(game, map, w.x, w.y) then
+        usable[#usable + 1] = w
+      end
+    end
+    warps = usable
+  end
   local all, dynamic, static = liveOccupancy(game)
   local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
   local topology = ledgeTopology(game, map, overview)
@@ -4328,6 +5905,166 @@ local function nearestExitTarget(game, overview, cur, intentX, intentY)
   return candidates[1]
 end
 
+
+-- Gold indoor exit semantic safety check.  Smart Exit and barrier-door
+-- inference are intentionally broad enough to understand a tap just outside a
+-- room.  That same forgiving behavior can be too eager when the player merely
+-- misses a visible NPC/item/fixture by a few screen pixels: without this pass,
+-- the miss is interpreted as "leave the room" and the route heads for the
+-- carpet/door instead of the thing the finger was obviously beside.
+--
+-- This is NOT a general NPC magnet.  It is considered only for an INDOOR tap
+-- that is already exit-prone (outside-map/world or a non-walkable local hit),
+-- and exact native exits/warps/holes plus exact interactions always win before
+-- this function is allowed to look around.  Candidates are measured in the
+-- rendered SCREEN space so zoom and TILT do not change the human tolerance.
+-- A candidate must also have a valid interaction approach; an unreachable NPC
+-- can never suppress a legitimate Smart Exit.
+function ControlsFree.goldIndoorExitSemanticAssist(game, screenX, screenY,
+    cur, overview, tx, ty, targetErr, cross, targetMeta)
+  if not WorldBackend.isGold(game) or option("interact", true) == false then
+    return nil
+  end
+  local world = WorldBackend.gold.owner(game)
+  local map = world and world.map
+  if not (world and map and cur and overview) then return nil end
+  if map.id ~= cur.mapId or overview.mapId ~= cur.mapId then return nil end
+  if defLooksOutdoor(game, map.def) or cross then return nil end
+
+  -- Exact semantics remain authoritative.  In particular, an intentional tap
+  -- on the carpet/door must never be stolen by a nearby nurse or item ball.
+  if type(tx) == "number" and type(ty) == "number" then
+    if interactionAt(game, tx, ty) ~= nil then return nil end
+    if hiddenTreasureInteractionAt(game, cur.mapId, tx, ty) ~= nil then return nil end
+    if ControlsFree.cutInteractionAt(game, map, overview, tx, ty) ~= nil then return nil end
+    if warpIntentAt(game, map, cur, tx, ty) ~= nil then return nil end
+    if ControlsFree.directionalWarpIntentAt
+        and ControlsFree.directionalWarpIntentAt(game, map, cur, tx, ty) ~= nil then
+      return nil
+    end
+    if ControlsFree.holeStepIntentAt
+        and ControlsFree.holeStepIntentAt(map, overview, tx, ty) ~= nil then
+      return nil
+    end
+  end
+
+  local exitProne = targetErr == "outside_world" or targetErr == "outside_map"
+      or (targetMeta and targetMeta.outsideBehind == true)
+  if not exitProne and type(tx) == "number" and type(ty) == "number" then
+    local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
+    local ch = cellChar(overview, tx, ty)
+    -- A valid floor click is ordinary movement and must never gain a semantic
+    -- halo merely because an NPC happens to be nearby.
+    exitProne = not (ch == "." or (ch == "~" and waterMode))
+  end
+  if not exitProne then return nil end
+
+  local g = ControlsFree.goldFrameGeometry(game, cur.mapId)
+  local scale = g and tonumber(g.scale) or nil
+  screenX, screenY = tonumber(screenX), tonumber(screenY)
+  if not (g and scale and scale > 0 and screenX and screenY) then return nil end
+
+  local originX = tonumber(g.originX)
+    or math.floor(-(tonumber(g.cameraX) or 0) * scale)
+  local originY = tonumber(g.originY)
+    or math.floor(-(tonumber(g.cameraY) or 0) * scale)
+  local tilePx = TILE_SIZE * scale
+  local spritePad = tilePx * 0.22
+  local fixtureRadius = tilePx * 0.62
+
+  local function worldPixelToScreen(wx, wy)
+    wx, wy = tonumber(wx), tonumber(wy)
+    if not wx or not wy then return nil end
+    local flatX = originX + wx * scale
+    local flatY = originY + wy * scale
+    return ControlsFree.goldFrameFlatToScreen(game, flatX, flatY, cur.mapId)
+  end
+
+  local function rectDistance(px, py, l, t, r, b)
+    local dx = px < l and (l - px) or (px > r and (px - r) or 0)
+    local dy = py < t and (t - py) or (py > b and (py - b) or 0)
+    return math.sqrt(dx * dx + dy * dy)
+  end
+
+  local function reachableInteraction(interaction)
+    local probe = newNavigation(cur)
+    probe.interaction = copyFlat(interaction)
+    probe.goalKind = "interact"
+    local ok, why = buildInteractionPath(game, probe, cur)
+    if ok or why == "dynamic" then
+      return probe.interaction
+    end
+    return nil
+  end
+
+  local best, bestScore, bestDist, bestKind
+  local function consider(interaction, distance, kind, bias)
+    if not interaction or distance == nil then return end
+    local resolved = reachableInteraction(interaction)
+    if not resolved then return end
+    local score = distance / math.max(1, tilePx) + (bias or 0)
+    if not bestScore or score < bestScore then
+      best, bestScore, bestDist, bestKind = resolved, score, distance, kind
+    end
+  end
+
+  -- NPCs and visible item balls are upright billboards under Gold TILT.  The
+  -- renderer anchors each at its FOOT, then translates that foot to the tilted
+  -- ground point without shearing/resizing the sprite.  Reproduce that exact
+  -- geometry here and put only a small pad around the visible 16px sprite.
+  for _, entity in ipairs(world.npcs or {}) do
+    if WorldBackend.gold.entityIsInteractable(entity) then
+      local ex = tonumber(entity.px)
+        or (tonumber(entity.cellX) and tonumber(entity.cellX) * TILE_SIZE)
+      local ey = tonumber(entity.py)
+        or (tonumber(entity.cellY) and tonumber(entity.cellY) * TILE_SIZE)
+      if ex and ey then
+        local fx, fy = worldPixelToScreen(ex + TILE_SIZE * 0.5, ey + TILE_SIZE)
+        if fx and fy then
+          -- SpriteRenderer's overworld sheet sits slightly above its gameplay
+          -- cell; use the rendered billboard footprint, not a whole-cell halo.
+          local l, r = fx - tilePx * 0.50, fx + tilePx * 0.50
+          local t, b = fy - tilePx * 1.28, fy + tilePx * 0.08
+          local dist = rectDistance(screenX, screenY, l, t, r, b)
+          if dist <= spritePad then
+            local ix = tonumber(entity.cellX) or math.floor(ex / TILE_SIZE)
+            local iy = tonumber(entity.cellY) or math.floor(ey / TILE_SIZE)
+            consider(entityInteraction(entity, ix, iy), dist, "entity", 0)
+          end
+        end
+      end
+    end
+  end
+
+  -- Gold bg events are visible fixed fixtures/signs/PCs.  Hidden treasure is
+  -- excluded by bgInteractionAt itself and therefore remains exact-tap only.
+  for _, ev in ipairs((map.def and map.def.bgEvents) or {}) do
+    local cx, cy = tonumber(ev.x), tonumber(ev.y)
+    if cx and cy then
+      local interaction = WorldBackend.gold.bgInteractionAt(game, cx, cy)
+      if interaction then
+        local sx, sy = ControlsFree.goldCellCenterToScreen(game, cur.mapId, cx, cy)
+        if sx and sy then
+          local dx, dy = screenX - sx, screenY - sy
+          local dist = math.sqrt(dx * dx + dy * dy)
+          if dist <= fixtureRadius then
+            -- A real actor is the stronger interpretation when both overlap.
+            consider(interaction, dist, "fixture", 0.08)
+          end
+        end
+      end
+    end
+  end
+
+  if not best then return nil end
+  local ix, iy = interactionTarget(game, best)
+  if ix == nil or iy == nil then return nil end
+  return {
+    x = ix, y = iy, interaction = best,
+    kind = bestKind, screenDistance = bestDist,
+  }
+end
+
 local function routeFeedback(showFeedback, kind, x, y)
   if showFeedback then setPulse(kind, x, y) end
 end
@@ -4371,7 +6108,12 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
   -- A genuinely new pointer press supersedes a previous automatic
   -- multi-floor exit journey. Hold-to-Steer refreshes never reach here while
   -- an exit journey owns navigation, so only a fresh user intent cancels it.
-  if gestureId ~= nil and state.exitJourney then state.exitJourney = nil end
+  if gestureId ~= nil then
+    if state.exitJourney then state.exitJourney = nil end
+    -- A fresh user command also supersedes a remote target that was waiting
+    -- for a warp/gate transition to settle.
+    state.pendingRemoteGoal = nil
+  end
 
   -- A fresh pointer intent supersedes any destination that was waiting to
   -- resume after a wild encounter. The CURRENT route is not retired until its
@@ -4381,6 +6123,125 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
   local tx, ty, cur, overview, targetErr, cross, targetMeta
   tx, ty, cur, overview, targetErr, cross, targetMeta =
     targetFromTap(game, screenX, screenY)
+
+  -- Before Smart Exit or the broad barrier-door fallback can reinterpret an
+  -- indoor miss as "leave", give a very small rendered-space halo to a real
+  -- nearby NPC/item/fixture.  Exact carpet/door taps are excluded inside the
+  -- helper, so this improves forgiving interaction without weakening exits.
+  if not continuous and WorldBackend.isGold(game) then
+    local semanticAssist = ControlsFree.goldIndoorExitSemanticAssist(
+      game, screenX, screenY, cur, overview, tx, ty, targetErr, cross, targetMeta)
+    if semanticAssist then
+      targetMeta = targetMeta or {}
+      targetMeta.forcedInteraction = semanticAssist.interaction
+      targetMeta.goldExitSemanticAssist = semanticAssist
+      targetMeta.semanticAssistRawX, targetMeta.semanticAssistRawY = tx, ty
+      targetMeta.semanticAssistOriginalError = targetErr
+      tx, ty = semanticAssist.x, semanticAssist.y
+      targetErr, cross = nil, nil
+      state.stats.goldExitSemanticAssists =
+        (state.stats.goldExitSemanticAssists or 0) + 1
+    end
+  end
+
+  -- A Gold doorway is visually taller than its collision/warp source.  On the
+  -- initial press only, let a nearby REAL native warp claim that graphic.  Do
+  -- not continuously acquire new exits while Hold-to-Steer is reprojecting the
+  -- same pointer as the camera moves.
+  if not continuous and tx and ty and not cross and not targetErr
+      and WorldBackend.isGold(game) then
+    local currentMap = WorldBackend.map(game)
+    local magnet = ControlsFree.goldDoorMagnet(
+      game, currentMap, cur, overview, tx, ty, targetMeta)
+    if magnet then
+      targetMeta = targetMeta or {}
+      targetMeta.goldDoorMagnet = magnet
+      targetMeta.doorMagnetClickedX, targetMeta.doorMagnetClickedY = tx, ty
+      tx, ty = magnet.x, magnet.y
+      state.stats.goldDoorMagnetSnaps =
+        (state.stats.goldDoorMagnetSnaps or 0) + 1
+    end
+  end
+
+  -- If the click is deliberately beyond an actually blocking Gold facade, a
+  -- door on THAT obstacle may represent the user's intended continuation even
+  -- when the pointer is several cells above the visible doorway.  This runs
+  -- only on the initial tap and only after the narrow visual door magnet.
+  if not continuous and WorldBackend.isGold(game)
+      and not (targetMeta and targetMeta.goldDoorMagnet) then
+    local currentMap = WorldBackend.map(game)
+    local barrierDoor = ControlsFree.goldBarrierDoorIntent(
+      game, currentMap, cur, overview,
+      targetMeta and targetMeta.intentX or nil,
+      targetMeta and targetMeta.intentY or nil,
+      tx, ty, targetErr, cross)
+    if barrierDoor then
+      targetMeta = targetMeta or {}
+      targetMeta.goldBarrierDoor = barrierDoor
+      targetMeta.barrierDoorClickedX, targetMeta.barrierDoorClickedY = tx, ty
+      targetMeta.barrierDoorOriginalError = targetErr
+      tx, ty = barrierDoor.x, barrierDoor.y
+      targetErr, cross = nil, nil
+      state.stats.goldBarrierDoorSnaps =
+        (state.stats.goldBarrierDoorSnaps or 0) + 1
+    end
+  end
+
+  -- Preserve one exact live Gold tap sample for the existing DEBUG OVERLAY.
+  -- This turns a screenshot into actionable calibration data: raw pointer,
+  -- pre/post-door cell, projected centre, camera/zoom/crop and perspective.
+  -- It is read-only instrumentation and never participates in route choice.
+  if not continuous and WorldBackend.isGold(game) then
+    local d = {
+      screenX = tonumber(screenX), screenY = tonumber(screenY),
+      mapId = cur and cur.mapId or (overview and overview.mapId),
+      rawCellX = targetMeta and (targetMeta.doorMagnetClickedX
+        or targetMeta.barrierDoorClickedX) or tx,
+      rawCellY = targetMeta and (targetMeta.doorMagnetClickedY
+        or targetMeta.barrierDoorClickedY) or ty,
+      finalCellX = tx, finalCellY = ty,
+      targetErr = targetErr,
+      intentX = targetMeta and targetMeta.intentX or nil,
+      intentY = targetMeta and targetMeta.intentY or nil,
+      doorSnap = targetMeta and targetMeta.goldDoorMagnet ~= nil or false,
+      barrierDoor = targetMeta and targetMeta.goldBarrierDoor ~= nil or false,
+      semanticAssist = targetMeta and targetMeta.goldExitSemanticAssist ~= nil or false,
+      semanticAssistKind = targetMeta and targetMeta.goldExitSemanticAssist
+        and targetMeta.goldExitSemanticAssist.kind or nil,
+      semanticAssistDistance = targetMeta and targetMeta.goldExitSemanticAssist
+        and targetMeta.goldExitSemanticAssist.screenDistance or nil,
+      barrierX = targetMeta and targetMeta.goldBarrierDoor
+        and targetMeta.goldBarrierDoor.barrierX or nil,
+      barrierY = targetMeta and targetMeta.goldBarrierDoor
+        and targetMeta.goldBarrierDoor.barrierY or nil,
+      barrierPerpendicular = targetMeta and targetMeta.goldBarrierDoor
+        and targetMeta.goldBarrierDoor.barrierPerpendicular or nil,
+      tick = state.tick,
+    }
+    local g = ControlsFree.goldFrameGeometry(game, d.mapId)
+    if g then
+      d.scale = tonumber(g.scale)
+      d.cameraX, d.cameraY = tonumber(g.cameraX), tonumber(g.cameraY)
+      d.originX, d.originY = tonumber(g.originX), tonumber(g.originY)
+      d.captureW, d.captureH = tonumber(g.captureW), tonumber(g.captureH)
+      d.cropX, d.cropY = tonumber(g.cropX), tonumber(g.cropY)
+      d.tiltActive = g.tiltActive == true
+      d.tiltAngle = tonumber(g.tiltAngle)
+    end
+    if d.finalCellX ~= nil and d.finalCellY ~= nil and d.mapId ~= nil then
+      d.cellScreenX, d.cellScreenY = ControlsFree.goldCellCenterToScreen(
+        game, d.mapId, d.finalCellX, d.finalCellY)
+      if d.cellScreenX and d.screenX then d.deltaX = d.cellScreenX - d.screenX end
+      if d.cellScreenY and d.screenY then d.deltaY = d.cellScreenY - d.screenY end
+    end
+    local live = mod.world and mod.world:current()
+    if live and live.mapId == d.mapId then
+      d.playerCellX, d.playerCellY = live.x, live.y
+      d.playerScreenX, d.playerScreenY = ControlsFree.goldCellCenterToScreen(
+        game, d.mapId, live.x, live.y)
+    end
+    state.lastGoldTapDiagnostic = d
+  end
 
   -- The player's billboard is not an opaque semantic target. A short tap that
   -- begins on Red first gets the exact same scene/interaction resolution as
@@ -4406,7 +6267,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       local semanticBehind = cross ~= nil
         or (targetMeta and targetMeta.forcedInteraction ~= nil)
         or (targetMeta and targetMeta.visibleKind == "entity")
-      local currentMap = game and game.overworld and game.overworld.map
+      local currentMap = WorldBackend.map(game)
       if not semanticBehind and tx and ty then
         semanticBehind = interactionAt(game, tx, ty) ~= nil
           or hiddenTreasureInteractionAt(game, cur and cur.mapId, tx, ty) ~= nil
@@ -4450,11 +6311,18 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
   -- of the real warp source and ExtraWarpCheck can require any of the four
   -- directions, not only DOWN.  Resolve the opening through actual warp data
   -- first, then route to the source and append the engine-required direction.
+  if targetMeta and (targetMeta.goldDoorMagnet or targetMeta.goldBarrierDoor) then
+    targetMeta.directionalWarpIntent = targetMeta.goldDoorMagnet
+      or targetMeta.goldBarrierDoor
+    semanticKind = "door"
+  end
   if tx and not cross and cur and overview
       and not (targetMeta and targetMeta.forcedInteraction)
       and ControlsFree.directionalWarpIntentAt then
-    local map = game and game.overworld and game.overworld.map
-    local directionalIntent = ControlsFree.directionalWarpIntentAt(game, map, cur, tx, ty)
+    local map = WorldBackend.map(game)
+    local directionalIntent = targetMeta
+      and (targetMeta.goldDoorMagnet or targetMeta.goldBarrierDoor)
+      or ControlsFree.directionalWarpIntentAt(game, map, cur, tx, ty)
     if directionalIntent then
       targetMeta = targetMeta or {}
       targetMeta.directionalWarpIntent = directionalIntent
@@ -4479,7 +6347,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       and not (targetMeta and targetMeta.forcedInteraction)
       and not (targetMeta and targetMeta.directionalWarpIntent)
       and ControlsFree.holeStepIntentAt then
-    local map = game and game.overworld and game.overworld.map
+    local map = WorldBackend.map(game)
     local holeIntent = ControlsFree.holeStepIntentAt(map, overview, tx, ty)
     if holeIntent then
       targetMeta = targetMeta or {}
@@ -4493,7 +6361,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
   -- ray's ground point is clearly beyond the current interior.
   if tx and targetMeta and targetMeta.outsideBehind
       and targetMeta.visibleKind == "structure" and cur and overview then
-    local currentMap = game and game.overworld and game.overworld.map
+    local currentMap = WorldBackend.map(game)
     local currentDef = currentMap and currentMap.def
     -- `outsideBehind` is the one retained Voxel-only geometric fallback: the
     -- SAME ray hits current-map exterior structure while its ground point lies
@@ -4505,7 +6373,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     local visibleInteraction = option("interact", true) ~= false
       and interactionAt(game, tx, ty) or nil
     local visibleWarp = warpIntentAt(game, currentMap, cur, tx, ty)
-    if not visibleInteraction and not visibleWarp and not defLooksOutdoor(currentDef) then
+    if not visibleInteraction and not visibleWarp and not defLooksOutdoor(game, currentDef) then
       tx, ty, cross, targetErr = nil, nil, nil, "outside_map"
     end
   end
@@ -4569,7 +6437,10 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     return false
   end
 
-  local requestedMapId = cross and cross.destMapId or (cur and cur.mapId)
+  local requestedMapId = cross
+    and ((cross.goldSimpleRemote and cross.goldSimpleRemote.mapId)
+      or (cross.remoteGoal and cross.remoteGoal.mapId) or cross.destMapId)
+    or (cur and cur.mapId)
   if continuous and state.nav
       and state.nav.goalKind ~= "move_nearest"
       and state.nav.requestedMapId == requestedMapId
@@ -4582,6 +6453,71 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
 
   if cross then
     local rawTx, rawTy = tx, ty
+
+    -- Gold remote-map taps use a deliberately isolated controller.  Do not
+    -- feed them back through the older cross-target classifier: on a multi-hop
+    -- route `tx,ty` belong to the FINAL map while cross.destOverview belongs
+    -- to the FIRST destination map.  Treating those coordinate spaces as the
+    -- same was exactly the kind of plausible-looking failure that made the
+    -- previous remote routing brittle.
+    if WorldBackend.isGold(game) and cross.goldSimpleRemote then
+      candidate = newNavigation(cur)
+      candidate.goalKind = exitFallback and "exit_connection" or "cross_move"
+      candidate.cross = copyFlat(cross)
+      candidate.goldSimpleRemote = copyFlat(cross.goldSimpleRemote)
+      candidate.cross.goldSimpleRemote = candidate.goldSimpleRemote
+      candidate.requestedMapId = candidate.goldSimpleRemote.mapId
+      candidate.requestedX, candidate.requestedY = rawTx, rawTy
+      buildStatus, buildWhy = rebuildNavigation(game, candidate, cur)
+
+      -- A rendered remote map can be visually straight ahead while a building
+      -- or gatehouse intentionally breaks the seamless connection.  In that
+      -- case the remote target is real, but the FIRST physical leg is not a
+      -- map seam at all: it is a native warp door on the blocking facade.
+      -- Only try this AFTER the ordinary Gold remote planner has proved there
+      -- is no usable seam.  This preserves every test10 success and restores
+      -- the older "click beyond the building -> use its door" affordance.
+      if not buildStatus and buildWhy ~= "dynamic" and not continuous then
+        local currentMap = WorldBackend.map(game)
+        local portalDoor = ControlsFree.goldBarrierDoorIntent(
+          game, currentMap, cur, overview,
+          targetMeta and targetMeta.intentX or nil,
+          targetMeta and targetMeta.intentY or nil,
+          nil, nil, "connected_map", nil)
+        if portalDoor then
+          local remoteGoal = copyFlat(cross.goldSimpleRemote)
+          local remoteDir = cross.dir
+          targetMeta = targetMeta or {}
+          targetMeta.goldBarrierDoor = portalDoor
+          targetMeta.portalDoorRescue = true
+          state.stats.goldBarrierDoorSnaps =
+            (state.stats.goldBarrierDoorSnaps or 0) + 1
+
+          candidate = newNavigation(cur)
+          candidate.goalKind = "exit"
+          candidate.targetX, candidate.targetY = portalDoor.x, portalDoor.y
+          candidate.exitIntent = portalDoor
+          candidate.exitDir = portalDoor.exitDir
+          -- Unlike an ordinary indoor Smart Exit, this journey starts outside:
+          -- the first door enters a gate, subsequent legs leave the gate, and
+          -- then the original remote map/cell resumes.
+          candidate.exitJourney = true
+          candidate.remotePortalGoal = remoteGoal
+          candidate.remotePortalDir = remoteDir
+          candidate.requestedMapId = cur.mapId
+          candidate.requestedX, candidate.requestedY = portalDoor.x, portalDoor.y
+          buildStatus, buildWhy = rebuildNavigation(game, candidate, cur)
+          if buildStatus or buildWhy == "dynamic" then
+            semanticKind = "door"
+            exitFallback = true
+            if state.lastGoldTapDiagnostic then
+              state.lastGoldTapDiagnostic.barrierDoor = true
+              state.lastGoldTapDiagnostic.portalDoorRescue = true
+            end
+          end
+        end
+      end
+    else
     local rawInteraction = option("interact", true) ~= false
       and neighbourInteractionAt(game, cross, tx, ty) or nil
     local crossInteraction = rawInteraction
@@ -4592,11 +6528,14 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       semanticKind, semanticEntityId = "npc", crossInteraction.entityId
     end
 
-    local targetChar = cellChar(cross.destOverview, tx, ty)
+    local remoteGoal = cross.remoteGoal
+    local targetOverview = remoteGoal and remoteGoal.overview or cross.destOverview
+    local targetMap = remoteGoal and remoteGoal.map or cross.destMap
+    local targetChar = cellChar(targetOverview, tx, ty)
     local waterMode = ControlsFree.routeWaterMode(game, overview, cur)
     local legalMovement = targetChar == "."
       or (targetChar == "~" and waterMode)
-    local crossWarpIntent = warpIntentAt(game, cross.destMap, nil, tx, ty)
+    local crossWarpIntent = warpIntentAt(game, targetMap, nil, tx, ty)
     if crossWarpIntent or targetChar == "+" then semanticKind = "door" end
 
     if legalMovement and not crossInteraction then clearStickySemantic() end
@@ -4607,9 +6546,34 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
 
     if needsNearestCross then
       if retainStickySemantic() then return true end
-      local nx, ny = nearestReachableCrossTarget(
-        game, cur, cross, rawTx, rawTy,
-        continuous and rawInteraction ~= nil)
+      local nx, ny
+      if remoteGoal then
+        -- The expensive route validation below will prove whether this final
+        -- map cell is actually reachable.  Here we only move an unstandable
+        -- visual hit to the nearest legal cell on THAT final rendered map;
+        -- never reinterpret its coordinates inside the immediate neighbour.
+        local maxR = (targetOverview.width or 0) + (targetOverview.height or 0)
+        for r = 0, maxR do
+          local found
+          for cy = rawTy - r, rawTy + r do
+            local dy = math.abs(cy - rawTy)
+            local dx = r - dy
+            for _, cx in ipairs(dx == 0 and { rawTx } or { rawTx - dx, rawTx + dx }) do
+              local ch = cellChar(targetOverview, cx, cy)
+              if ch == "." or (ch == "~" and waterMode) or ch == "+" then
+                found = { x=cx, y=cy }
+                break
+              end
+            end
+            if found then break end
+          end
+          if found then nx, ny = found.x, found.y; break end
+        end
+      else
+        nx, ny = nearestReachableCrossTarget(
+          game, cur, cross, rawTx, rawTy,
+          continuous and rawInteraction ~= nil)
+      end
       if not nx then
         if not continuous and ControlsFree.crossTargetCandidateLimit() ~= nil then
           local localFallback = ControlsFree.currentMapTowardCrossFallback(
@@ -4632,7 +6596,14 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
         return false
       end
       cross = copyFlat(cross)
-      cross.targetX, cross.targetY = nx, ny
+      if remoteGoal then
+        remoteGoal = copyFlat(remoteGoal)
+        remoteGoal.x, remoteGoal.y = nx, ny
+        cross.remoteGoal = remoteGoal
+        tx, ty = nx, ny
+      else
+        cross.targetX, cross.targetY = nx, ny
+      end
       nearestFallback = true
       crossInteraction = nil
     end
@@ -4642,17 +6613,20 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
       or (exitFallback and "exit_connection"
       or (nearestFallback and "cross_nearest" or "cross_move"))
     candidate.cross = cross
+    candidate.remoteGoal = cross.remoteGoal
+    candidate.goldSimpleRemote = cross.goldSimpleRemote
     if exitFallback then
       candidate.exitIntent = exitIntent
-      candidate.exitJourney = not defLooksOutdoor(game and game.overworld
-        and game.overworld.map and game.overworld.map.def)
+      candidate.exitJourney = not defLooksOutdoor(game, WorldBackend.map(game)
+        and WorldBackend.map(game).def)
     end
     candidate.crossInteraction = crossInteraction
     if crossInteraction and gestureId ~= nil then
       candidate.interactionGestureId = gestureId
       candidate.interactionRequiresRelease = true
     end
-    candidate.requestedMapId = cross.destMapId
+    candidate.requestedMapId =
+      (candidate.remoteGoal and candidate.remoteGoal.mapId) or cross.destMapId
     candidate.requestedX, candidate.requestedY = rawTx, rawTy
     local budgetHitsBeforeBuild = state.stats.pathBudgetHits or 0
     buildStatus, buildWhy = rebuildNavigation(game, candidate, cur)
@@ -4663,6 +6637,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     -- usable seam. Fall back toward the requested point rather than making the
     -- held input disappear.
     if not buildStatus and buildWhy ~= "dynamic"
+        and not candidate.remoteGoal
         and not crossInteraction and semanticKind ~= "door"
         and not (directCrossBudgetExhausted
           and ControlsFree.crossTargetCandidateLimit() ~= nil) then
@@ -4673,12 +6648,15 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
         candidate = newNavigation(cur)
         candidate.goalKind = "cross_nearest"
         candidate.cross = cross
-        candidate.requestedMapId = cross.destMapId
+        candidate.remoteGoal = cross.remoteGoal
+        candidate.requestedMapId =
+          (candidate.remoteGoal and candidate.remoteGoal.mapId) or cross.destMapId
         candidate.requestedX, candidate.requestedY = rawTx, rawTy
         buildStatus, buildWhy = rebuildNavigation(game, candidate, cur)
         nearestFallback = buildStatus and true or nearestFallback
       end
     elseif not buildStatus and buildWhy ~= "dynamic"
+        and not candidate.remoteGoal
         and not crossInteraction and semanticKind ~= "door"
         and directCrossBudgetExhausted
         and ControlsFree.crossTargetCandidateLimit() ~= nil then
@@ -4692,6 +6670,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     -- visual direction. HOLD is intentionally excluded; its continuous
     -- steering behavior already remains responsive.
     if not buildStatus and not continuous
+        and not candidate.remoteGoal
         and not crossInteraction and semanticKind ~= "door"
         and ControlsFree.crossTargetCandidateLimit() ~= nil then
       local localFallback = ControlsFree.currentMapTowardCrossFallback(
@@ -4701,6 +6680,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
         buildStatus, buildWhy = true, nil
       end
     end
+    end -- isolated Gold remote-map controller / legacy cross classifier
   else
     -- A cell may intentionally be BOTH a background interaction and a real
     -- directional warp (CERULEAN_TRASHED_HOUSE's wall hole is exactly that).
@@ -4708,14 +6688,14 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     -- warp wins over a fixed bg/sign interaction when the user taps that cell:
     -- tapping the hole means "go through it", not merely "read the hole".
     local selectedWarpIntent = targetMeta and targetMeta.directionalWarpIntent
-      or warpIntentAt(game, game and game.overworld and game.overworld.map,
+      or warpIntentAt(game, WorldBackend.map(game),
                       cur, tx, ty)
     local forcedInteraction = targetMeta and targetMeta.forcedInteraction or nil
     local exactHiddenTreasure = option("interact", true) ~= false
       and hiddenTreasureInteractionAt(game, cur.mapId, tx, ty) or nil
     local cutInteraction = option("interact", true) ~= false
       and ControlsFree.cutInteractionAt(
-        game, game.overworld and game.overworld.map, overview, tx, ty) or nil
+        game, WorldBackend.map(game), overview, tx, ty) or nil
     local rawInteraction = forcedInteraction or exactHiddenTreasure or cutInteraction
       or (option("interact", true) ~= false and interactionAt(game, tx, ty) or nil)
     if cutInteraction and rawInteraction == cutInteraction then
@@ -4800,8 +6780,8 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
         if activeExitIntent then
           candidate.exitIntent = activeExitIntent
           candidate.exitDir = activeExitIntent.exitDir
-          candidate.exitJourney = exitFallback and not defLooksOutdoor(game and game.overworld
-            and game.overworld.map and game.overworld.map.def) or false
+          candidate.exitJourney = exitFallback and not defLooksOutdoor(game, WorldBackend.map(game)
+            and WorldBackend.map(game).def) or false
         end
         candidate.requestedMapId = cur.mapId
         candidate.requestedX, candidate.requestedY = tx, ty
@@ -4843,6 +6823,16 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     return false
   end
 
+  -- Preserve the ORIGINAL pointer intent on the route.  The Gold endpoint
+  -- interaction assist runs only after movement has finished, so it must not
+  -- infer intent from the camera position at that later time.
+  if candidate then
+    candidate.intentX = targetMeta and tonumber(targetMeta.intentX) or candidate.intentX
+    candidate.intentY = targetMeta and tonumber(targetMeta.intentY) or candidate.intentY
+    candidate.tapScreenX = tonumber(screenX)
+    candidate.tapScreenY = tonumber(screenY)
+  end
+
   retireForRetarget(oldNav, continuous)
   state.nav = candidate
   state.stats.routesStarted = state.stats.routesStarted + 1
@@ -4861,6 +6851,8 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
     state.exitJourney = {
       startedTick = state.tick, legs = 1,
       visited = { [cur.mapId] = 1 },
+      remoteGoal = candidate.remotePortalGoal and copyFlat(candidate.remotePortalGoal) or nil,
+      remoteDir = candidate.remotePortalDir,
     }
     state.stats.exitJourneyLegs = state.stats.exitJourneyLegs + 1
   end
@@ -4906,18 +6898,36 @@ local function startExitJourneyLeg(game)
     return false, "manual_override"
   end
   local cur = mod.world and mod.world:current()
-  local overview = mod.world and mod.world:mapOverview()
+  local overview = WorldBackend.overview(game)
   if not cur or not overview or cur.mapId ~= overview.mapId then
     return nil, "map_not_ready"
   end
-  local def = game and game.overworld and game.overworld.map
-      and game.overworld.map.def
-  if defLooksOutdoor(def) then
+  local map = WorldBackend.map(game)
+  local def = map and map.def
+  if defLooksOutdoor(game, def) then
+    if journey.remoteGoal then
+      state.pendingRemoteGoal = copyFlat(journey.remoteGoal)
+      state.exitJourney = nil
+      return true, "remote_resume"
+    end
     state.exitJourney = nil
     return false, "outside"
   end
 
-  local intent = nearestExitTarget(game, overview, cur)
+  -- A portal rescue remembers which side of the original outdoor map the
+  -- player was trying to reach.  Carry that compass intent through a gatehouse
+  -- so the closer BACK door cannot win merely because it costs fewer steps.
+  local intentX, intentY
+  if journey.remoteDir == "up" then
+    intentX, intentY = cur.x + 0.5, -1
+  elseif journey.remoteDir == "down" then
+    intentX, intentY = cur.x + 0.5, (overview.height or cur.y + 1) + 1
+  elseif journey.remoteDir == "left" then
+    intentX, intentY = -1, cur.y + 0.5
+  elseif journey.remoteDir == "right" then
+    intentX, intentY = (overview.width or cur.x + 1) + 1, cur.y + 0.5
+  end
+  local intent = nearestExitTarget(game, overview, cur, intentX, intentY)
   if not intent then
     state.exitJourney = nil
     return false, "no_exit"
@@ -4963,6 +6973,60 @@ local function startExitJourneyLeg(game)
   state.stats.routesStarted = state.stats.routesStarted + 1
   state.stats.exitJourneyLegs = state.stats.exitJourneyLegs + 1
   if dynamic then scheduleDynamicWait(candidate, "exit_journey_dynamic") end
+  return true
+end
+
+-- Resume the ORIGINAL connected-map cell after a barrier door/gate has put the
+-- player back on an outdoor map.  This uses the exact same test10 Gold remote
+-- controller that already works for ordinary seamless neighbours; the portal
+-- layer only bridges the otherwise impossible first seam.
+function ControlsFree.startPendingRemoteGoal(game)
+  local goal = state.pendingRemoteGoal
+  if not goal then return false, "inactive" end
+  local free = overworldGate(game)
+  if not free then return nil, "busy" end
+  local cur = mod.world and mod.world:current()
+  local overview = WorldBackend.overview(game)
+  if not cur or not overview or cur.mapId ~= overview.mapId then
+    return nil, "map_not_ready"
+  end
+
+  local candidate = newNavigation(cur)
+  local ok, why
+  if cur.mapId == goal.mapId then
+    candidate.goalKind = "move"
+    candidate.targetX, candidate.targetY = goal.x, goal.y
+    candidate.requestedMapId = goal.mapId
+    candidate.requestedX, candidate.requestedY = goal.x, goal.y
+    candidate.intentX, candidate.intentY = goal.x + 0.5, goal.y + 0.5
+    ok, why = buildPath(game, candidate, cur)
+    if not ok and why ~= "dynamic" then
+      ok, why = buildNearestLegalPath(game, candidate, cur, goal.x, goal.y)
+    end
+  else
+    local cross = ControlsFree.goldSimpleRemoteTarget(game, goal.mapId, goal.x, goal.y)
+    if not cross then
+      state.pendingRemoteGoal = nil
+      return false, "no_map_route"
+    end
+    candidate.goalKind = "cross_move"
+    candidate.cross = copyFlat(cross)
+    candidate.goldSimpleRemote = copyFlat(cross.goldSimpleRemote)
+    candidate.cross.goldSimpleRemote = candidate.goldSimpleRemote
+    candidate.requestedMapId = goal.mapId
+    candidate.requestedX, candidate.requestedY = goal.x, goal.y
+    ok, why = rebuildNavigation(game, candidate, cur)
+  end
+
+  local dynamic = why == "dynamic"
+  if not ok and not dynamic then
+    state.pendingRemoteGoal = nil
+    return false, why or "no_route"
+  end
+  state.pendingRemoteGoal = nil
+  state.nav = candidate
+  state.stats.routesStarted = state.stats.routesStarted + 1
+  if dynamic then scheduleDynamicWait(candidate, "portal_remote_resume_dynamic") end
   return true
 end
 
@@ -5020,6 +7084,101 @@ local function processPendingInteraction()
   end
 end
 
+
+-- Gold post-arrival semantic resolver ----------------------------------------
+--
+-- This runs ONLY after the proven movement core says "arrived".  It never
+-- participates in pathfinding or exit selection, so a bad semantic guess cannot
+-- stop basic movement.  The user asked for Gen1-style finishing: once stopped,
+-- notice a nearby interaction, face it visibly, confirm facing, then press A.
+ControlsFree.goldPromoteEndpointInteraction = function(game, nav, cur)
+  if not (WorldBackend.isGold(game) and nav and cur)
+      or option("interact", true) == false then return false end
+  if nav.endpointAssistTried or nav.interaction or nav.cross then return false end
+  if nav.goalKind == "exit" or nav.goalKind == "exit_connection"
+      or nav.goalKind == "cross_move" or nav.goalKind == "cross_nearest"
+      or nav.goalKind == "cross_interact" then return false end
+
+  local player = WorldBackend.gold.player(game)
+  if not player or player.moving then return false end
+  nav.endpointAssistTried = true
+
+  local intentX = tonumber(nav.intentX)
+  local intentY = tonumber(nav.intentY)
+  if not intentX or not intentY then
+    intentX = tonumber(nav.requestedX) and (tonumber(nav.requestedX) + 0.5) or nil
+    intentY = tonumber(nav.requestedY) and (tonumber(nav.requestedY) + 0.5) or nil
+  end
+
+  local best
+  local function consider(interaction, tx, ty, dir, rank)
+    if not interaction then return end
+    if interaction.requiredFacing and interaction.requiredFacing ~= dir then return end
+    if interaction.preferredFacing and interaction.preferredFacing ~= dir then
+      rank = rank + 2
+    end
+    local dist = 0
+    if intentX and intentY then
+      local dx = (tx + 0.5) - intentX
+      local dy = (ty + 0.5) - intentY
+      dist = math.sqrt(dx * dx + dy * dy)
+      -- The endpoint rule is intentionally stronger than the initial tap
+      -- magnet: once movement has genuinely stopped, ANY cardinal-adjacent
+      -- native interaction is eligible.  The original tap is used only to
+      -- choose between multiple adjacent candidates.  This mirrors the user's
+      -- Gen1 expectation for PCs/signs/NPCs/hidden objects and cannot interfere
+      -- with walking because it runs only after route completion.
+    end
+    local score = dist * 10 + (rank or 0)
+    if not best or score < best.score then
+      best = { interaction = interaction, x = tx, y = ty,
+               dir = dir, score = score }
+    end
+  end
+
+  local overview = WorldBackend.overview(game)
+  local liveMap = WorldBackend.map(game)
+  for rank, d in ipairs(DIRS) do
+    local tx, ty = cur.x + d.dx, cur.y + d.dy
+    -- Visible/native semantics first.  CUT is also a native A interaction in
+    -- Gold; the field-move handler itself remains authoritative for move/badge
+    -- eligibility.  Hidden treasure is deliberately lower priority when two
+    -- different adjacent semantics compete for the same endpoint.
+    consider(interactionAt(game, tx, ty), tx, ty, d.name, rank)
+    if overview and liveMap then
+      consider(ControlsFree.cutInteractionAt(game, liveMap, overview, tx, ty),
+               tx, ty, d.name, rank + 5)
+    end
+    consider(hiddenTreasureInteractionAt(game, cur.mapId, tx, ty),
+             tx, ty, d.name, rank + 10)
+  end
+
+  if not best then return false end
+  local interaction = copyFlat(best.interaction)
+  local ix, iy = interactionTarget(game, interaction)
+  if not ix then return false end
+  interaction.targetX, interaction.targetY = ix, iy
+  interaction.faceDir = best.dir
+  interaction.clickedX = interaction.clickedX or best.x
+  interaction.clickedY = interaction.clickedY or best.y
+
+  nav.interaction = interaction
+  nav.goalKind = "interact"
+  nav.targetX, nav.targetY = cur.x, cur.y
+  nav.lastX, nav.lastY = cur.x, cur.y
+  nav.path, nav.index = {}, 1
+  nav.faceNeutralTick = nil
+  nav.facePressTick = nil
+  nav.faceVerifiedTick = nil
+  nav.faceRetryCount = 0
+  nav.interactionRequiresRelease = false -- arrival occurs after the tap gesture
+  nav.endpointAssistPromoted = true
+  setPhase(nav, "WALKING", "gold_endpoint_semantic")
+  state.stats.goldEndpointInteractionPromotions =
+    (state.stats.goldEndpointInteractionPromotions or 0) + 1
+  return true
+end
+
 local function interactionAtDestination(game, nav, cur)
   local interaction = nav and nav.interaction
   if not interaction then return false end
@@ -5074,7 +7233,7 @@ local function interactionAtDestination(game, nav, cur)
     return true
   end
 
-  local player = game and game.overworld and game.overworld.player
+  local player = WorldBackend.player(game)
   if not player then
     cancelRoute("interaction_no_player")
     return true
@@ -5180,6 +7339,20 @@ local function interactionAtDestination(game, nav, cur)
   end
 
   releaseHold(nav)
+  if interaction.goldNativeCut and WorldBackend.isGold(game) then
+    -- Tap to Move owns only target selection + stance/facing. Gold's ordinary
+    -- A-press interaction owns move/badge eligibility, the yes/no prompt,
+    -- animation, block replacement and SFX.
+    mod.input:tap(game, "a")
+    state.stats.cutDirectTriggers = (state.stats.cutDirectTriggers or 0) + 1
+    state.pendingInteraction = {
+      tick = state.tick, mapId = nav.mapId, kind = "gold_cut",
+      x = ix, y = iy,
+    }
+    markStop("interaction_triggered", nav)
+    state.nav = nil
+    return true
+  end
   if interaction.cutTarget then
     local ow = game and game.overworld
     local okCheck, status = false, nil
@@ -5271,7 +7444,7 @@ local function tryBattleResume(game)
   end
 
   local cur = mod.world and mod.world:current()
-  local overview = mod.world and mod.world:mapOverview()
+  local overview = WorldBackend.overview(game)
   if not cur or not overview or cur.mapId ~= resume.mapId
       or overview.mapId ~= resume.mapId then
     dropBattleResume("map_changed")
@@ -5362,6 +7535,9 @@ end
 -- overworld's own takeWarp() transition with that SAME record.  No coordinates
 -- are written and no destination is invented.
 function ControlsFree.commitValidatedExitWarp(game, nav, cur)
+  -- Gold transitions remain exclusively movement-driven. Never call takeWarp
+  -- or manufacture destination coordinates from the mod.
+  if WorldBackend.isGold(game) then return false end
   local ow = game and game.overworld
   local map = ow and ow.map
   if not (ow and map and nav and cur and nav.goalKind == "exit"
@@ -5406,6 +7582,29 @@ local function navigationTick(game)
   processPendingInteraction()
 
   local nav = state.nav
+  if not nav and state.pendingRemoteGoal and ControlsFree.goldNativeForcedDirection(game) then
+    -- A gate can drop the player on the same native forced-spawn movement used
+    -- by ordinary doors/stairs.  Resume the remote target only after Gold has
+    -- physically finished that landing step.
+    ControlsFree.releaseSimpleHold()
+    return
+  end
+  if not nav and state.pendingRemoteGoal then
+    local resumed, why = ControlsFree.startPendingRemoteGoal(game)
+    nav = state.nav
+    if resumed == nil then return end
+    if not resumed and not nav then
+      markStop("portal_remote_" .. tostring(why), nil)
+    end
+  end
+  if not nav and state.exitJourney and ControlsFree.goldNativeForcedDirection(game) then
+    -- Gold's PlayerEvents owns currents, ice continuation and the forced DOWN
+    -- step after door/stair/cave spawns.  An interior-exit journey can arrive
+    -- on one of those cells between legs; let the native move settle before
+    -- computing the next floor's route from the real landing coordinate.
+    ControlsFree.releaseSimpleHold()
+    return
+  end
   if not nav and state.exitJourney then
     startExitJourneyLeg(game)
     nav = state.nav
@@ -5422,15 +7621,55 @@ local function navigationTick(game)
 
   local free, gateReason = overworldGate(game)
   if not free then
-    if nav.phase == "WAITING_CUT_FLOW" then return end
+    if nav.phase == "WAITING_CUT_FLOW" or nav.phase == "WAITING_GOLD_SURF" then return end
     cancelRoute("interrupt_" .. tostring(gateReason))
     return
+  end
+
+  if nav.phase == "WAITING_GOLD_SURF" then
+    releaseHold(nav)
+    if ControlsFree.playerIsSurfing(game) then
+      nav.goldSurfStartedTick = nil
+      setPhase(nav, "WALKING", "gold_surf_ready")
+    elseif state.tick - (nav.goldSurfStartedTick or state.tick) > 600 then
+      cancelRoute("gold_surf_timeout")
+      return
+    else
+      return
+    end
   end
 
   local cur = mod.world and mod.world:current()
   if not cur or cur.mapId ~= nav.mapId then
     cancelRoute("map_changed")
     return
+  end
+
+  -- Gold consumes a held D-pad continuously. Crucially, on the exact logic
+  -- frame a step lands, World:stepBody can immediately start ANOTHER step in
+  -- the still-held direction before Tap to Move gets its next input.step hook.
+  -- That is harmless on a straight run, but at a corner / final cell it makes
+  -- the player overshoot with the OLD direction and the next tick reports
+  -- unexpected_movement. Released taps show it most clearly; Hold-to-Steer can
+  -- hide it by continuously retargeting.
+  --
+  -- Pulse ordinary Gold route input one cell at a time: once vanilla has
+  -- actually started the step, release our token and wait for the player to
+  -- settle on the destination cell before choosing the next route direction.
+  -- Turning in place still works because player.moving remains false until the
+  -- turnTimer has drained and the step really begins. Connection/warp/forced
+  -- phases keep their dedicated held-input semantics below.
+  if WorldBackend.isGold(game) and nav.phase == "WALKING" then
+    local goldPlayer = WorldBackend.player(game)
+    if nav.goldStepPulseWait then
+      if goldPlayer and goldPlayer.moving then return end
+      nav.goldStepPulseWait = nil
+    elseif nav.hold and goldPlayer and goldPlayer.moving then
+      releaseHold(nav)
+      nav.goldStepPulseWait = true
+      state.stats.goldStepPulses = (state.stats.goldStepPulses or 0) + 1
+      return
+    end
   end
 
   -- A connected-map seam may itself be the first land -> water edge.
@@ -5440,8 +7679,11 @@ local function navigationTick(game)
       and cur.x == nav.targetX and cur.y == nav.targetY
       and nav.cross.destOverview and nav.cross.entryX and nav.cross.entryY
       and cellChar(nav.cross.destOverview, nav.cross.entryX, nav.cross.entryY) == "~"
-      and game.overworld and game.overworld.player
-      and not game.overworld.player.surfing then
+      and not ControlsFree.playerIsSurfing(game) then
+    if WorldBackend.isGold(game) then
+      cancelRoute("gold_surf_connection_unverified")
+      return
+    end
     local surfState, surfWhy =
       ControlsFree.prepareSeamlessSurfStep(game, nav, nav.cross.dir)
     if surfState == "waiting" then return end
@@ -5494,7 +7736,7 @@ local function navigationTick(game)
 
   if nav.phase == "WAITING_CONNECTION_FACE" then
     releaseHold(nav)
-    local player = game and game.overworld and game.overworld.player
+    local player = WorldBackend.player(game)
     if player and player.moving then return end
     pressConnectionCross(game, nav, cur)
     return
@@ -5522,7 +7764,7 @@ local function navigationTick(game)
 
   if nav.phase == "WAITING_CONNECTION_STEP" then
     releaseHold(nav)
-    local player = game and game.overworld and game.overworld.player
+    local player = WorldBackend.player(game)
     if player and player.moving then return end
     if cur.x ~= nav.cross.entryX or cur.y ~= nav.cross.entryY then
       cancelRoute("connection_landing_mismatch")
@@ -5531,6 +7773,39 @@ local function navigationTick(game)
     nav.lastX, nav.lastY = cur.x, cur.y
     nav.lastProgressTick = state.tick
     nav.path, nav.index = nil, 1
+
+    -- test10 Gold remote routing deliberately re-plans one physical map at a
+    -- time.  The map change and landing above are already the engine's real
+    -- result; now derive the next seam (or final local A*) from this live map.
+    if nav.goldSimpleRemote then
+      local advanced, why = ControlsFree.advanceGoldSimpleRemote(game, nav, cur)
+      if not advanced then
+        if why == "dynamic" then
+          scheduleDynamicWait(nav, "dynamic_after_gold_simple_connection")
+          return
+        end
+        cancelRoute("gold_simple_connection_" .. tostring(why))
+        return
+      end
+      return
+    end
+
+    -- Legacy remote planner retained for Gen1-compatible/internal paths.
+    if nav.remoteGoal and cur.mapId ~= nav.remoteGoal.mapId then
+      local advanced, why = ControlsFree.advanceRemoteConnection(game, nav, cur)
+      if not advanced then
+        state.stats.remoteConnectionRejects =
+          (state.stats.remoteConnectionRejects or 0) + 1
+        if why == "dynamic" then
+          scheduleDynamicWait(nav, "dynamic_after_remote_connection")
+          return
+        end
+        cancelRoute("remote_connection_no_route_" .. tostring(why))
+        return
+      end
+      return
+    end
+
     if nav.crossInteraction then
       nav.interaction = nav.crossInteraction
       nav.crossInteraction = nil
@@ -5685,7 +7960,7 @@ local function navigationTick(game)
   -- must not starve the replan forever.
   if cur.x == nav.targetX and cur.y == nav.targetY then
     if nav.cross and not nav.cross.crossed then
-      local player = game and game.overworld and game.overworld.player
+      local player = WorldBackend.player(game)
       -- When the user is actively HOLDING and vanilla already faces the seam,
       -- there is nothing to re-arm: begin the connection press on this very
       -- fixed tick. Released taps retain the neutral safety poll, and a held
@@ -5731,14 +8006,27 @@ local function navigationTick(game)
   end
 
   local dir = directionTo(cur.x, cur.y, nextNode.x, nextNode.y)
+  if not dir and WorldBackend.isGold(game) and nextNode.forced == "forced" then
+    releaseHold(nav)
+    nav.forcedWaitStarted = nav.forcedWaitStarted or state.tick
+    setPhase(nav, "WAITING_FORCED", "gold_native_forced")
+    if state.tick - nav.forcedWaitStarted > 240 then
+      requestReplan(nav, "forced_timeout_replan")
+    end
+    return
+  end
   if not dir then
     cancelRoute("non_adjacent_plan")
     return
   end
+  if nav.phase == "WAITING_FORCED" then
+    nav.forcedWaitStarted = nil
+    setPhase(nav, "WALKING", "forced_settled")
+  end
 
-  local activeOverview = mod.world and mod.world:mapOverview()
-  local activeMap = game and game.overworld and game.overworld.map
-  local player = game and game.overworld and game.overworld.player
+  local activeOverview = WorldBackend.overview(game)
+  local activeMap = WorldBackend.map(game)
+  local player = WorldBackend.player(game)
 
   -- Seamless Surf must never claim an edge that already belongs to an
   -- exit/warp journey. Some carpet exits can expose terrain classifications
@@ -5750,7 +8038,7 @@ local function navigationTick(game)
     and nav.cross == nil
     and nextWarpIntent == nil
 
-  if surfOwnsNextEdge and activeOverview and player and not player.surfing
+  if surfOwnsNextEdge and activeOverview and player and not ControlsFree.playerIsSurfing(game)
       and cellChar(activeOverview, nextNode.x, nextNode.y) == "~" then
     local surfState, surfWhy =
       ControlsFree.prepareSeamlessSurfStep(game, nav, dir)
@@ -6839,6 +9127,15 @@ end
 -- This fail-open coverage means newly added menus, choice screens and overlays
 -- automatically inherit release-A + swipe D-pad without needing a hard-coded
 -- state-name allowlist.
+function ControlsFree.stateIsBattle(st)
+  if type(st) ~= "table" then return false end
+  -- Gen 1 BattleState has carried isBattle=true since the baseline. Gold uses
+  -- the generation-specific registry id because its battle screen does not
+  -- expose that Gen 1 marker. Avoid a literal Gen 1 screen id so gen2check can
+  -- correctly distinguish the two surfaces.
+  return st.isBattle == true or st.screenId == "Gen2BattleState"
+end
+
 function ControlsFree.dialogTouchSurfaceActive(game)
   local stack = game and game.stack
   if not stack or type(stack.top) ~= "function" then return false end
@@ -6849,13 +9146,13 @@ function ControlsFree.dialogTouchSurfaceActive(game)
   if type(states) == "table" then
     for i = #states, 1, -1 do
       local st = states[i]
-      if st and st.isBattle == true then return false end
+      if ControlsFree.stateIsBattle(st) then return false end
     end
   end
 
   local ok, top = pcall(stack.top, stack)
   if not ok or not top then return false end
-  if top.isBattle == true then return false end
+  if ControlsFree.stateIsBattle(top) then return false end
 
   -- Only the bare overworld is excluded. Any overlay pushed above it is a UI
   -- surface and is deliberately covered by this catch-all control.
@@ -6880,12 +9177,12 @@ function ControlsFree.battleActive(game)
   if type(states) == "table" then
     for i = #states, 1, -1 do
       local st = states[i]
-      if st and st.isBattle == true then return true end
+      if ControlsFree.stateIsBattle(st) then return true end
     end
   end
   if type(stack.top) == "function" then
     local ok, top = pcall(stack.top, stack)
-    if ok and top and top.isBattle == true then return true end
+    if ok and ControlsFree.stateIsBattle(top) then return true end
   end
   return false
 end
@@ -6964,6 +9261,42 @@ function ControlsFree.playerScreenHit(game, x, y)
     end
   end
 
+  if WorldBackend.isGold(game) then
+    local player = WorldBackend.player(game)
+    local g = ControlsFree.goldFrameGeometry(game, cur.mapId)
+    local scale = g and tonumber(g.scale) or nil
+    if player and g and scale and scale > 0 then
+      local originX = tonumber(g.originX) or 0
+      local originY = tonumber(g.originY) or 0
+      -- drawPeople positions the sprite body from the same integer-floored
+      -- map origin as drawGround.  Use the sprite's cell centre for the flat
+      -- hitbox; if TILT is active, translate that centre by the exact delta
+      -- applied to the upright billboard's FOOT anchor (px+8, py+16).
+      local px = tonumber(player.px) or cur.x * TILE_SIZE
+      local py = tonumber(player.py) or cur.y * TILE_SIZE
+      local cx = originX + (px + TILE_SIZE / 2) * scale
+      local cy = originY + (py + TILE_SIZE / 2) * scale
+      if g.tiltActive then
+        local footX = originX + (px + TILE_SIZE / 2) * scale
+        local footY = originY + (py + TILE_SIZE) * scale
+        local projFootX, projFootY = ControlsFree.goldFrameFlatToScreen(
+          game, footX, footY, cur.mapId)
+        if not projFootX then return false end
+        cx = cx + (projFootX - footX)
+        cy = cy + (projFootY - footY)
+      end
+      -- People remain upright and unscaled by perspective, so hitbox size is
+      -- controlled only by Gold zoom after the billboard translation.
+      local tile = TILE_SIZE * scale
+      cy = cy - tile * 0.35
+      local halfW = math.max(16, tile * 0.85)
+      local halfH = math.max(22, tile * 1.35)
+      if math.abs(x - cx) <= halfW and math.abs(y - cy) <= halfH then
+        return true
+      end
+    end
+  end
+
   local view = state.view
   if view then
     local ppx, ppy = playerPixel(game, cur)
@@ -7000,7 +9333,27 @@ function ControlsFree.startMenuTapInside(game, x, y)
   local stack = game and game.stack
   if not stack or type(stack.top) ~= "function" then return nil end
   local okTop, top = pcall(stack.top, stack)
-  if not okTop or type(top) ~= "table" or top.startCloses ~= true then return nil end
+  if not okTop or type(top) ~= "table" then return nil end
+
+  if WorldBackend.isGold(game) and top.screenId == "Gen2StartMenu" then
+    local ww, wh
+    if love and love.graphics and type(love.graphics.getDimensions) == "function" then
+      local okDims, w, h = pcall(love.graphics.getDimensions)
+      if okDims then ww, wh = tonumber(w), tonumber(h) end
+    end
+    local frame = state.frame or {}
+    ww, wh = ww or tonumber(frame.ww), wh or tonumber(frame.wh)
+    if not (ww and wh and type(game.frameFit) == "function") then return nil end
+    local okFit, scale, ox, oy = pcall(game.frameFit, game, ww, wh)
+    if not okFit or not tonumber(scale) then return nil end
+    scale, ox, oy = tonumber(scale), tonumber(ox) or 0, tonumber(oy) or 0
+    -- Gold StartMenu: menu_coords 10,0,19,17 => right half of 160x144.
+    local dx, dy = ox + 10 * 8 * scale, oy
+    local bw, bh = 10 * 8 * scale, 18 * 8 * scale
+    return x >= dx and y >= dy and x < dx + bw and y < dy + bh
+  end
+
+  if top.startCloses ~= true then return nil end
   local tx, ty, tw, th = tonumber(top.tx), tonumber(top.ty), tonumber(top.tw), tonumber(top.th)
   if not (tx and ty and tw and th and tw > 0 and th > 0) then return nil end
 
@@ -7660,6 +10013,7 @@ function ControlsFree.simpleTouchComponents(p)
 end
 
 function ControlsFree.simplePairBlocked(game, map, player, sx, sy, tx, ty)
+  if WorldBackend.isGold(game) then return false end
   local pairs = game and game.data and game.data.field and game.data.field.tilePairs
   local list = pairs and (player and player.surfing and pairs.water or pairs.land)
   if not list or type(map.cellTile) ~= "function" then return false end
@@ -7677,6 +10031,7 @@ function ControlsFree.simplePairBlocked(game, map, player, sx, sy, tx, ty)
 end
 
 function ControlsFree.simplePushableLegal(game, ow, map, tx, ty, dir)
+  if WorldBackend.isGold(game) then return false end
   if not (ow and ow.strengthActive and type(ow.pushableAtCell) == "function") then
     return false
   end
@@ -7702,6 +10057,48 @@ end
 function ControlsFree.simpleDirectionLikelyLegal(game, p, dirName)
   local free = overworldGate(game)
   if not free then return false end
+
+  if WorldBackend.isGold(game) then
+    local world, player, map = WorldBackend.owner(game), WorldBackend.player(game),
+      WorldBackend.map(game)
+    local d = DIR_BY_NAME[dirName]
+    if not (world and map and player and d) then return false end
+    local sx, sy = player.cellX, player.cellY
+    local cellK = key(sx, sy)
+    local failed = p and p.simpleFailed
+    if failed and failed.cell == cellK and failed.dir == dirName
+        and state.tick <= (failed.untilTick or -1) then return false end
+
+    local dirs = warpActivationDirections(game, map, sx, sy)
+    if listHas(dirs, dirName) and WorldBackend.gold.warpFiresAt(game, map, sx, sy) then
+      return true
+    end
+
+    local tx, ty = sx + d.dx, sy + d.dy
+    if not map:inBounds(tx, ty) then
+      local compass = ControlsFree.SIMPLE_DIR_COMPASS[dirName]
+      local conn = map.def and map.def.connections and map.def.connections[compass]
+      return conn ~= nil
+    end
+
+    local overview = WorldBackend.overview(game) or overviewFromLoadedMap(map)
+    if not overview then return false end
+    local topo = ledgeTopology(game, map, overview)
+    for _, jump in ipairs((topo.jumps and topo.jumps[cellK]) or {}) do
+      if jump.dir == dirName then return true end
+    end
+    if topo.blockedEdges and topo.blockedEdges[edgeKey(sx, sy, tx, ty)] then
+      return false
+    end
+    local ch = cellChar(overview, tx, ty)
+    if ch ~= "." and not (ch == "~" and ControlsFree.playerIsSurfing(game)) then
+      return false
+    end
+    local occupied = select(1, liveOccupancy(game))
+    if occupied[key(tx, ty)] then return false end
+    return true
+  end
+
   local ow, player = game.overworld, game.overworld.player
   local map = ow and ow.map
   local d = DIR_BY_NAME[dirName]
@@ -7727,7 +10124,7 @@ function ControlsFree.simpleDirectionLikelyLegal(game, p, dirName)
     return conn ~= nil -- engine remains authoritative for exact seam landing
   end
 
-  local overview = mod.world and mod.world:mapOverview() or overviewFromLoadedMap(map)
+  local overview = WorldBackend.overview(game) or overviewFromLoadedMap(map)
   if overview then
     local topo = ledgeTopology(game, map, overview)
     for _, jump in ipairs((topo.jumps and topo.jumps[cellK]) or {}) do
@@ -7863,7 +10260,7 @@ function ControlsFree.finishSimpleGesture(game, p)
 end
 
 function ControlsFree.simpleTurnTowardBlocked(game, p, dir)
-  local player = game and game.overworld and game.overworld.player
+  local player = WorldBackend.player(game)
   if not player or not dir or player.moving or player.facing == dir then return false end
   -- The direction was already proven non-walkable by the simple legality
   -- filter, so one fixed-step hold can only turn/bonk; it cannot move through
@@ -7899,10 +10296,21 @@ function ControlsFree.simpleMovementTick(game)
     return
   end
   local free = overworldGate(game)
-  local player = game and game.overworld and game.overworld.player
+  local player = WorldBackend.player(game)
   if not free or not player then
     ControlsFree.releaseSimpleHold()
     return
+  end
+  if WorldBackend.isGold(game) then
+    local world, map = WorldBackend.owner(game), WorldBackend.map(game)
+    local Permissions = WorldBackend.gold.permissionsModule()
+    if world and map and Permissions and type(map.cellCollision) == "function" then
+      local forced = ControlsFree.goldNativeForcedDirection(game)
+      if forced then
+        ControlsFree.releaseSimpleHold()
+        return
+      end
+    end
   end
   -- Never queue a second weighted direction in the middle of an engine-owned
   -- walking animation. A new mix decision belongs to the next idle cell.
@@ -8137,6 +10545,7 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
           -- Mutual exclusion: no world target acquisition, Voxel picking or A*.
           if state.nav then cancelRoute("simple_touch_enabled") end
           state.exitJourney = nil
+          state.pendingRemoteGoal = nil
           p.simpleMode = true
           p.initialAccepted = true
         else
@@ -8371,6 +10780,7 @@ mod.hooks:wrap("input.step", function(nextFn, game, dt)
     if simpleNow then
       if state.nav then cancelRoute("simple_touch_enabled") end
       state.exitJourney = nil
+      state.pendingRemoteGoal = nil
       state.battleResume = nil
     else
       ControlsFree.releaseSimpleHold()
@@ -8400,10 +10810,10 @@ mod.hooks:wrap("movement.collision", function(nextFn, allowed, ctx)
   local result = nextFn(allowed, ctx)
   local nav = state.nav
   local game = state.game
-  if not nav or not ctx or not game or not game.overworld then return result end
+  if not nav or not ctx or not game then return result end
 
-  local player = game.overworld.player
-  if ctx.mover ~= player then return result end
+  local player = WorldBackend.player(game)
+  if not player or ctx.mover ~= player then return result end
 
   -- A different direction reaching the player's collision path means another
   -- input source won.  Manual control always has priority over autowalk.
@@ -8423,13 +10833,14 @@ mod.hooks:wrap("movement.collision", function(nextFn, allowed, ctx)
   --   * an actual warp record must exist on the destination cell,
   --   * only the engine's non-walkable-tile rejection is bypassed,
   --   * entity/bounds failures and tile-pair/elevation failures remain final.
-  if result == false and ctx.reason == "tile"
+  if not WorldBackend.isGold(game)
+      and result == false and ctx.reason == "tile"
       and nav.goalKind == "exit" and nav.exitIntent ~= nil
       and nav.exitDir ~= nil
       and nav.holdDir == ctx.dir
       and nav.targetX == ctx.toX and nav.targetY == ctx.toY
       and nav.expectedX == ctx.toX and nav.expectedY == ctx.toY then
-    local map = game.overworld.map
+    local map = WorldBackend.map(game)
     local hasWarp = map and type(map.warpAtCell) == "function"
       and map:warpAtCell(ctx.toX, ctx.toY) ~= nil
     local ordinaryWalkable = map and type(map.isWalkableCell) == "function"
@@ -8541,10 +10952,9 @@ mod.events:on("world.interacted", function(ev)
   end
 end)
 
-local function mapDefIsOutdoor(def)
+local function mapDefIsOutdoor(game, def)
   if type(def) ~= "table" then return nil end
-  if def.outdoor ~= nil then return def.outdoor == true end
-  return defLooksOutdoor(def)
+  return defLooksOutdoor(game, def)
 end
 
 -- "Non-outdoor" is much broader than "entered a building" in Gen I. Route
@@ -8562,6 +10972,9 @@ local BUILDING_INTERIOR_TILESETS = {
 
 function ControlsFree.mapDefIsBuildingInterior(def)
   if type(def) ~= "table" then return false end
+  if def.environment ~= nil then
+    return tostring(def.environment) == "INDOOR"
+  end
   -- Mod-authored maps can opt in explicitly instead of borrowing a vanilla
   -- tileset merely to communicate semantics.
   if def.building ~= nil then return def.building == true end
@@ -8577,10 +10990,11 @@ end
 local function enteringBuildingInterior(ev)
   if not ev or ev.via ~= "warp" or not ev.fromMapId then return false end
   local game = state.game
-  local maps = game and game.data and game.data.maps
+  local maps = WorldBackend.mapDefinitions(game)
   local fromDef = maps and maps[ev.fromMapId] or nil
   local toDef = ev.map and ev.map.def or (maps and maps[ev.mapId])
-  return mapDefIsOutdoor(fromDef) == true and ControlsFree.mapDefIsBuildingInterior(toDef)
+  return mapDefIsOutdoor(game, fromDef) == true
+    and ControlsFree.mapDefIsBuildingInterior(toDef)
 end
 
 function ControlsFree.flushMapSensitiveRuntimeCaches()
@@ -8611,8 +11025,8 @@ function ControlsFree.mapRuntimeReady(game)
   if not pending then return true end
 
   local cur = mod.world and mod.world:current()
-  local overview = mod.world and mod.world:mapOverview()
-  local liveMap = game and game.overworld and game.overworld.map
+  local overview = WorldBackend.overview(game)
+  local liveMap = WorldBackend.map(game)
   local expected = pending.mapId
 
   -- Do not perform path/retarget work against a half-switched world. The
@@ -8664,14 +11078,21 @@ mod.events:on("map.entered", function(ev)
     -- the next leg automatically. Reaching an outdoor map ends the journey.
     releaseHold(nav)
     state.nav = nil
-    local maps = state.game and state.game.data and state.game.data.maps
+    local game = state.game
+    local maps = WorldBackend.mapDefinitions(game)
     local toDef = ev.map and ev.map.def or (maps and maps[ev.mapId])
-    if defLooksOutdoor(toDef) then
-      state.stats.routesArrived = state.stats.routesArrived + 1
-      markStop("exited_interior", nav)
-      state.exitJourney = nil
+    local journey = state.exitJourney or { startedTick = state.tick, legs = 1, visited = {} }
+    if defLooksOutdoor(game, toDef) then
+      if journey.remoteGoal then
+        state.pendingRemoteGoal = copyFlat(journey.remoteGoal)
+        markStop("portal_reached_outdoor", nav)
+        state.exitJourney = nil
+      else
+        state.stats.routesArrived = state.stats.routesArrived + 1
+        markStop("exited_interior", nav)
+        state.exitJourney = nil
+      end
     else
-      local journey = state.exitJourney or { startedTick = state.tick, legs = 1, visited = {} }
       journey.pendingMapId = ev.mapId
       journey.pendingTick = state.tick
       state.exitJourney = journey
@@ -8687,13 +11108,38 @@ mod.events:on("map.entered", function(ev)
   end
 end)
 
+function ControlsFree.safeBattleResumeStart(game, ev, nav)
+  local battle = ev and ev.battle
+  if not (nav and nav.goalKind == "move" and battle) then return false end
+  if WorldBackend.isGold(game) then
+    -- The event kind is the shared cross-generation seam. Gold's Battle object
+    -- itself uses .wild rather than Gen 1's .kind. Resume only the untyped,
+    -- ordinary random-wild shape; special/tutorial/fishing/roamer/contest and
+    -- scripted battle variants fail closed.
+    if ev.kind ~= "wild" or battle.wild ~= true or battle.trainer ~= nil then
+      return false
+    end
+    if ev.battleType ~= nil or battle.battleType ~= nil or battle.roaming ~= nil then
+      return false
+    end
+    local world = WorldBackend.owner(game)
+    local save = game and game.save
+    if (world and (world.catchTutorial or world.scriptBattle or world.queuedBattle))
+        or (save and save.bugContest and save.bugContest.active) then
+      return false
+    end
+    return true
+  end
+  return battle.kind == "wild"
+end
+
 mod.events:on("battle.started", function(ev)
   ControlsFree.releaseSimpleHold()
   state.simpleInteraction = nil
   local nav = state.nav
   local battle = ev and ev.battle
-  if option("battle_resume", false) == true and nav and nav.goalKind == "move"
-      and battle and battle.kind == "wild" then
+  if option("battle_resume", false) == true
+      and ControlsFree.safeBattleResumeStart(state.game, ev, nav) then
     state.battleResume = {
       mapId = nav.mapId, x = nav.requestedX or nav.targetX,
       y = nav.requestedY or nav.targetY, battle = battle,
@@ -8711,7 +11157,8 @@ mod.events:on("battle.ended", function(ev)
   if not resume then return end
   local battle = ev and ev.battle
   local result = ev and ev.result
-  if not battle or battle ~= resume.battle or battle.kind ~= "wild" then
+  if not battle or battle ~= resume.battle
+      or (not WorldBackend.isGold(state.game) and battle.kind ~= "wild") then
     dropBattleResume("battle_mismatch")
     return
   end
@@ -8759,6 +11206,7 @@ mod.events:on("save.loading", function()
   state.pendingInteraction = nil
   state.battleResume = nil
   state.exitJourney = nil
+  state.pendingRemoteGoal = nil
   state.mapTransition = nil
   ControlsFree.flushMapSensitiveRuntimeCaches()
 end)
@@ -8793,9 +11241,35 @@ local function drawFeedback()
 end
 
 local function flatPreviewContext(game)
-  local view = state.view
   local cur = mod.world and mod.world:current()
-  if not view or not cur then return nil end
+  if not cur then return nil end
+
+  if WorldBackend.isGold(game) then
+    local world = WorldBackend.owner(game)
+    if not (world and world.camera and type(world.zoomScale) == "function") then
+      return nil
+    end
+    local g = ControlsFree.goldFrameGeometry(game, cur.mapId)
+    if not g then return nil end
+    local ww, wh = tonumber(g.windowW), tonumber(g.windowH)
+    local scale = tonumber(g.scale)
+    if not (ww and wh and scale and scale > 0) then return nil end
+    state.stats.flatPreviewContextBuilds =
+      (state.stats.flatPreviewContextBuilds or 0) + 1
+    return {
+      view = { ox = tonumber(g.originX) or 0, oy = tonumber(g.originY) or 0,
+               scale = scale, dpiX = 1, dpiY = 1 },
+      -- Gold's view.ox/oy are the ACTUAL map render origin, not a canvas
+      -- letterbox.  Keep camera at zero here so flatPathCellToScreen applies
+      -- that origin exactly once.
+      cameraX = 0, cameraY = 0,
+      right = ww, bottom = wh, generation = 2,
+      goldFrame = g,
+    }
+  end
+
+  local view = state.view
+  if not view then return nil end
   local ppx, ppy = playerPixel(game, cur)
   state.stats.flatPreviewContextBuilds =
     (state.stats.flatPreviewContextBuilds or 0) + 1
@@ -8815,6 +11289,11 @@ local function flatPathCellToScreen(ctx, x, y)
   local canvasY = y * TILE_SIZE + TILE_SIZE / 2 - ctx.cameraY
   local px = view.ox + canvasX * view.scale
   local py = view.oy + canvasY * view.scale
+  if ctx.generation == 2 and ctx.goldFrame and ctx.goldFrame.tiltActive then
+    px, py = ControlsFree.goldFrameFlatToScreen(
+      state.game, px, py, ctx.goldFrame.mapId)
+    if not px then return nil end
+  end
   if px < view.ox or py < view.oy or px >= ctx.right or py >= ctx.bottom then
     return nil
   end
@@ -8838,7 +11317,7 @@ local function voxelPreviewContext(game, scene, mapId)
   local voxel3d = scene and scene.voxel3d
   if not voxel3d or type(voxel3d.project) ~= "function" then return nil end
 
-  local overview = mod.world and mod.world:mapOverview()
+  local overview = WorldBackend.overview(game)
   local entry
   for _, cand in ipairs(voxelCandidateMaps(game, overview)) do
     if cand.mapId == mapId then entry = cand break end
@@ -9128,6 +11607,39 @@ local function drawDebug()
       state.stats.overviewCacheHits or 0, state.stats.overviewCacheMisses or 0,
       state.stats.entryGestureSuppressions or 0),
   }
+  local gd = state.lastGoldTapDiagnostic
+  if gd then
+    local function n1(v)
+      return type(v) == "number" and string.format("%.1f", v) or "-"
+    end
+    table.insert(lines, 2, ("G-TAP S %s,%s  CELL %s,%s -> %s,%s %s"):format(
+      n1(gd.screenX), n1(gd.screenY), tostring(gd.rawCellX or "-"),
+      tostring(gd.rawCellY or "-"), tostring(gd.finalCellX or "-"),
+      tostring(gd.finalCellY or "-"),
+      gd.semanticAssist and ("SEM-" .. tostring(gd.semanticAssistKind or "TARGET"))
+        or (gd.barrierDoor and "DOOR-BARRIER" or (gd.doorSnap and "DOOR" or ""))))
+    table.insert(lines, 3, ("G-CENTER %s,%s  DELTA %s,%s  INTENT %s,%s"):format(
+      n1(gd.cellScreenX), n1(gd.cellScreenY), n1(gd.deltaX), n1(gd.deltaY),
+      n1(gd.intentX), n1(gd.intentY)))
+    table.insert(lines, 4, ("G-FRAME S%s O%s,%s C%s,%s T%s"):format(
+      n1(gd.scale), n1(gd.originX), n1(gd.originY), n1(gd.cameraX),
+      n1(gd.cameraY), gd.tiltActive and n1(gd.tiltAngle) or "OFF"))
+    table.insert(lines, 5, ("G-CAP %s,%s CROP %s,%s ERR %s"):format(
+      n1(gd.captureW), n1(gd.captureH), n1(gd.cropX), n1(gd.cropY),
+      tostring(gd.targetErr or "OK")))
+
+    -- Snapshot values above are frozen at press time.  Reproject the SAME
+    -- world target through the CURRENT camera as a separate diagnostic so a
+    -- screenshot taken after walking cannot confuse camera motion with a bad
+    -- original pick.
+    if gd.mapId and gd.finalCellX ~= nil and gd.finalCellY ~= nil then
+      local lx, ly = ControlsFree.goldCellCenterToScreen(
+        state.game, gd.mapId, gd.finalCellX, gd.finalCellY)
+      gd.liveCellScreenX, gd.liveCellScreenY = lx, ly
+      table.insert(lines, 6, ("G-LIVE TARGET %s,%s  STEP-PULSE %d"):format(
+        n1(lx), n1(ly), state.stats.goldStepPulses or 0))
+    end
+  end
   if ControlsFree.simpleTouchEnabled() then
     local p = state.tapOwner and state.pointers[state.tapOwner] or nil
     lines[#lines + 1] = ("SIMPLE %s X%+d%% Y%+d%% F%d D%d BT%d"):format(
@@ -9157,6 +11669,35 @@ local function drawDebug()
 
   love.graphics.push("all")
   love.graphics.origin()
+  local gd = state.lastGoldTapDiagnostic
+  if gd then
+    -- Raw pointer: cross. Interpreted cell centre: ring. Player cell centre:
+    -- square. Their relative placement is enough to diagnose origin/scale skew
+    -- from a single screenshot without the user estimating offsets by eye.
+    if gd.screenX and gd.screenY then
+      love.graphics.setColor(1, 0.25, 0.25, 1)
+      love.graphics.setLineWidth(2)
+      love.graphics.line(gd.screenX - 8, gd.screenY, gd.screenX + 8, gd.screenY)
+      love.graphics.line(gd.screenX, gd.screenY - 8, gd.screenX, gd.screenY + 8)
+    end
+    if gd.cellScreenX and gd.cellScreenY then
+      love.graphics.setColor(0.2, 1, 1, 1)
+      love.graphics.setLineWidth(2)
+      love.graphics.circle("line", gd.cellScreenX, gd.cellScreenY, 8)
+    end
+    if gd.liveCellScreenX and gd.liveCellScreenY then
+      -- Current-camera projection of the frozen world target: a larger ring.
+      -- This one should travel with the map while the press-time ring stays put.
+      love.graphics.setColor(0.3, 1, 0.3, 1)
+      love.graphics.setLineWidth(2)
+      love.graphics.circle("line", gd.liveCellScreenX, gd.liveCellScreenY, 13)
+    end
+    if gd.playerScreenX and gd.playerScreenY then
+      love.graphics.setColor(1, 0.9, 0.2, 1)
+      love.graphics.setLineWidth(2)
+      love.graphics.rectangle("line", gd.playerScreenX - 7, gd.playerScreenY - 7, 14, 14)
+    end
+  end
   local y = 6
   for _, text in ipairs(lines) do
     love.graphics.setColor(0, 0, 0, 0.8)
@@ -9179,8 +11720,20 @@ end)
 local function diagnostics()
   local nav = state.nav
   local perf, perfName = performanceInputProfile()
+  local backend = state.game and WorldBackend.forGame(state.game) or nil
+  local liveMap = state.game and WorldBackend.map(state.game) or nil
+  local controllable, gateReason = state.game and overworldGate(state.game) or false, nil
+  if state.game then controllable, gateReason = overworldGate(state.game) end
   local out = {
     version = VERSION,
+    generation = state.game and (WorldBackend.isGold(state.game) and 2 or 1) or nil,
+    backend = backend == WorldBackend.gold and "gold"
+      or (backend == WorldBackend.gen1 and "gen1" or nil),
+    mapId = liveMap and liveMap.id or nil,
+    controllable = controllable and true or false,
+    gateReason = gateReason,
+    traversalMode = state.game and ControlsFree.playerIsSurfing(state.game)
+      and "SURF" or "LAND",
     tick = state.tick,
     active = nav ~= nil,
     holdRetarget = { mode = perfName, label = perf.label, holdMs = perf.holdMs },
@@ -9218,6 +11771,7 @@ local function diagnostics()
     },
     stats = copyFlat(state.stats),
     lastStop = state.lastStop and copyFlat(state.lastStop) or nil,
+    lastGoldTap = state.lastGoldTapDiagnostic and copyFlat(state.lastGoldTapDiagnostic) or nil,
   }
   if nav then
     out.navigation = {
@@ -9241,6 +11795,14 @@ local function diagnostics()
         entryX = nav.cross.entryX, entryY = nav.cross.entryY,
         crossed = nav.cross.crossed and true or false,
         ledgeSeam = nav.cross.ledgeSeam and true or false,
+      }
+    end
+    if nav.remoteGoal then
+      out.navigation.remoteGoal = {
+        mapId = nav.remoteGoal.mapId,
+        x = nav.remoteGoal.x, y = nav.remoteGoal.y,
+        routeIndex = nav.remoteGoal.routeIndex,
+        routeLength = #(nav.remoteGoal.route or {}),
       }
     end
     if nav.interaction then

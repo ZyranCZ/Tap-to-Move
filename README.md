@@ -1,17 +1,17 @@
 # Tap to Move
 
-**Tap to Move** adds modern touch and mouse navigation to **Pokémon Gen1Recomp**.
+**Tap to Move** adds modern touch and mouse navigation to **Pokémon Gen1Recomp**, with full support for **Red / Blue / Yellow / Gold** in v2.0.0.
 
-Tap a destination in the overworld and the player walks there using collision-aware A* pathfinding. The mod drives normal Gen1Recomp movement input rather than rewriting player coordinates, so collisions, encounters, ledges, scripts, trainers and movement timing remain controlled by the game.
+Tap a destination in the overworld and the player walks there using collision-aware A* pathfinding. The mod drives normal Gen1Recomp movement input rather than rewriting player coordinates, so collisions, encounters, ledges, scripts, trainers and movement timing remain controlled by the game. On Gold it uses Gold's native collision, field-move and overworld rules rather than forcing Gen 1 map mechanics onto Gen 2.
 
 ## Features
 
 - **Tap to Move** with A* pathfinding around walls, buildings, NPCs and other obstacles.
 - **Hold to Steer** with speed-aware retarget delay.
 - **NPC and interaction targeting** for trainers, visible items, signs, PCs, counters, bookshelves and other supported fixtures.
-- **Hidden treasure interaction** — tapping the exact ordinary tile containing an undiscovered hidden item/coin routes beside it, turns the player toward it and presses normal A; the mod does not reveal hidden treasure elsewhere on the map.
+- **Hidden treasure interaction** — exact taps still target hidden items directly, and the Gold post-arrival semantic finisher can also use a hidden interaction that is cardinal-adjacent to the final stopped cell. Hidden data is never rendered as a marker or exposed remotely.
 - **Smart doors and exits**, including directional warps, carpets, map-edge exits, scripted holes and multi-floor exit journeys.
-- **Connected-map navigation** across normal Route/Town connections.
+- **Connected-map navigation** across normal Route/Town connections, including a single tap onto a visible Gold map rendered multiple seamless connection hops away.
 - **Ledge-aware routing** with legal one-way jumps.
 - **CUT interaction targeting** — clicking a cuttable tree/plant routes beside it, turns the player correctly and uses Gen1Recomp's real CUT action, including the normal “hacked away with CUT!” text and animation. CUT trees remain ordinary obstacles for normal pathfinding and are never chosen automatically as shortcuts.
 - **Seamless Surf routing** — when the party can legally use SURF, A* may route across water; at the shoreline Tap to Move turns the player toward the water, mounts Surf without the party-menu dialog/flash, and continues the same route with normal movement input. Returning to walkable land uses Gen1Recomp's normal automatic dismount.
@@ -52,6 +52,21 @@ Its available tuning options remain:
 - Axis Deadzone
 - Dominance Ratio
 
+## What's new in v2.0.0
+
+- Added full **Pokémon Gold / Gen 2** support while preserving the established Red / Blue / Yellow behavior.
+- Gold pathfinding uses native Gen 2 collision, ledges, one-way movement, ice/current behavior, warps, carpets, doors, stairs and map connections.
+- Added reliable **connected-map navigation**: a single tap can cross seamless Route/Town boundaries, continue through multiple visible map connections, and replan from the real landing cell after each native transition.
+- Added **smart portal/gatehouse routing**. When a visible remote destination cannot be reached by a direct seamless connection, Tap to Move can infer the appropriate doorway, cross the intervening interior and resume toward the original remote target.
+- Door intent is **tap-centric**: when a click is slightly beyond a building, the building and door closest to the actual click are preferred rather than whichever door is closest to the player.
+- Added Gold-native interaction targeting for NPCs, trainers, visible items, counters, signs, fixed bg events and collision-standard fixtures such as **PCs, bookshelves, radios, town maps, mart shelves, TVs, windows and incense burners**.
+- Added a post-arrival interaction finisher: after reaching the correct approach cell, Tap to Move releases movement, turns the player, verifies the real facing and turn completion, and only then presses **A**.
+- Hidden items remain secret and are never displayed remotely; exact taps and legitimate adjacent post-arrival interactions still use the game's normal faced-cell A interaction.
+- Added conservative near-miss tolerance around interactive NPCs/objects before Smart Exit is chosen, while exact door/carpet/hole taps remain authoritative.
+- Added native Gold CUT and Surf routing through the game's own field-move eligibility and execution paths.
+- Added Gold-aware battle resume classification, touch controls, START/SELECT gestures, accurate flat/TILT picking and matching Path Preview projection.
+- Preserved manual-input priority and moved Gold automated walking to one synthetic direction press per actual cell step, preventing old-direction spillover at corners.
+
 ## What's new in v1.5
 
 - Added full native **PotatoVoxel** support.
@@ -75,4 +90,10 @@ No Voxel mod is required. Dramatic Shape and PotatoVoxel are optional integratio
 
 ## Notes
 
-Tap to Move intentionally uses normal Gen1Recomp movement and interaction systems whenever possible. It does not reveal secret hidden items merely because their event data exists. Hidden treasure is considered only after the player explicitly taps its exact tile, and the item is still collected through Gen1Recomp's normal faced-cell A interaction. Fixed hidden-event fixtures are likewise treated as pathfinding targets rather than being activated remotely.
+Tap to Move intentionally uses normal Gen1Recomp movement and interaction systems whenever possible. It does not reveal secret hidden items merely because their event data exists. Hidden treasure is never displayed or remotely exposed by the mod. It can be selected by an exact tap, or by the Gold post-arrival finisher when the player has already stopped directly beside it; collection still happens through Gen1Recomp's normal faced-cell A interaction. Fixed hidden-event fixtures are likewise treated as pathfinding targets rather than being activated remotely.
+
+### Gold interaction tolerance
+
+- Indoor taps that would otherwise become Smart Exit/barrier-door intent now first check a small rendered-space halo around real reachable NPCs, visible item-ball entities and fixed Gold bg-event interactions.
+- Exact native door/carpet/hole/interaction taps remain authoritative, so the tolerance cannot disable ordinary room exits.
+- The assist is screen-space aware, so the same practical miss tolerance is preserved across zoom and TILT.
