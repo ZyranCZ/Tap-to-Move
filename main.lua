@@ -1,4 +1,4 @@
--- Tap to Move v2.0.0
+-- Tap to Move v2.0.1
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,7 +9,7 @@
 
 local mod = ...
 
-local VERSION = "2.0.0"
+local VERSION = "2.0.1"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 150 -- 1X base; scaled by live overworld logic speed
@@ -3669,11 +3669,10 @@ function VoxelAdapter.pixelSize()
 end
 
 function VoxelAdapter.flipY()
-  if love and love.system and type(love.system.getOS) == "function" then
-    local ok, osName = pcall(love.system.getOS)
-    return ok and osName == "iOS"
-  end
-  return false
+  -- v0.1.84+ sandboxes the LÖVE system module away from mod chunks. Platform detection
+  -- belongs to the engine; ControlsFree.hostOS() reaches the engine's narrow
+  -- Platform helper through the already-declared engine_internals permission.
+  return ControlsFree.hostOS() == "iOS"
 end
 
 function VoxelAdapter.windowToCanvas(scene, x, y)
@@ -8904,11 +8903,27 @@ function ControlsFree.dialogueActive(game)
 end
 
 function ControlsFree.hostOS()
-  if not (love and love.system and type(love.system.getOS) == "function") then
-    return nil
+  -- Do not touch the LÖVE system module from a mod chunk: Gen1Recomp v0.1.84+ blocks the
+  -- whole module in the mod sandbox. The engine's Platform module is the
+  -- canonical compatibility boundary and is safe to query through the
+  -- engine_internals permission this mod already needs for Gold/TILT support.
+  if ControlsFree.hostOSCache ~= nil then
+    return ControlsFree.hostOSCache or nil
   end
-  local ok, name = pcall(love.system.getOS)
-  return ok and name or nil
+  local okPlatform, Platform = pcall(require, "src.core.Platform")
+  if okPlatform and type(Platform) == "table" and type(Platform.detect) == "function" then
+    local okDetect, info = pcall(Platform.detect)
+    local name = okDetect and type(info) == "table" and info.os or nil
+    if type(name) == "string" and name ~= "" then
+      ControlsFree.hostOSCache = name
+      return name
+    end
+  end
+  -- Preserve the old graceful-degradation semantics if an older/future host
+  -- does not expose Platform: mobile-only shortcuts stay off, while explicit
+  -- mouse-source shortcuts remain usable through desktopHost().
+  ControlsFree.hostOSCache = false
+  return nil
 end
 
 function ControlsFree.mobileHost()

@@ -1,6 +1,6 @@
 # Tap to Move
 
-**Tap to Move** adds modern touch and mouse navigation to **Pokémon Gen1Recomp**, with full support for **Red / Blue / Yellow / Gold** in v2.0.0.
+**Tap to Move** adds modern touch and mouse navigation to **Pokémon Gen1Recomp**, with full support for **Red / Blue / Yellow / Gold** in v2.0.1.
 
 Tap a destination in the overworld and the player walks there using collision-aware A* pathfinding. The mod drives normal Gen1Recomp movement input rather than rewriting player coordinates, so collisions, encounters, ledges, scripts, trainers and movement timing remain controlled by the game. On Gold it uses Gold's native collision, field-move and overworld rules rather than forcing Gen 1 map mechanics onto Gen 2.
 
@@ -51,6 +51,12 @@ Its available tuning options remain:
 - Center Deadzone
 - Axis Deadzone
 - Dominance Ratio
+
+## What's new in v2.0.1
+
+- Migrated platform detection for the Gen1Recomp v0.1.86 sandbox: the mod no longer accesses blocked `love.system` directly.
+- Preserves Android/iOS/Desktop/Switch host gating through Gen1Recomp's engine-side `Platform` compatibility helper.
+- Keeps the existing Red / Blue / Yellow / Gold behavior and settings unchanged.
 
 ## What's new in v2.0.0
 
