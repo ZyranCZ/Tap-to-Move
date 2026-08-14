@@ -1,8 +1,37 @@
 # Tap to Move
 
-**Tap to Move** adds modern touch and mouse navigation to **Pokémon Gen1Recomp**, with full support for **Red / Blue / Yellow / Gold** in v2.0.1.
+**Tap to Move** adds modern touch and mouse navigation to **Pokémon Gen1Recomp**, with full support for **Red / Blue / Yellow / Gold** in v2.0.5.
 
 Tap a destination in the overworld and the player walks there using collision-aware A* pathfinding. The mod drives normal Gen1Recomp movement input rather than rewriting player coordinates, so collisions, encounters, ledges, scripts, trainers and movement timing remain controlled by the game. On Gold it uses Gold's native collision, field-move and overworld rules rather than forcing Gen 1 map mechanics onto Gen 2.
+
+
+## v2.0.5
+
+- Fixed **HOLD STEER DELAY × Game Speed** timing. The previous implementation multiplied the configured milliseconds by Game Speed but then measured the delay on the equally accelerated fixed-step clock, cancelling the multiplier in real time.
+- `150 ms` at `3X` now really waits about `450 ms` before Hold-to-Steer retargeting begins (and analogously for other Game Speed values).
+- Initial Tap-to-Move routing, Hold Retarget Rate, TILT handling and Gold entrance intent are otherwise unchanged.
+
+
+## v2.0.4
+
+- Gold entrance intent now uses a route-relative safety budget instead of a hard door-to-tap radius.
+- Tapping high on a tall building can once again route to its nearest valid entrance, while entrances requiring more than roughly four extra steps beyond the requested travel distance are still rejected.
+
+## v2.0.3 — Gold local door-intent guard
+
+- Stops an invalid tap on a Gold building/facade from routing to an unrelated entrance tens of tiles away.
+- Normal barrier-door inference now accepts only entrances roughly within four gameplay tiles of the pointer (4.5-cell centre/edge tolerance).
+- It also rejects entrances whose executable route is more than four steps longer than the pointer's apparent travel distance, preventing huge detours around connected walls/facades.
+- The narrow visual door magnet is unchanged, and explicit connected-map gatehouse/portal rescue keeps its long-range behavior.
+- Gen 1, TILT handling, settings, and ordinary pathfinding are otherwise unchanged.
+
+## v2.0.2 — TILT input fix
+
+- Fixes Tap to Move becoming unusable when Gen1Recomp TILT is set to 15, 35, or 50.
+- Gen 1 now captures the grown TILT world-canvas geometry and inverse-projects pointer coordinates through the exact v0.1.86 perspective equation before pathfinding.
+- Player hit-testing and path-preview projection now follow the same upright-billboard / tilted-ground transform as the engine.
+- Flat rendering, Gold support, Voxel support, options, and pathfinding behavior are otherwise unchanged.
+
 
 ## Features
 

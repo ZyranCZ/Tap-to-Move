@@ -1,4 +1,4 @@
--- Tap to Move v2.0.1
+-- Tap to Move v2.0.5
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,7 +9,7 @@
 
 local mod = ...
 
-local VERSION = "2.0.1"
+local VERSION = "2.0.5"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 150 -- 1X base; scaled by live overworld logic speed
@@ -66,6 +66,13 @@ local ControlsFree = {
     },
   },
   DEFAULT_PATH_BUDGET = "full",
+  -- Gold barrier-door inference may redirect an imprecise tap on a tall facade
+  -- to that structure's entrance even when the door is several tiles away from
+  -- the literal pointer.  The safety budget is PLAYER/ROUTE-relative instead:
+  -- never walk materially farther than the distance the user appeared to ask
+  -- for.  This prevents the old "cross half the map to some door" failure
+  -- without rejecting legitimate tall-building taps.
+  GOLD_BARRIER_DOOR_MAX_ROUTE_OVERSHOOT = 4,
   -- Voxel Path Preview live reprojection is intentionally fixed at 0.25/s.
   VOXEL_PATH_REFRESH_TICKS = 240,
   engineWarpModule = false,
@@ -497,11 +504,25 @@ function ControlsFree.overworldSpeedMultiplier(game)
 end
 
 function ControlsFree.holdSteerDelayMs(game)
+  -- Public semantics: HOLD STEER DELAY is the 1X baseline and Game Speed
+  -- stretches that delay in REAL time. Example: 150 ms at 3X must behave
+  -- like a 450 ms hold before continuous steering starts. This intentionally
+  -- gives the initial tap route enough time to advance before the stationary
+  -- screen-space pointer is reprojected on a fast-scrolling overworld.
   return ControlsFree.holdSteerBaseDelayMs() * ControlsFree.overworldSpeedMultiplier(game)
 end
 
 local function holdSteerDelayTicks(game)
-  return msToTicks(ControlsFree.holdSteerDelayMs(game), DEFAULT_HOLD_STEER_DELAY_MS)
+  -- state.tick is the fixed LOGIC clock, so it itself advances `speed` times
+  -- faster than wall time. Converting only holdSteerDelayMs() to ticks would
+  -- cancel the Game Speed multiplier (150*3 ms -> 27 ticks, but those 27
+  -- ticks elapse in ~150 ms at 3X). Scale once more when mapping the desired
+  -- real-time delay onto the accelerated logic clock. Thus 150 @ 3X becomes
+  -- 81 logic ticks = ~450 ms real time, matching the option's intended
+  -- speed-aware behavior.
+  local speed = ControlsFree.overworldSpeedMultiplier(game)
+  local realDelayMs = ControlsFree.holdSteerBaseDelayMs() * speed
+  return msToTicks(realDelayMs * speed, DEFAULT_HOLD_STEER_DELAY_MS)
 end
 
 local function performanceInputProfile()
@@ -554,15 +575,17 @@ local function evenCeil(n)
   return v
 end
 
--- Renderer.worldViewSize() is intentionally inferred from the public
--- render.compose context instead of requiring Renderer/Zoom internals.
--- In the normal flat renderer the world canvas is even-sized ceil(P/s).
--- Tilt grows that canvas and a custom world pipeline exposes worldOverride,
--- so both fail closed instead of mapping a tap to the wrong cell.
-local function inferFlatWorldScale(ctx, worldW, worldH)
+-- Renderer.worldViewSize() is inferred from the render.compose frame rather
+-- than depending on Renderer internals. In flat mode the world canvas is the
+-- even-sized ceil(P/s) view. TILT then grows that proven flat view; v2.0.2
+-- recognizes that exact growth so pointer picking remains valid, while an
+-- unrelated custom world pipeline still fails closed through worldOverride.
+local function inferFlatWorldScale(ctx, worldW, worldH, tiltGrowth)
   if not ctx or not worldW or not worldH then return nil end
   local fit = tonumber(ctx.scale) or 1
   local maxScale = math.max(16, math.ceil(fit * 2 + 8))
+  tiltGrowth = tonumber(tiltGrowth)
+  if not tiltGrowth or tiltGrowth <= 0 then tiltGrowth = 1 end
 
   local bases = {
     { tonumber(ctx.pw), tonumber(ctx.ph) },
@@ -575,18 +598,85 @@ local function inferFlatWorldScale(ctx, worldW, worldH)
     bases[#bases + 1] = { tonumber(ctx.uiw) * fit, tonumber(ctx.uih) * fit }
   end
 
+  local function expected(bw, bh, scale)
+    local vw, vh = evenCeil(bw / scale), evenCeil(bh / scale)
+    if tiltGrowth ~= 1 then
+      -- Renderer:worldViewSize grows the already-even flat view after TILT is
+      -- enabled; it intentionally does not re-even the grown dimensions.
+      vw, vh = math.ceil(vw * tiltGrowth), math.ceil(vh * tiltGrowth)
+    end
+    return vw, vh
+  end
+
   for _, base in ipairs(bases) do
     local bw, bh = base[1], base[2]
     if bw and bh and bw > 0 and bh > 0 then
-      for s = 1, maxScale do
-        if evenCeil(bw / s) == worldW and evenCeil(bh / s) == worldH then
-          return s
+      for scale = 1, maxScale do
+        local vw, vh = expected(bw, bh, scale)
+        if vw == worldW and vh == worldH then return scale end
+      end
+    end
+  end
+
+  -- Survey zoom can be fractional when another zoom-range mod widens the
+  -- engine range.  The exact v0.1.86 renderer already exposes the canonical
+  -- scale through src.render.Zoom, and Tap to Move declares engine_internals
+  -- for its existing TILT/Gold adapters.  Use that exact value only as a
+  -- compatibility fallback when integer inference cannot prove the geometry.
+  local okZoom, Zoom = pcall(require, "src.render.Zoom")
+  if okZoom and type(Zoom) == "table" and type(Zoom.scale) == "function" then
+    local okScale, exactScale = pcall(Zoom.scale, fit)
+    exactScale = okScale and tonumber(exactScale) or nil
+    if exactScale and exactScale > 0 then
+      for _, base in ipairs(bases) do
+        local bw, bh = base[1], base[2]
+        if bw and bh and bw > 0 and bh > 0 then
+          local vw, vh = expected(bw, bh, exactScale)
+          if vw == worldW and vh == worldH then return exactScale end
         end
       end
     end
   end
 
   return nil
+end
+
+-- TILT.groundPoint is a perspective warp of flat world-canvas coordinates.
+-- These helpers are the exact forward/inverse equations used by v0.1.86, but
+-- take a CAPTURED angle/focal so pointer input resolves against the frame the
+-- user actually saw even while the engine is tweening between tilt levels.
+function ControlsFree.tiltFlatToProjected(x, y, vw, vh, angle, focal)
+  vw, vh = tonumber(vw), tonumber(vh)
+  angle, focal = tonumber(angle) or 0, tonumber(focal) or 1
+  if not (vw and vh and vw > 0 and vh > 0) then return nil, nil end
+  if angle <= 0 then return x, y end
+  local u, row = x - vw * 0.5, y - vh * 0.5
+  local d = focal * vh
+  local denom = d - row * math.sin(angle)
+  if math.abs(denom) < 1e-7 then return nil, nil end
+  local perspective = d / denom
+  if perspective <= 0 or perspective ~= perspective then return nil, nil end
+  return vw * 0.5 + u * perspective,
+         vh * 0.5 + row * math.cos(angle) * perspective
+end
+
+function ControlsFree.tiltProjectedToFlat(x, y, vw, vh, angle, focal)
+  vw, vh = tonumber(vw), tonumber(vh)
+  angle, focal = tonumber(angle) or 0, tonumber(focal) or 1
+  if not (vw and vh and vw > 0 and vh > 0) then return nil, nil end
+  if angle <= 0 then return x, y end
+  local d = focal * vh
+  local sinA, cosA = math.sin(angle), math.cos(angle)
+  local screenY = y - vh * 0.5
+  local denom = cosA * d + screenY * sinA
+  if math.abs(denom) < 1e-7 then return nil, nil end
+  local row = screenY * d / denom
+  local scaleDenom = d - row * sinA
+  if math.abs(scaleDenom) < 1e-7 then return nil, nil end
+  local perspective = d / scaleDenom
+  if perspective <= 0 or perspective ~= perspective then return nil, nil end
+  return vw * 0.5 + (x - vw * 0.5) / perspective,
+         vh * 0.5 + row
 end
 
 local function captureView(ctx)
@@ -696,13 +786,32 @@ local function captureView(ctx)
     return
   end
 
-  local scale = inferFlatWorldScale(ctx, worldW, worldH)
+  -- Gen 1 TILT grows worldCanvas AFTER the flat view has been sized.  v2.0.1
+  -- treated that larger canvas as an unknown render pipeline and cleared the
+  -- tap transform entirely, which is why enabling 15/35/50 made Tap to Move
+  -- appear dead.  Capture the exact TILT geometry instead and invert it later.
+  local tiltActive, tiltAngle, tiltFocal, tiltGrowth = false, 0, 1, 1
+  local okTilt, Tilt = pcall(require, "src.render.Tilt")
+  if okTilt and type(Tilt) == "table"
+      and type(Tilt.active) == "function" and Tilt.active() == true then
+    tiltActive = true
+    tiltAngle = tonumber(Tilt.angle) or 0
+    tiltFocal = tonumber(Tilt.FOCAL) or 1
+    if type(Tilt.viewGrowth) == "function" then
+      local okGrowth, growth = pcall(Tilt.viewGrowth)
+      growth = okGrowth and tonumber(growth) or nil
+      if growth and growth > 0 then tiltGrowth = growth end
+    end
+  end
+
+  local scale = inferFlatWorldScale(ctx, worldW, worldH,
+    tiltActive and tiltGrowth or 1)
   if not scale or not pw or not ph then
     state.view = nil
     return
   end
 
-  state.view = {
+  local view = {
     worldW = worldW,
     worldH = worldH,
     scale = scale,
@@ -712,7 +821,21 @@ local function captureView(ctx)
     dpiY = dpiY,
     ox = math.floor((pw - worldW * scale) / 2),
     oy = math.floor((ph - worldH * scale) / 2),
+    tiltActive = tiltActive,
+    tiltAngle = tiltAngle,
+    tiltFocal = tiltFocal,
+    tiltGrowth = tiltGrowth,
   }
+  -- Snapshot the camera that produced this compose frame.  This matters while
+  -- TILT is tweening because the grown viewport changes the camera follow size
+  -- from frame to frame; reading the next update's camera during input would
+  -- introduce a one-frame targeting offset.
+  local ow = state.game and state.game.overworld
+  if ow and ow.camera then
+    view.cameraX = tonumber(ow.camera.x)
+    view.cameraY = tonumber(ow.camera.y)
+  end
+  state.view = view
 end
 
 -- Generation boundary ---------------------------------------------------------
@@ -4781,29 +4904,45 @@ local function targetFromTap(game, x, y)
   end
 
   local tapPX, tapPY = x * view.dpiX, y * view.dpiY
-  local right = view.ox + view.worldW * view.scale
-  local bottom = view.oy + view.worldH * view.scale
-  local outsideCanvas = tapPX < view.ox or tapPY < view.oy
-    or tapPX >= right or tapPY >= bottom
+  local projectedX = (tapPX - view.ox) / view.scale
+  local projectedY = (tapPY - view.oy) / view.scale
+  local canvasX, canvasY = projectedX, projectedY
+  if view.tiltActive then
+    canvasX, canvasY = ControlsFree.tiltProjectedToFlat(projectedX, projectedY,
+      view.worldW, view.worldH, view.tiltAngle, view.tiltFocal)
+    if not canvasX then
+      return nil, nil, cur, overview, "no_view"
+    end
+  end
+  local outsideCanvas = canvasX < 0 or canvasY < 0
+    or canvasX >= view.worldW or canvasY >= view.worldH
 
-  -- Deliberately map even letterbox/outside-canvas clicks through the live
-  -- camera.  Those extrapolated map-cell coordinates are not movement targets;
-  -- they are only directional intent used to choose between multiple real
-  -- exits in an enclosed interior.
-  local canvasX = (tapPX - view.ox) / view.scale
-  local canvasY = (tapPY - view.oy) / view.scale
+  -- Deliberately map even letterbox/outside-canvas clicks through the camera.
+  -- Those extrapolated map-cell coordinates are not movement targets; they are
+  -- only directional intent used to choose between multiple real exits in an
+  -- enclosed interior.  Under TILT, inverse-project FIRST and then apply the
+  -- exact flat camera mapping; treating the warped screen point as flat space
+  -- is the v2.0.1 failure that disabled every destination.
   local ppx, ppy = playerPixel(game, cur)
   local ow = game and game.overworld
-  -- Prefer the live camera when available: it is exactly what rendered the
-  -- neighbour rectangles and also includes temporary camera pans.  The public
-  -- player-follow formula remains a compatibility fallback.
-  local cameraX = ow and ow.camera and tonumber(ow.camera.x)
-    or (ppx - (view.worldW / 2 - 16))
-  local cameraY = ow and ow.camera and tonumber(ow.camera.y)
-    or (ppy - (view.worldH / 2 - 8))
+  local cameraX, cameraY
+  if view.tiltActive and view.cameraX ~= nil and view.cameraY ~= nil then
+    cameraX, cameraY = view.cameraX, view.cameraY
+  else
+    -- Prefer the live camera when available: it is exactly what rendered the
+    -- neighbour rectangles and also includes temporary camera pans.  The public
+    -- player-follow formula remains a compatibility fallback.
+    cameraX = ow and ow.camera and tonumber(ow.camera.x)
+      or (ppx - (view.worldW / 2 - 16))
+    cameraY = ow and ow.camera and tonumber(ow.camera.y)
+      or (ppy - (view.worldH / 2 - 8))
+  end
   local worldX = cameraX + canvasX
   local worldY = cameraY + canvasY
-  local intentMeta = { intentX = worldX / TILE_SIZE, intentY = worldY / TILE_SIZE }
+  local intentMeta = {
+    intentX = worldX / TILE_SIZE, intentY = worldY / TILE_SIZE,
+    tiltedGen1 = view.tiltActive and true or false,
+  }
   local tx = math.floor(worldX / TILE_SIZE)
   local ty = math.floor(worldY / TILE_SIZE)
 
@@ -5295,6 +5434,31 @@ function ControlsFree.goldDoorMagnet(game, map, cur, overview, tx, ty, meta)
 end
 
 
+-- Decide whether a broad Gold barrier-door correction still represents the
+-- user's travel intent.  A door can be visually far from a tap on a tall
+-- building, so DO NOT impose a door-to-pointer radius here.  Instead compare
+-- the actual route cost with the distance the player appeared to request.
+-- Only the explicit connected-map portal rescue may bypass that route budget.
+function ControlsFree.goldBarrierDoorLocalIntentOK(cur, intentX, intentY,
+    doorX, doorY, pathCost, remotePortalRescue)
+  if remotePortalRescue == true then
+    return true, nil, nil, nil
+  end
+  if not cur or type(intentX) ~= "number" or type(intentY) ~= "number"
+      or type(doorX) ~= "number" or type(doorY) ~= "number"
+      or type(pathCost) ~= "number" then
+    return false, nil, nil, nil
+  end
+  local px, py = cur.x + 0.5, cur.y + 0.5
+  local dx, dy = (doorX + 0.5) - intentX, (doorY + 0.5) - intentY
+  local tapDistance = math.sqrt(dx * dx + dy * dy)
+  local intendedTravel = math.abs(intentX - px) + math.abs(intentY - py)
+  local routeLimit = math.ceil(
+    intendedTravel + ControlsFree.GOLD_BARRIER_DOOR_MAX_ROUTE_OVERSHOOT)
+  local ok = pathCost <= routeLimit
+  return ok, tapDistance, intendedTravel, routeLimit
+end
+
 -- Gold smart-door barrier inference.  A user can deliberately tap well past a
 -- building/facade instead of on the tiny door sprite itself.  Do NOT solve
 -- that by making the door magnet huge: that would let unrelated doors steal
@@ -5314,7 +5478,7 @@ end
 -- high above a building while refusing to pull a click across an unrelated
 -- wall toward some other entrance elsewhere on the map.
 function ControlsFree.goldBarrierDoorIntent(game, map, cur, overview,
-    intentX, intentY, tx, ty, targetErr, cross)
+    intentX, intentY, tx, ty, targetErr, cross, remotePortalRescue)
   if not WorldBackend.isGold(game) or not map or not cur or not overview then
     return nil
   end
@@ -5483,6 +5647,22 @@ function ControlsFree.goldBarrierDoorIntent(game, map, cur, overview,
           local dx, dy = cx - intentX, cy - intentY
           local tapDist = dx * dx + dy * dy
           local pathCost = #path
+
+          -- Ordinary facade intent is route-bounded, not pointer-radius-bounded.
+          -- A tall building can put its real door many tiles from the graphic
+          -- the user tapped.  What matters is that reaching the selected door
+          -- does not take materially farther travel than the tap requested.
+          -- A connected-map portal rescue is intentionally different and may
+          -- bypass even that route budget.
+          local localIntentOK, tapDistance, intendedTravel, routeLimit =
+            ControlsFree.goldBarrierDoorLocalIntentOK(
+              cur, intentX, intentY, w.x, w.y, pathCost, remotePortalRescue)
+          if not localIntentOK then
+            state.stats.goldBarrierDoorDistanceRejects =
+              (state.stats.goldBarrierDoorDistanceRejects or 0) + 1
+            goto continue_gold_barrier_warp
+          end
+
           -- Strict lexicographic priority:
           --   1. closest door to the CLICK,
           --   2. tightest attachment to that component,
@@ -5506,8 +5686,11 @@ function ControlsFree.goldBarrierDoorIntent(game, map, cur, overview,
               intent.barrierComponentSize = componentSize
               intent.barrierComponentDistance = compDist
               intent.barrierPathCost = pathCost
-              intent.barrierTapDistance = math.sqrt(tapDist)
+              intent.barrierTapDistance = tapDistance
               intent.barrierSeedDistance = math.sqrt(seedDist or 0)
+              intent.barrierIntendedTravel = intendedTravel
+              intent.barrierRouteOvershoot = pathCost - intendedTravel
+              intent.barrierRouteLimit = routeLimit
               best, bestTapDist = intent, tapDist
               bestCompDist, bestPathCost = compDist, pathCost
             end
@@ -5515,6 +5698,7 @@ function ControlsFree.goldBarrierDoorIntent(game, map, cur, overview,
         end
       end
     end
+    ::continue_gold_barrier_warp::
   end
   return best
 end
@@ -6482,7 +6666,7 @@ local function startRoute(game, screenX, screenY, continuous, showFeedback, gest
           game, currentMap, cur, overview,
           targetMeta and targetMeta.intentX or nil,
           targetMeta and targetMeta.intentY or nil,
-          nil, nil, "connected_map", nil)
+          nil, nil, "connected_map", nil, true)
         if portalDoor then
           local remoteGoal = copyFlat(cross.goldSimpleRemote)
           local remoteDir = cross.dir
@@ -9316,14 +9500,35 @@ function ControlsFree.playerScreenHit(game, x, y)
   if view then
     local ppx, ppy = playerPixel(game, cur)
     local ow = game and game.overworld
-    local cameraX = ow and ow.camera and tonumber(ow.camera.x)
-      or (ppx - (view.worldW / 2 - 16))
-    local cameraY = ow and ow.camera and tonumber(ow.camera.y)
-      or (ppy - (view.worldH / 2 - 8))
+    local cameraX, cameraY
+    if view.tiltActive and view.cameraX ~= nil and view.cameraY ~= nil then
+      cameraX, cameraY = view.cameraX, view.cameraY
+    else
+      cameraX = ow and ow.camera and tonumber(ow.camera.x)
+        or (ppx - (view.worldW / 2 - 16))
+      cameraY = ow and ow.camera and tonumber(ow.camera.y)
+        or (ppy - (view.worldH / 2 - 8))
+    end
     local canvasX = cur.x * TILE_SIZE + TILE_SIZE / 2 - cameraX
     local canvasY = cur.y * TILE_SIZE + TILE_SIZE / 2 - cameraY
-    local cx = (view.ox + canvasX * view.scale) / math.max(view.dpiX or 1, 1e-6)
-    local cy = (view.oy + canvasY * view.scale) / math.max(view.dpiY or 1, 1e-6)
+    local screenCanvasX, screenCanvasY = canvasX, canvasY
+    if view.tiltActive then
+      -- Gen 1 characters are upright billboards.  Move the hitbox by the same
+      -- projected FOOT-anchor delta as OverworldState:billboard; do not resize
+      -- the sprite by perspective depth.
+      local footX = cur.x * TILE_SIZE + TILE_SIZE / 2 - cameraX
+      local footY = cur.y * TILE_SIZE + TILE_SIZE - cameraY
+      local projFootX, projFootY = ControlsFree.tiltFlatToProjected(footX, footY,
+        view.worldW, view.worldH, view.tiltAngle, view.tiltFocal)
+      if projFootX then
+        screenCanvasX = canvasX + (projFootX - footX)
+        screenCanvasY = canvasY + (projFootY - footY)
+      end
+    end
+    local cx = (view.ox + screenCanvasX * view.scale)
+      / math.max(view.dpiX or 1, 1e-6)
+    local cy = (view.oy + screenCanvasY * view.scale)
+      / math.max(view.dpiY or 1, 1e-6)
     local tileW = TILE_SIZE * view.scale / math.max(view.dpiX or 1, 1e-6)
     local tileH = TILE_SIZE * view.scale / math.max(view.dpiY or 1, 1e-6)
     -- The sprite extends above its cell centre, so bias the hitbox upward.
@@ -11286,14 +11491,25 @@ local function flatPreviewContext(game)
   local view = state.view
   if not view then return nil end
   local ppx, ppy = playerPixel(game, cur)
+  local ow = game and game.overworld
+  local cameraX, cameraY
+  if view.tiltActive and view.cameraX ~= nil and view.cameraY ~= nil then
+    cameraX, cameraY = view.cameraX, view.cameraY
+  else
+    cameraX = ow and ow.camera and tonumber(ow.camera.x)
+      or (ppx - (view.worldW / 2 - 16))
+    cameraY = ow and ow.camera and tonumber(ow.camera.y)
+      or (ppy - (view.worldH / 2 - 8))
+  end
   state.stats.flatPreviewContextBuilds =
     (state.stats.flatPreviewContextBuilds or 0) + 1
   return {
     view = view,
-    cameraX = ppx - (view.worldW / 2 - 16),
-    cameraY = ppy - (view.worldH / 2 - 8),
+    cameraX = cameraX,
+    cameraY = cameraY,
     right = view.ox + view.worldW * view.scale,
     bottom = view.oy + view.worldH * view.scale,
+    tiltedGen1 = view.tiltActive and true or false,
   }
 end
 
@@ -11302,14 +11518,32 @@ local function flatPathCellToScreen(ctx, x, y)
   local view = ctx.view
   local canvasX = x * TILE_SIZE + TILE_SIZE / 2 - ctx.cameraX
   local canvasY = y * TILE_SIZE + TILE_SIZE / 2 - ctx.cameraY
-  local px = view.ox + canvasX * view.scale
-  local py = view.oy + canvasY * view.scale
+  local projectedX, projectedY = canvasX, canvasY
+  if ctx.tiltedGen1 then
+    projectedX, projectedY = ControlsFree.tiltFlatToProjected(canvasX, canvasY,
+      view.worldW, view.worldH, view.tiltAngle, view.tiltFocal)
+    if not projectedX then return nil end
+  end
+  local px = view.ox + projectedX * view.scale
+  local py = view.oy + projectedY * view.scale
   if ctx.generation == 2 and ctx.goldFrame and ctx.goldFrame.tiltActive then
     px, py = ControlsFree.goldFrameFlatToScreen(
       state.game, px, py, ctx.goldFrame.mapId)
     if not px then return nil end
   end
-  if px < view.ox or py < view.oy or px >= ctx.right or py >= ctx.bottom then
+  -- Under Gen 1 TILT the projected quad is not the same rectangle as the flat
+  -- grown canvas.  Clip in actual framebuffer/window space instead of against
+  -- flat world-canvas bounds, otherwise valid preview points near the receded
+  -- edge disappear.
+  local clipLeft, clipTop, clipRight, clipBottom
+  if ctx.tiltedGen1 then
+    clipLeft, clipTop = 0, 0
+    clipRight, clipBottom = view.pw, view.ph
+  else
+    clipLeft, clipTop = view.ox, view.oy
+    clipRight, clipBottom = ctx.right, ctx.bottom
+  end
+  if px < clipLeft or py < clipTop or px >= clipRight or py >= clipBottom then
     return nil
   end
   state.stats.flatPreviewPointTransforms =
@@ -11503,9 +11737,10 @@ local function drawDebug()
   local nav = state.nav
   local lines = {
     "TAP TO MOVE " .. VERSION,
-    ("HOLD BASE %dMS X%s = %dMS  RETARGET %s"):format(
+    ("HOLD BASE %dMS X%s = %dMS / %dT  RETARGET %s"):format(
       ControlsFree.holdSteerBaseDelayMs(), tostring(ControlsFree.overworldSpeedMultiplier(state.game)),
-      ControlsFree.holdSteerDelayMs(state.game), (select(1, performanceInputProfile()).label)),
+      ControlsFree.holdSteerDelayMs(state.game), holdSteerDelayTicks(state.game),
+      (select(1, performanceInputProfile()).label)),
     ("RETARGET %dMS  PREVIEW /%d"):format(
       select(1, performanceInputProfile()).holdMs, previewRefreshTicks()),
     (function()
