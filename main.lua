@@ -1,4 +1,4 @@
--- Tap to Move v2.0.5
+-- Tap to Move v2.0.7
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,7 +9,7 @@
 
 local mod = ...
 
-local VERSION = "2.0.5"
+local VERSION = "2.0.7"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 150 -- 1X base; scaled by live overworld logic speed
@@ -3678,6 +3678,16 @@ end
 local VoxelAdapter = {
   providers = {
     { id = "DRAMATIC_SHAPE", kind = "dramatic_shape", short = "DS" },
+    -- Battle Art is a fork of Dramatic Shape and deliberately preserves the
+    -- same exported Voxel library contract (VoxelState/Voxel3D/VoxelScene/
+    -- Structures/TileShape). Treat it as the same provider family while
+    -- keeping its distinct mod id for discovery, load ordering and diagnostics.
+    { id = "BATTLE_ART_VOXEL_FORK", kind = "dramatic_shape", short = "BA" },
+    -- Dramaless is another Dramatic Shape fork. v2.0.1 keeps the same public
+    -- lib.require contract and the VoxelState/Voxel3D/VoxelScene/Structures/
+    -- TileShape/FirstPerson modules used by this adapter, so it belongs to the
+    -- same provider family instead of maintaining a renderer-specific fork.
+    { id = "DRAMALESS_SHAPE", kind = "dramatic_shape", short = "DL" },
     { id = "potato_voxel", kind = "potato_voxel", short = "POTATO" },
   },
   cache = { id = nil, peer = nil, lib = nil },
@@ -3740,6 +3750,24 @@ function VoxelAdapter.discover()
     VoxelAdapter.cache = selected
   end
   return VoxelAdapter.cache
+end
+
+-- A Dramatic-family provider may put the camera in a free-look mode (1ST/3RD)
+-- where an open-screen touch is camera input, not a world destination. Ask the
+-- provider itself instead of keying off a renderer-specific level number.
+function VoxelAdapter.inputOwned(scene)
+  scene = scene or VoxelAdapter.discover()
+  local firstPerson = scene and scene.firstPerson
+  if type(firstPerson) ~= "table" then return false end
+  if type(firstPerson.driving) == "function" then
+    local ok, owned = pcall(firstPerson.driving)
+    if ok then return owned == true end
+  end
+  if type(firstPerson.engaged) == "function" then
+    local ok, owned = pcall(firstPerson.engaged)
+    return ok and owned == true
+  end
+  return false
 end
 
 function VoxelAdapter.canvasSize(scene)
@@ -8741,6 +8769,18 @@ local function installRawPinchZoomGuard(game)
     -- A lifecycle interruption can swallow the previous release. Any NEW press
     -- with the same host touch id is authoritative and retires stale ownership.
     if state.nativeControlOwnedTouches then state.nativeControlOwnedTouches[id] = nil end
+    if state.voxelProviderOwnedTouches then state.voxelProviderOwnedTouches[id] = nil end
+
+    -- Free-camera Voxel modes own open-screen touch at the raw Game seam. This
+    -- must happen before Tap-to-Move's pinch/system-edge/player-hold classifiers:
+    -- otherwise the compatibility layer could swallow a look gesture before the
+    -- renderer's already-installed FirstPerson handler ever sees it.
+    if id ~= nil and id ~= "mouse" and VoxelAdapter.inputOwned() then
+      state.voxelProviderOwnedTouches = state.voxelProviderOwnedTouches or {}
+      state.voxelProviderOwnedTouches[id] = true
+      if state.nav then cancelRoute("voxel_provider_input") end
+      return pressed(self, id, x, y, dx, dy, pressure)
+    end
 
     -- Absolute priority for Gen1Recomp's visible virtual controls. Ownership is
     -- decided only at touch-DOWN: a finger that starts on A/B/D-pad/START/SELECT
@@ -8802,6 +8842,9 @@ local function installRawPinchZoomGuard(game)
       if ddx * ddx + ddy * ddy > slop * slop then toggleTouch.cancelled = true end
       return true
     end
+    if state.voxelProviderOwnedTouches and state.voxelProviderOwnedTouches[id] then
+      return moved(self, id, x, y, dx, dy, pressure)
+    end
     if state.nativeControlOwnedTouches and state.nativeControlOwnedTouches[id] then
       return moved(self, id, x, y, dx, dy, pressure)
     end
@@ -8851,6 +8894,10 @@ local function installRawPinchZoomGuard(game)
         ControlsFree.toggleNativeControls(self)
       end
       return true
+    end
+    if state.voxelProviderOwnedTouches and state.voxelProviderOwnedTouches[id] then
+      state.voxelProviderOwnedTouches[id] = nil
+      return released(self, id, x, y, dx, dy, pressure)
     end
     if state.nativeControlOwnedTouches and state.nativeControlOwnedTouches[id] then
       -- Keep the ownership flag set while the original Game path calls the
@@ -10646,6 +10693,16 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
     end
     state.pointers[ev.id] = nil
     if state.tapOwner == ev.id then state.tapOwner = nil end
+    return result
+  end
+  -- Compatibility fallback for hosts/input paths that reach input.pointer
+  -- without passing through the raw Game touch bridge above. A live provider
+  -- free-camera still has semantic ownership even if the deeper seam did not
+  -- explicitly return true.
+  if VoxelAdapter.inputOwned() then
+    state.pointers[ev.id] = nil
+    if state.tapOwner == ev.id then state.tapOwner = nil end
+    if state.nav and ev.phase == "pressed" then cancelRoute("voxel_provider_input") end
     return result
   end
   if option("enabled", true) == false then return result end

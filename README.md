@@ -1,8 +1,25 @@
 # Tap to Move
 
-**Tap to Move** adds modern touch and mouse navigation to **Pokémon Gen1Recomp**, with full support for **Red / Blue / Yellow / Gold** in v2.0.5.
+**Tap to Move** adds modern touch and mouse navigation to **Pokémon Gen1Recomp**, with full support for **Red / Blue / Yellow / Gold** in v2.0.7.
 
 Tap a destination in the overworld and the player walks there using collision-aware A* pathfinding. The mod drives normal Gen1Recomp movement input rather than rewriting player coordinates, so collisions, encounters, ledges, scripts, trainers and movement timing remain controlled by the game. On Gold it uses Gold's native collision, field-move and overworld rules rather than forcing Gen 1 map mechanics onto Gen 2.
+
+
+## v2.0.7
+
+- Added native **Dramaless Shape Voxel Mod** compatibility for `DRAMALESS_SHAPE` (verified against Dramaless v2.0.1).
+- Dramaless is discovered through the existing shared Voxel Provider Adapter and uses its fork-preserved `VoxelState`, `Voxel3D`, `VoxelScene`, `Structures`, `TileShape` and `FirstPerson` exports for real 3D picking and Path Preview.
+- Added Dramaless as an optional dependency so its exported Voxel scene is available before Tap to Move performs provider discovery.
+- Dramaless free-camera/first-person touch ownership remains authoritative because its raw `Game:touch*` handlers are loaded before Tap to Move and claimed camera touches never reach Tap-to-Move navigation.
+- Dramatic Shape, Battle Art, PotatoVoxel, normal 2D rendering and Gold behavior are otherwise unchanged.
+
+## v2.0.6
+
+- Added native **Battle Art Voxel Fork** compatibility for `BATTLE_ART_VOXEL_FORK` (verified against Battle Art v1.9.0).
+- Battle Art is discovered through the existing shared Voxel Provider Adapter and uses its fork-preserved `VoxelState`, `Voxel3D`, `VoxelScene`, `Structures` and `TileShape` exports for real 3D picking and Path Preview.
+- Added Battle Art as an optional dependency so its exported Voxel scene is available before Tap to Move performs provider discovery.
+- Battle Art's **1ST** first-person input ownership remains authoritative: when Battle Art claims a pointer for camera/A/B control, Tap to Move does not also start navigation.
+- Dramatic Shape, PotatoVoxel, normal 2D rendering and Gold behavior are otherwise unchanged.
 
 
 ## v2.0.5
@@ -59,13 +76,15 @@ Tap a destination in the overworld and the player walks there using collision-aw
 Tap to Move supports full 3D navigation with:
 
 - **Dramatic Shape Voxel Mod**
+- **Battle Art Voxel Fork**
+- **Dramaless Shape Voxel Mod**
 - **PotatoVoxel**
 
-Both use the same Tap to Move navigation engine through a shared **Voxel Provider Adapter**. The adapter reads the active renderer's exported camera and scene capabilities, so 3D ray picking, NPC targeting, doors, hidden-event fixtures, Smart Exits, connected maps, avatar hit testing and Path Preview use the actual Voxel scene.
+All supported Voxel renderers use the same Tap to Move navigation engine through a shared **Voxel Provider Adapter**. The adapter reads the active renderer's exported camera and scene capabilities, so 3D ray picking, NPC targeting, doors, hidden-event fixtures, Smart Exits, connected maps, avatar hit testing and Path Preview use the actual Voxel scene.
 
 PotatoVoxel's HIGH, MEDIUM, LOW and POTATO render scales are handled from the renderer's live internal canvas dimensions rather than hardcoded scale values.
 
-Both Voxel mods are optional. Without a supported Voxel renderer, Tap to Move automatically uses its normal 2D targeting path.
+All Voxel mods are optional. Without a supported Voxel renderer, Tap to Move automatically uses its normal 2D targeting path.
 
 ## Experimental Simple Mode
 
@@ -73,7 +92,7 @@ Both Voxel mods are optional. Without a supported Voxel renderer, Tap to Move au
 
 It directly converts the finger direction into normal movement input instead of using 2D/3D target picking and A* pathfinding.
 
-Simple Mode is **OFF by default** and is **not required for PotatoVoxel or Dramatic Shape**.
+Simple Mode is **OFF by default** and is **not required for PotatoVoxel, Dramatic Shape, Battle Art or Dramaless**.
 
 Its available tuning options remain:
 
@@ -121,7 +140,7 @@ Its available tuning options remain:
 
 Install the mod normally through Gen1Recomp's mod system.
 
-No Voxel mod is required. Dramatic Shape and PotatoVoxel are optional integrations.
+No Voxel mod is required. Dramatic Shape, Battle Art, Dramaless and PotatoVoxel are optional integrations.
 
 ## Notes
 
