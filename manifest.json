@@ -1,7 +1,7 @@
 {
   "id": "tap_to_move",
   "name": "Tap to Move",
-  "version": "2.0.7",
+  "version": "2.2.0",
   "entry": "main.lua",
   "api": 2,
   "category": "GAMEPLAY",
@@ -9,8 +9,6 @@
   "dependencies": [],
   "optional_dependencies": [
     "DRAMATIC_SHAPE",
-    "BATTLE_ART_VOXEL_FORK",
-    "DRAMALESS_SHAPE",
     "potato_voxel"
   ],
   "conflicts": [],

@@ -1,4 +1,4 @@
--- Tap to Move v2.0.7
+-- Tap to Move v2.2.0
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,7 +9,7 @@
 
 local mod = ...
 
-local VERSION = "2.0.7"
+local VERSION = "2.2.0"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 150 -- 1X base; scaled by live overworld logic speed
@@ -36,10 +36,11 @@ local TWO_FINGER_TRIGGER_RATIO = 0.18
 local PINCH_ZOOM_GRACE_TICKS = 36 -- keep blocking delayed native zoom callbacks for ~0.6 s
 
 -- Controls-free one-finger gestures. Holding directly on the player for one
--- second is an alternate START gesture. DIALOG TOUCH CONTROL is the catch-all
--- classifier for non-overworld, non-battle UI: a short stationary release
--- becomes A, a nearly stationary one-second hold becomes B, while a deliberate
--- swipe becomes one D-pad tap. Exactly one semantic action owns each contact.
+-- second is an alternate START gesture. DIRECTIONAL SWIPES is the shared controls-free gesture layer for non-overworld UI
+-- and battle UI: a deliberate swipe becomes one D-pad tap. The legacy short-tap A
+-- and one-second-hold B fallback remains attached to this layer on generic UI so
+-- existing touch behavior is preserved. Direct battle choices are owned separately
+-- by BATTLE TOUCH CONTROLS. Exactly one semantic action owns each contact.
 local PLAYER_HOLD_START_TICKS = FIXED_TICKS_PER_SECOND -- exactly 1.0 s
 local PLAYER_HOLD_MOVE_SLOP_UNITS = 22
 local DIALOG_SWIPE_TRIGGER_UNITS = 30
@@ -165,40 +166,48 @@ mod.options:define({
       { "VERY LOW", "very_low" },
       { "MEDIUM", "medium" },
       { "FULL", "full" },
-    } },  { key = "dialog_touch_control", label = "DIALOG TOUCH CONTROL",
-    type = "toggle", default = false },
-  { key = "battle_touch_control", label = "BATTLE TOUCH CONTROL",
-    type = "toggle", default = false },
+    } },
+  { key = "directional_swipes", label = "Directional Swipes",
+    type = "toggle", default = true },
+  { key = "battle_touch_controls", label = "Battle Touch Controls",
+    type = "toggle", default = true },
+  { key = "touch_confirmations", label = "Touch Confirmations",
+    type = "choice", default = "two_clicks",
+    choices = {
+      { "One Click", "one_click" },
+      { "Two Clicks", "two_clicks" },
+    } },
   { key = "start_select_touch_control", label = "START/SELECT TOUCH CONTROL",
-    type = "choice", default = "off",
+    type = "choice", default = "hold_player_sprite",
     choices = {
       { "OFF", "off" },
       { "HOLD PLAYER SPRITE", "hold_player_sprite" },
       { "PINCH OR SPREAD", "pinch_or_spread" },
     } },
   { key = "feedback", label = "TAP FEEDBACK", type = "toggle", default = true },
-  { key = "path_preview", label = "PATH PREVIEW", type = "choice", default = "off",
+  { key = "path_preview", label = "PATH PREVIEW", type = "choice", default = "full",
     choices = { { "OFF", "off" }, { "SHORT", "short" }, { "FULL", "full" } } },
-  { key = "battle_resume", label = "RESUME AFTER WILD", type = "toggle", default = false },
+  { key = "battle_resume", label = "RESUME AFTER WILD", type = "toggle", default = true },
   { key = "debug", label = "DEBUG OVERLAY", type = "toggle", default = false },
 
-  -- Mouse options stay grouped together: all are opt-in.
+  -- Normal desktop control features are enabled on a fresh install. DEBUG and
+  -- the mutually-exclusive Experimental Simple Mode remain intentionally opt-in.
   { key = "mouse", label = "MOUSE WALK CONTROL",
-    type = "toggle", default = false },
+    type = "toggle", default = true },
   { key = "desktop_mouse_ab", label = "MOUSE LMB/RMB=A/B",
-    type = "toggle", default = false },
+    type = "toggle", default = true },
   { key = "mouse_wheel_control", label = "MOUSE WHEEL ▲/▼",
-    type = "choice", default = "off",
+    type = "choice", default = "on",
     choices = {
       { "OFF", "off" }, { "ON", "on" }, { "ON FLIPPED", "on_flipped" },
     } },
   { key = "mouse_wheel_tilt", label = "MOUSE WH.TILT L/R",
-    type = "choice", default = "off",
+    type = "choice", default = "on",
     choices = {
       { "OFF", "off" }, { "ON", "on" }, { "ON FLIPPED", "on_flipped" },
     } },
   { key = "mouse_side_buttons", label = "MOUSE SIDE ST/SEL",
-    type = "choice", default = "off",
+    type = "choice", default = "on",
     choices = {
       { "OFF", "off" }, { "ON", "on" }, { "ON FLIPPED", "on_flipped" },
     } },
@@ -263,6 +272,7 @@ local state = {
   nativeZoomSuppression = nil,
   dialogTouches = {},
   battleTouches = {},
+  battleTouchPendingConfirm = nil,
   battleCameraOwnedTouches = {},
   playerHoldTouches = {},
   systemEdgeTouches = {},
@@ -406,6 +416,11 @@ local state = {
     battleSwipeDown = 0,
     battleSwipeLeft = 0,
     battleSwipeRight = 0,
+    battleDirectMenuTaps = 0,
+    battleDirectMoveTaps = 0,
+    battleDirectSelections = 0,
+    battleDirectSecondConfirms = 0,
+    battleDirectMisses = 0,
     battleCameraTouchesSuppressed = 0,
     playerHoldStartTriggers = 0,
     playerAvatarInteractionProxies = 0,
@@ -418,6 +433,7 @@ local state = {
     startMenuInsideATaps = 0,
     desktopATaps = 0,
     desktopBTaps = 0,
+    desktopBattleDirectTaps = 0,
     cancellations = 0,
   },
 }
@@ -3678,16 +3694,6 @@ end
 local VoxelAdapter = {
   providers = {
     { id = "DRAMATIC_SHAPE", kind = "dramatic_shape", short = "DS" },
-    -- Battle Art is a fork of Dramatic Shape and deliberately preserves the
-    -- same exported Voxel library contract (VoxelState/Voxel3D/VoxelScene/
-    -- Structures/TileShape). Treat it as the same provider family while
-    -- keeping its distinct mod id for discovery, load ordering and diagnostics.
-    { id = "BATTLE_ART_VOXEL_FORK", kind = "dramatic_shape", short = "BA" },
-    -- Dramaless is another Dramatic Shape fork. v2.0.1 keeps the same public
-    -- lib.require contract and the VoxelState/Voxel3D/VoxelScene/Structures/
-    -- TileShape/FirstPerson modules used by this adapter, so it belongs to the
-    -- same provider family instead of maintaining a renderer-specific fork.
-    { id = "DRAMALESS_SHAPE", kind = "dramatic_shape", short = "DL" },
     { id = "potato_voxel", kind = "potato_voxel", short = "POTATO" },
   },
   cache = { id = nil, peer = nil, lib = nil },
@@ -3750,24 +3756,6 @@ function VoxelAdapter.discover()
     VoxelAdapter.cache = selected
   end
   return VoxelAdapter.cache
-end
-
--- A Dramatic-family provider may put the camera in a free-look mode (1ST/3RD)
--- where an open-screen touch is camera input, not a world destination. Ask the
--- provider itself instead of keying off a renderer-specific level number.
-function VoxelAdapter.inputOwned(scene)
-  scene = scene or VoxelAdapter.discover()
-  local firstPerson = scene and scene.firstPerson
-  if type(firstPerson) ~= "table" then return false end
-  if type(firstPerson.driving) == "function" then
-    local ok, owned = pcall(firstPerson.driving)
-    if ok then return owned == true end
-  end
-  if type(firstPerson.engaged) == "function" then
-    local ok, owned = pcall(firstPerson.engaged)
-    return ok and owned == true
-  end
-  return false
 end
 
 function VoxelAdapter.canvasSize(scene)
@@ -8769,18 +8757,6 @@ local function installRawPinchZoomGuard(game)
     -- A lifecycle interruption can swallow the previous release. Any NEW press
     -- with the same host touch id is authoritative and retires stale ownership.
     if state.nativeControlOwnedTouches then state.nativeControlOwnedTouches[id] = nil end
-    if state.voxelProviderOwnedTouches then state.voxelProviderOwnedTouches[id] = nil end
-
-    -- Free-camera Voxel modes own open-screen touch at the raw Game seam. This
-    -- must happen before Tap-to-Move's pinch/system-edge/player-hold classifiers:
-    -- otherwise the compatibility layer could swallow a look gesture before the
-    -- renderer's already-installed FirstPerson handler ever sees it.
-    if id ~= nil and id ~= "mouse" and VoxelAdapter.inputOwned() then
-      state.voxelProviderOwnedTouches = state.voxelProviderOwnedTouches or {}
-      state.voxelProviderOwnedTouches[id] = true
-      if state.nav then cancelRoute("voxel_provider_input") end
-      return pressed(self, id, x, y, dx, dy, pressure)
-    end
 
     -- Absolute priority for Gen1Recomp's visible virtual controls. Ownership is
     -- decided only at touch-DOWN: a finger that starts on A/B/D-pad/START/SELECT
@@ -8842,9 +8818,6 @@ local function installRawPinchZoomGuard(game)
       if ddx * ddx + ddy * ddy > slop * slop then toggleTouch.cancelled = true end
       return true
     end
-    if state.voxelProviderOwnedTouches and state.voxelProviderOwnedTouches[id] then
-      return moved(self, id, x, y, dx, dy, pressure)
-    end
     if state.nativeControlOwnedTouches and state.nativeControlOwnedTouches[id] then
       return moved(self, id, x, y, dx, dy, pressure)
     end
@@ -8894,10 +8867,6 @@ local function installRawPinchZoomGuard(game)
         ControlsFree.toggleNativeControls(self)
       end
       return true
-    end
-    if state.voxelProviderOwnedTouches and state.voxelProviderOwnedTouches[id] then
-      state.voxelProviderOwnedTouches[id] = nil
-      return released(self, id, x, y, dx, dy, pressure)
     end
     if state.nativeControlOwnedTouches and state.nativeControlOwnedTouches[id] then
       -- Keep the ownership flag set while the original Game path calls the
@@ -9365,11 +9334,11 @@ function ControlsFree.pruneSystemEdgeTouches()
   end
 end
 
--- DIALOG TOUCH CONTROL is intentionally broader than literal TextBox dialogue.
+-- DIRECTIONAL SWIPES is intentionally broader than literal TextBox dialogue.
 -- It is the mobile fallback controller for every game UI/state except the two
 -- contexts that already have their own touch semantics:
 --   * free overworld -> Tap to Move / Hold to Steer
---   * any BattleState in the stack -> BATTLE TOUCH CONTROL / native battle touch
+--   * any BattleState in the stack -> Battle Touch Controls / native battle touch
 -- This fail-open coverage means newly added menus, choice screens and overlays
 -- automatically inherit release-A + swipe D-pad without needing a hard-coded
 -- state-name allowlist.
@@ -9387,7 +9356,7 @@ function ControlsFree.dialogTouchSurfaceActive(game)
   if not stack or type(stack.top) ~= "function" then return false end
 
   -- A battle remains a battle even when a Party/Item/Choice/TextBox state is
-  -- pushed above BattleState. DIALOG TOUCH CONTROL must never steal those.
+  -- pushed above BattleState. DIRECTIONAL SWIPES must never steal those.
   local states = stack.states
   if type(states) == "table" then
     for i = #states, 1, -1 do
@@ -9406,8 +9375,12 @@ function ControlsFree.dialogTouchSurfaceActive(game)
   return true
 end
 
+function ControlsFree.directionalSwipesEnabled()
+  return option("directional_swipes", true) == true
+end
+
 function ControlsFree.dialogTouchFeatureEnabled(game)
-  return option("dialog_touch_control", false) == true
+  return ControlsFree.directionalSwipesEnabled()
       and ControlsFree.mobileHost()
       and ControlsFree.dialogTouchSurfaceActive(game)
 end
@@ -9433,10 +9406,273 @@ function ControlsFree.battleActive(game)
   return false
 end
 
-function ControlsFree.battleTouchFeatureEnabled(game)
-  return option("battle_touch_control", false) == true
+function ControlsFree.battleTouchControlsEnabled(game)
+  return option("battle_touch_controls", true) == true
       and ControlsFree.mobileHost()
       and ControlsFree.battleActive(game)
+end
+
+function ControlsFree.battleDirectionalSwipesEnabled(game)
+  return ControlsFree.directionalSwipesEnabled()
+      and ControlsFree.mobileHost()
+      and ControlsFree.battleActive(game)
+end
+
+-- The raw battle touch bridge owns a contact whenever EITHER battle-specific
+-- direct selection or the shared Directional Swipes layer needs it.
+function ControlsFree.battleTouchFeatureEnabled(game)
+  return ControlsFree.battleTouchControlsEnabled(game)
+      or ControlsFree.battleDirectionalSwipesEnabled(game)
+end
+
+function ControlsFree.touchConfirmationMode()
+  local mode = tostring(option("touch_confirmations", "two_clicks") or "two_clicks")
+  return mode == "one_click" and "one_click" or "two_clicks"
+end
+
+function ControlsFree.clearBattleTouchConfirmation()
+  state.battleTouchPendingConfirm = nil
+end
+
+-- Direct battle UI targeting -------------------------------------------------
+--
+-- The former battle-touch layer treated a stationary tap as a blind A
+-- press.  That is a useful fallback, but it means a visible 2x2 command menu
+-- cannot tell whether the player touched FIGHT, PKMN, ITEM or RUN, and a move
+-- list cannot tell which row/card was touched.  Gen1Recomp's battle states
+-- already own authoritative menuIndex/moveIndex cursors, so direct touch does
+-- not bypass battle rules: it only places the native cursor under the visible
+-- choice and then sends the same A press the engine normally receives.
+--
+-- Keep this deliberately fail-closed.  A party/bag/choice screen pushed above
+-- BattleState is NOT the battle screen even though battleActive() remains true;
+-- those surfaces retain the old generic tap=A/swipe=D-pad behavior.
+function ControlsFree.topBattleState(game)
+  local stack = game and game.stack
+  if not stack or type(stack.top) ~= "function" then return nil end
+  local ok, top = pcall(stack.top, stack)
+  if ok and ControlsFree.stateIsBattle(top) then return top end
+  return nil
+end
+
+-- Convert input.pointer LOVE-window coordinates into the battle UI canvas's
+-- native pixels.  This mirrors Renderer:endFrame: uiScale is expressed in
+-- framebuffer pixels per native UI pixel, then divided by each axis DPI to
+-- produce LOVE units.  BATTLE SIZE=FILL is fractional by design and therefore
+-- has to override uiScale here exactly as it does in the renderer.
+--
+-- The transform is shared by classic 160x144 battles, Gen 1 WIDE 304x144,
+-- Gold, high-DPI displays and 3D battle renderers such as Dramatic Shape.  A
+-- renderer may replace the world behind the fight; the command/move UI still
+-- lands through the engine's UI canvas, so screen -> UI inversion stays the
+-- authoritative hit-test boundary.
+function ControlsFree.battleWindowToUI(game, x, y)
+  x, y = tonumber(x), tonumber(y)
+  local r = game and game.renderer
+  if not (x and y and r) then return nil end
+
+  local frame = state.frame or {}
+  local ww, wh = tonumber(frame.ww), tonumber(frame.wh)
+  if (not ww or not wh) and love and love.graphics
+      and type(love.graphics.getDimensions) == "function" then
+    local okDims, w, h = pcall(love.graphics.getDimensions)
+    if okDims then ww, wh = tonumber(w), tonumber(h) end
+  end
+  if not (ww and wh and ww > 0 and wh > 0) then return nil end
+
+  -- Prefer the renderer frame's drawable metrics, but do not depend on a
+  -- render.compose having happened already. Pointer events can arrive before
+  -- our first compose callback after a state transition, so fall back to the
+  -- live LOVE drawable size just like the engine Renderer does. This is also
+  -- required on high-DPI surfaces where window units and framebuffer pixels
+  -- differ (and can differ per axis).
+  local dpiX, dpiY = tonumber(frame.dpiX), tonumber(frame.dpiY)
+  local pw, ph = tonumber(frame.pw), tonumber(frame.ph)
+  if (not pw or not ph) and love and love.graphics
+      and type(love.graphics.getPixelDimensions) == "function" then
+    local okPix, fw, fh = pcall(love.graphics.getPixelDimensions)
+    if okPix then
+      pw = pw or tonumber(fw)
+      ph = ph or tonumber(fh)
+    end
+  end
+  if not dpiX or dpiX <= 1e-6 then
+    dpiX = (pw and pw > 0) and (pw / ww) or 1
+  end
+  if not dpiY or dpiY <= 1e-6 then
+    dpiY = (ph and ph > 0) and (ph / wh) or 1
+  end
+  if dpiX <= 1e-6 then dpiX = 1 end
+  if dpiY <= 1e-6 then dpiY = 1 end
+  pw = pw or ww * dpiX
+  ph = ph or wh * dpiY
+
+  local uiw, uih = 160, 144
+  if type(r.uiSize) == "function" then
+    local okSize, w, h = pcall(r.uiSize, r)
+    w, h = okSize and tonumber(w) or nil, okSize and tonumber(h) or nil
+    if w and h and w >= 160 and h >= 144 then uiw, uih = w, h end
+  end
+
+  local up
+  if type(r.uiScale) == "function" then
+    local okScale, value = pcall(r.uiScale, r)
+    if okScale then up = tonumber(value) end
+  end
+  if (not up or up <= 0) and type(r.fitScale) == "function" then
+    local okScale, value = pcall(r.fitScale, r)
+    if okScale then up = tonumber(value) end
+  end
+  if not up or up <= 0 then return nil end
+
+  if r.uiFill then
+    up = math.min(ph / uih, pw / uiw)
+  end
+  if not up or up <= 1e-6 then return nil end
+
+  local sx, sy = up / dpiX, up / dpiY
+  local ox = math.floor((pw - uiw * up) / 2) / dpiX
+  local oy = math.floor((ph - uih * up) / 2) / dpiY
+  if sx <= 1e-6 or sy <= 1e-6 then return nil end
+
+  local ux, uy = (x - ox) / sx, (y - oy) / sy
+  if ux < 0 or uy < 0 or ux >= uiw or uy >= uih then return nil end
+  return ux, uy, uiw, uih
+end
+
+function ControlsFree.battleMoveCount(battle, gen2)
+  if type(battle) ~= "table" then return 0 end
+  local moves
+  if gen2 and type(battle.playerMoves) == "function" then
+    local ok, value = pcall(battle.playerMoves, battle)
+    if ok and type(value) == "table" then moves = value end
+  else
+    moves = battle.player and battle.player.curMoves
+  end
+  return type(moves) == "table" and #moves or 0
+end
+
+-- Return the row-major native menu slot (1..4) under a UI-space point.
+function ControlsFree.battleCommandHit(battle, gen2, ux, uy, uiw)
+  if not (ux and uy and uiw) then return nil end
+  -- Scripted demo/tutorial hands must not become player-controlled through a
+  -- pointer shortcut. Safari/Contest menus are safe: both are still a 2x2
+  -- row-major menu whose own A handler supplies the generation-specific action.
+  if battle.demo or (gen2 and battle.tutorial) then return nil end
+
+  local left, right, splitX, top, bottom = 64, 160, 120, 104, 144
+  if not gen2 and uiw >= 300 then
+    -- Gen 1 WIDE: prompt on x=0..160, commands on x=160..304.
+    left, right, splitX = 160, math.min(uiw, 304), 232
+  elseif gen2 and battle.contest then
+    -- Bug Contest uses the same 2x2 semantics but widens the left column.
+    left = 16
+  end
+  if ux < left or ux >= right or uy < top or uy >= bottom then return nil end
+  local col = ux >= splitX and 1 or 0
+  local row = uy >= 120 and 1 or 0
+  return row * 2 + col + 1
+end
+
+-- Return the native move slot under a UI-space point.
+function ControlsFree.battleMoveHit(battle, gen2, ux, uy, uiw)
+  if not (ux and uy and uiw) then return nil end
+  local count = ControlsFree.battleMoveCount(battle, gen2)
+  if count < 1 then return nil end
+
+  local index
+  if not gen2 and uiw >= 300 then
+    -- Gen 1 WIDE lays the four moves out as a true 2x2 grid.  The details
+    -- panel begins at x=224, so clicks on PP/type information are not moves.
+    if ux < 0 or ux >= 224 or uy < 104 or uy >= 144 then return nil end
+    local col = ux >= 112 and 1 or 0
+    local row = uy >= 120 and 1 or 0
+    index = row * 2 + col + 1
+  else
+    -- Classic Gen 1 and Gold both draw four single-spaced rows at
+    -- y=104/112/120/128.  Gold prints PP at the far right on the same row,
+    -- which is still semantically the same move, so the whole row is tappable.
+    local left = gen2 and 8 or 40
+    if ux < left or ux >= 160 or uy < 104 or uy >= 136 then return nil end
+    index = math.floor((uy - 104) / 8) + 1
+  end
+  if index < 1 or index > count then return nil end
+  return index
+end
+
+-- Select a visible battle command/move directly and confirm it through the
+-- normal A input path. Returns true only when this tap really targeted a battle
+-- choice; callers must retain their historical blind-A fallback on false.
+function ControlsFree.directBattleTap(game, x, y, confirmationMode)
+  local battle = ControlsFree.topBattleState(game)
+  if not battle then
+    ControlsFree.clearBattleTouchConfirmation()
+    return false
+  end
+  local ux, uy, uiw = ControlsFree.battleWindowToUI(game, x, y)
+  if not ux then
+    ControlsFree.clearBattleTouchConfirmation()
+    state.stats.battleDirectMisses = (state.stats.battleDirectMisses or 0) + 1
+    return false
+  end
+
+  local gen2 = battle.screenId == "Gen2BattleState"
+  local phase = tostring(battle.phase or "")
+  local index, kind
+  if phase == "menu" then
+    index = ControlsFree.battleCommandHit(battle, gen2, ux, uy, uiw)
+    if index then
+      battle.menuIndex = index
+      kind = "menu"
+    end
+  elseif (not gen2 and phase == "moveSelect") or (gen2 and phase == "moves") then
+    index = ControlsFree.battleMoveHit(battle, gen2, ux, uy, uiw)
+    if index then
+      battle.moveIndex = index
+      kind = "move"
+    end
+  end
+
+  if not index then
+    ControlsFree.clearBattleTouchConfirmation()
+    state.stats.battleDirectMisses = (state.stats.battleDirectMisses or 0) + 1
+    return false
+  end
+
+  local mode = confirmationMode or ControlsFree.touchConfirmationMode()
+  if mode == "two_clicks" then
+    local pending = state.battleTouchPendingConfirm
+    local same = pending
+      and pending.battle == battle
+      and pending.phase == phase
+      and pending.kind == kind
+      and pending.index == index
+    if not same then
+      -- First click only moves the engine's own cursor. The next draw therefore
+      -- highlights the touched FIGHT/PKMN/ITEM/RUN or move slot exactly as if
+      -- the player had navigated there with the D-pad.
+      state.battleTouchPendingConfirm = {
+        battle = battle, phase = phase, kind = kind, index = index,
+        selectedTick = state.tick,
+      }
+      state.stats.battleDirectSelections =
+        (state.stats.battleDirectSelections or 0) + 1
+      return true, kind, index, false
+    end
+    ControlsFree.clearBattleTouchConfirmation()
+    state.stats.battleDirectSecondConfirms =
+      (state.stats.battleDirectSecondConfirms or 0) + 1
+  else
+    ControlsFree.clearBattleTouchConfirmation()
+  end
+
+  mod.input:tap(game, "a")
+  if kind == "menu" then
+    state.stats.battleDirectMenuTaps = (state.stats.battleDirectMenuTaps or 0) + 1
+  else
+    state.stats.battleDirectMoveTaps = (state.stats.battleDirectMoveTaps or 0) + 1
+  end
+  return true, kind, index, true
 end
 
 local function voxelCanvasToWindow(voxel3d, p)
@@ -9755,7 +9991,7 @@ function ControlsFree.finishDialogTouch(game, id, x, y, cancelled)
 end
 
 
--- BATTLE TOUCH CONTROL intentionally mirrors DIALOG TOUCH CONTROL: no Game
+-- The battle touch bridge shares the legacy gesture classifier: no Game
 -- Boy input on touch-down, a stationary one-second hold can fire B, otherwise
 -- sticky swipe/tap classification resolves exactly one action on release.  The raw Game:touch* bridge additionally owns the whole
 -- contact while the battle is present, which is what prevents a 3D camera
@@ -9765,7 +10001,7 @@ function ControlsFree.beginBattleTouch(game, id, x, y)
       or not ControlsFree.battleTouchFeatureEnabled(game) then
     return false
   end
-  -- DIALOG TOUCH CONTROL excludes BattleState by contract, so there is no
+  -- Non-battle Directional Swipes excludes BattleState by contract, so there is no
   -- semantic overlap here. Keep this guard as a defensive single-owner check.
   if ControlsFree.dialogTouchFeatureEnabled(game) then return false end
   state.battleTouches = state.battleTouches or {}
@@ -9808,28 +10044,52 @@ function ControlsFree.finishBattleTouch(game, id, x, y, cancelled)
     t.swipeDirection = dialogSwipeDirection(dx, dy)
   end
   if t.swipeDirection then
-    local btn = t.swipeDirection
-    mod.input:tap(game, btn)
-    state.stats.battleSwipes = (state.stats.battleSwipes or 0) + 1
-    local statKey = "battleSwipe" .. btn:sub(1, 1):upper() .. btn:sub(2)
-    state.stats[statKey] = (state.stats[statKey] or 0) + 1
+    ControlsFree.clearBattleTouchConfirmation()
+    if ControlsFree.battleDirectionalSwipesEnabled(game) then
+      local btn = t.swipeDirection
+      mod.input:tap(game, btn)
+      state.stats.battleSwipes = (state.stats.battleSwipes or 0) + 1
+      local statKey = "battleSwipe" .. btn:sub(1, 1):upper() .. btn:sub(2)
+      state.stats[statKey] = (state.stats[statKey] or 0) + 1
+    end
     return true
   end
 
-  mod.input:tap(game, "a")
-  state.stats.battleATaps = (state.stats.battleATaps or 0) + 1
+  -- Battle Touch Controls owns exact visible commands/moves. With TWO CLICKS,
+  -- the first tap only highlights the target by moving the native cursor; the
+  -- same target must be tapped again before A is emitted.
+  if ControlsFree.battleTouchControlsEnabled(game) then
+    local handled, _, _, confirmed = ControlsFree.directBattleTap(
+      game, t.startX, t.startY, ControlsFree.touchConfirmationMode())
+    if handled then
+      if confirmed then
+        state.stats.battleATaps = (state.stats.battleATaps or 0) + 1
+      end
+      return true
+    end
+  else
+    ControlsFree.clearBattleTouchConfirmation()
+  end
+
+  -- Preserve the legacy generic battle tap=A fallback under Directional Swipes
+  -- for message/choice/overlay phases which have no direct battle hit target.
+  if ControlsFree.battleDirectionalSwipesEnabled(game) then
+    mod.input:tap(game, "a")
+    state.stats.battleATaps = (state.stats.battleATaps or 0) + 1
+  end
   return true
 end
 
 -- A stationary one-finger hold is the B counterpart to release-A. The two
--- contexts keep separate touch tables and counters, so enabling DIALOG does
--- not affect battles and enabling BATTLE does not affect non-battle UI.
+-- contexts keep separate touch tables and counters so generic UI and battle UI
+-- cannot both own the same physical contact.
 function ControlsFree.fireHoldBForTouches(game, touches, active, statKey)
   for _, t in pairs(touches or {}) do
     if not t.bFired and not t.suppressed and not t.holdBCancelled then
       if not active(game) or state.twoFingerGesture then
         t.holdBCancelled = true
       elseif state.tick - (t.startedTick or state.tick) + 1 >= ControlsFree.TOUCH_HOLD_B_TICKS then
+        if touches == state.battleTouches then ControlsFree.clearBattleTouchConfirmation() end
         mod.input:tap(game, "b")
         t.bFired = true
         state.stats[statKey] = (state.stats[statKey] or 0) + 1
@@ -9842,7 +10102,7 @@ function ControlsFree.holdBTouchTick(game)
   ControlsFree.fireHoldBForTouches(game, state.dialogTouches,
     ControlsFree.dialogTouchFeatureEnabled, "dialogBHoldTriggers")
   ControlsFree.fireHoldBForTouches(game, state.battleTouches,
-    ControlsFree.battleTouchFeatureEnabled, "battleBHoldTriggers")
+    ControlsFree.battleDirectionalSwipesEnabled, "battleBHoldTriggers")
 end
 
 function ControlsFree.beginPlayerHoldTouch(game, id, x, y)
@@ -10695,16 +10955,6 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
     if state.tapOwner == ev.id then state.tapOwner = nil end
     return result
   end
-  -- Compatibility fallback for hosts/input paths that reach input.pointer
-  -- without passing through the raw Game touch bridge above. A live provider
-  -- free-camera still has semantic ownership even if the deeper seam did not
-  -- explicitly return true.
-  if VoxelAdapter.inputOwned() then
-    state.pointers[ev.id] = nil
-    if state.tapOwner == ev.id then state.tapOwner = nil end
-    if state.nav and ev.phase == "pressed" then cancelRoute("voxel_provider_input") end
-    return result
-  end
   if option("enabled", true) == false then return result end
 
   -- Mouse shortcuts are independent from mouse walking. Only LMB is ever
@@ -10757,6 +11007,20 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
     local stack = game and game.stack
     local top = stack and type(stack.top) == "function" and stack:top() or nil
     if top and top ~= game.overworld then
+      if option("battle_touch_controls", true) == true and ControlsFree.battleActive(game) then
+        local handled, _, _, confirmed = ControlsFree.directBattleTap(
+          game, ev.x, ev.y, ControlsFree.touchConfirmationMode())
+        if handled then
+          if confirmed then
+            state.stats.desktopATaps = (state.stats.desktopATaps or 0) + 1
+            state.stats.desktopBattleDirectTaps =
+              (state.stats.desktopBattleDirectTaps or 0) + 1
+          end
+          return true
+        end
+      else
+        ControlsFree.clearBattleTouchConfirmation()
+      end
       mod.input:tap(game, "a")
       state.stats.desktopATaps = (state.stats.desktopATaps or 0) + 1
       return true
@@ -11045,8 +11309,8 @@ mod.hooks:wrap("input.step", function(nextFn, game, dt)
   -- tolerance expires. If a second finger arrived, beginRawTwoFingerGesture has
   -- already marked the candidate suppressed and nothing is replayed.
   ControlsFree.promotePinchGraceTouches(game)
-  -- DIALOG/BATTLE TOUCH CONTROL each include their own stationary 1-second
-  -- hold -> B gesture. This is independent from overworld Tap to Move.
+  -- DIRECTIONAL SWIPES keeps the legacy stationary one-second hold -> B
+  -- gesture. This is independent from overworld Tap to Move.
   ControlsFree.holdBTouchTick(game)
   -- START/SELECT TOUCH CONTROL is independent from the TAP TO MOVE switch.
   -- Its own OFF/HOLD/PINCH-SPREAD choice is authoritative.
@@ -11471,6 +11735,7 @@ mod.events:on("save.loading", function()
   state.rawZoomTouches = {}
   state.dialogTouches = {}
   state.battleTouches = {}
+  state.battleTouchPendingConfirm = nil
   state.battleCameraOwnedTouches = {}
   state.playerHoldTouches = {}
   state.systemEdgeTouches = {}
@@ -12059,14 +12324,16 @@ local function diagnostics()
     simpleTouchMovement = ControlsFree.simpleTouchEnabled(),
     nativeControlsVisible = ControlsFree.nativeControlsVisible(state.game),
     controlsFree = {
-      dialogTouchControl = option("dialog_touch_control", false) == true,
-      battleTouchControl = option("battle_touch_control", false) == true,
+      directionalSwipes = ControlsFree.directionalSwipesEnabled(),
+      battleTouchControls = option("battle_touch_controls", true) == true,
+      touchConfirmations = ControlsFree.touchConfirmationMode(),
       startSelectTouchControl = startSelectTouchMode(),
-      dialogue = option("dialog_touch_control", false) == true,
-      dialogueSwipe = option("dialog_touch_control", false) == true,
-      battle = option("battle_touch_control", false) == true,
-      battleSwipe = option("battle_touch_control", false) == true,
-      battleCameraTouchSuppression = option("battle_touch_control", false) == true,
+      dialogue = ControlsFree.directionalSwipesEnabled(),
+      dialogueSwipe = ControlsFree.directionalSwipesEnabled(),
+      battle = option("battle_touch_controls", true) == true,
+      battleSwipe = ControlsFree.directionalSwipesEnabled(),
+      battleCameraTouchSuppression = option("battle_touch_controls", true) == true
+        or ControlsFree.directionalSwipesEnabled(),
       holdPlayerStart = startSelectTouchMode() == "hold_player_sprite",
       pinchSpreadStartSelect = startSelectTouchMode() == "pinch_or_spread",
       pinchFirstTouchGraceTicks = ControlsFree.PINCH_FIRST_TOUCH_GRACE_TICKS,

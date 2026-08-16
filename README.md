@@ -1,25 +1,29 @@
 # Tap to Move
 
-**Tap to Move** adds modern touch and mouse navigation to **Pokémon Gen1Recomp**, with full support for **Red / Blue / Yellow / Gold** in v2.0.7.
+**Tap to Move** adds modern touch and mouse navigation to **Pokémon Gen1Recomp**, with full support for **Red / Blue / Yellow / Gold** in v2.2.0.
 
 Tap a destination in the overworld and the player walks there using collision-aware A* pathfinding. The mod drives normal Gen1Recomp movement input rather than rewriting player coordinates, so collisions, encounters, ledges, scripts, trainers and movement timing remain controlled by the game. On Gold it uses Gold's native collision, field-move and overworld rules rather than forcing Gen 1 map mechanics onto Gen 2.
 
 
-## v2.0.7
+## v2.2.0
 
-- Added native **Dramaless Shape Voxel Mod** compatibility for `DRAMALESS_SHAPE` (verified against Dramaless v2.0.1).
-- Dramaless is discovered through the existing shared Voxel Provider Adapter and uses its fork-preserved `VoxelState`, `Voxel3D`, `VoxelScene`, `Structures`, `TileShape` and `FirstPerson` exports for real 3D picking and Path Preview.
-- Added Dramaless as an optional dependency so its exported Voxel scene is available before Tap to Move performs provider discovery.
-- Dramaless free-camera/first-person touch ownership remains authoritative because its raw `Game:touch*` handlers are loaded before Tap to Move and claimed camera touches never reach Tap-to-Move navigation.
-- Dramatic Shape, Battle Art, PotatoVoxel, normal 2D rendering and Gold behavior are otherwise unchanged.
+- Reworked touch options: the legacy dialogue/battle swipe layer is now a single **Directional Swipes** toggle.
+- **Battle Touch Controls** now specifically means direct tapping of the visible battle choice: FIGHT / PKMN / ITEM / RUN or an exact move slot.
+- Added **Touch Confirmations** immediately after Battle Touch Controls with **One Click** and **Two Clicks**. The default is **Two Clicks**.
+- Under **Two Clicks**, the first tap only moves the game's native battle cursor so the target is visibly highlighted; tapping that same target a second time emits the normal A input and confirms it. Tapping a different target only moves the highlight to the new target.
+- Fresh installs now enable the normal gameplay/control features by default, including Directional Swipes, Battle Touch Controls, START/SELECT hold, FULL Path Preview, Resume After Wild and desktop mouse shortcuts. **DEBUG OVERLAY** and the mutually-exclusive **Experimental Simple Mode** remain opt-in because enabling either would change normal presentation/navigation rather than merely activate a control surface.
+- Existing battle rules remain authoritative: the mod still never calls a move/item/run action directly; confirmation goes through the native A path.
 
-## v2.0.6
 
-- Added native **Battle Art Voxel Fork** compatibility for `BATTLE_ART_VOXEL_FORK` (verified against Battle Art v1.9.0).
-- Battle Art is discovered through the existing shared Voxel Provider Adapter and uses its fork-preserved `VoxelState`, `Voxel3D`, `VoxelScene`, `Structures` and `TileShape` exports for real 3D picking and Path Preview.
-- Added Battle Art as an optional dependency so its exported Voxel scene is available before Tap to Move performs provider discovery.
-- Battle Art's **1ST** first-person input ownership remains authoritative: when Battle Art claims a pointer for camera/A/B control, Tap to Move does not also start navigation.
-- Dramatic Shape, PotatoVoxel, normal 2D rendering and Gold behavior are otherwise unchanged.
+## v2.1.0
+
+- Added **direct battle UI tapping** on top of the existing Battle Touch Control / desktop LMB=A layer.
+- Tapping **FIGHT / PKMN / ITEM / RUN** now targets that exact native battle-menu slot before confirming with the game's normal A input.
+- Tapping a visible move selects the exact move slot (including Gen 1 WIDE 2x2 move layout) and then confirms it through native battle logic.
+- Supports classic Gen 1, Gen 1 WIDE, Gold/Gen 2, high-DPI scaling and Battle Size FILL; the hit test follows the engine UI canvas, so 3D battle backgrounds such as Dramatic Shape do not require screenshot-resolution-specific coordinates.
+- Message phases and party/bag/other overlays deliberately fall back to the existing tap=A / swipe=D-pad / hold=B controls instead of mutating a covered BattleState.
+- No new public option was added: mobile uses the existing **BATTLE TOUCH CONTROL**, while desktop uses the existing **MOUSE LMB/RMB=A/B** option.
+- All v2.0.5 TILT, Gold entrance-intent and Game-Speed/Hold-Steer fixes are preserved.
 
 
 ## v2.0.5
@@ -66,25 +70,24 @@ Tap a destination in the overworld and the player walks there using collision-aw
 - **Avatar semantic pass-through** — if an NPC, interaction, entrance, door or other meaningful target is visually behind the player sprite, tapping there targets that object instead of incorrectly treating the avatar as the destination.
 - **Manual controls always take priority** over automatic movement.
 - **Performance tuning** — `PERFORMANCE BUDGET` limits A* node expansion, connected-map seam/nearest-target work and initial Smart Exit warp scoring. On bounded profiles, an over-budget click into a connected map gracefully becomes movement toward the nearest reachable edge point on the current map instead of being ignored. It exposes only VERY LOW / MEDIUM / FULL, with FULL as the default. VERY LOW and MEDIUM are intentionally aggressive low-CPU profiles. FULL preserves the original search scope; lower profiles trade difficult-route coverage for lower CPU cost. `HOLD RETARGET RATE` separately controls how often Hold to Steer recalculates its target. Voxel Path Preview reprojection is fixed at a conservative 0.25/s to protect weaker devices. Flat 2D Path Preview shares one camera transform per draw instead of rebuilding it for every marker. Map transitions flush map-sensitive runtime caches and wait for the new map authorities to agree before replanning.
-- Optional **Resume After Wild Encounter**.
-- Optional mobile **Dialogue Touch Control** and **Battle Touch Control**.
-- Optional **START/SELECT touch gestures**, including player hold or pinch/spread.
-- Optional desktop mouse shortcuts.
+- **Resume After Wild Encounter** is enabled by default on fresh installs.
+- Mobile **Directional Swipes** and **Battle Touch Controls** are enabled by default.
+- **Touch Confirmations** defaults to **Two Clicks** for safer small-screen battle selection.
+- **START/SELECT touch control** defaults to **Hold Player Sprite**.
+- Desktop mouse walk, LMB/RMB, wheel and side-button shortcuts are enabled by default.
 
 ## Voxel support
 
 Tap to Move supports full 3D navigation with:
 
 - **Dramatic Shape Voxel Mod**
-- **Battle Art Voxel Fork**
-- **Dramaless Shape Voxel Mod**
 - **PotatoVoxel**
 
-All supported Voxel renderers use the same Tap to Move navigation engine through a shared **Voxel Provider Adapter**. The adapter reads the active renderer's exported camera and scene capabilities, so 3D ray picking, NPC targeting, doors, hidden-event fixtures, Smart Exits, connected maps, avatar hit testing and Path Preview use the actual Voxel scene.
+Both use the same Tap to Move navigation engine through a shared **Voxel Provider Adapter**. The adapter reads the active renderer's exported camera and scene capabilities, so 3D ray picking, NPC targeting, doors, hidden-event fixtures, Smart Exits, connected maps, avatar hit testing and Path Preview use the actual Voxel scene.
 
 PotatoVoxel's HIGH, MEDIUM, LOW and POTATO render scales are handled from the renderer's live internal canvas dimensions rather than hardcoded scale values.
 
-All Voxel mods are optional. Without a supported Voxel renderer, Tap to Move automatically uses its normal 2D targeting path.
+Both Voxel mods are optional. Without a supported Voxel renderer, Tap to Move automatically uses its normal 2D targeting path.
 
 ## Experimental Simple Mode
 
@@ -92,7 +95,7 @@ All Voxel mods are optional. Without a supported Voxel renderer, Tap to Move aut
 
 It directly converts the finger direction into normal movement input instead of using 2D/3D target picking and A* pathfinding.
 
-Simple Mode is **OFF by default** and is **not required for PotatoVoxel, Dramatic Shape, Battle Art or Dramaless**.
+Simple Mode is **OFF by default** and is **not required for PotatoVoxel or Dramatic Shape**.
 
 Its available tuning options remain:
 
@@ -140,7 +143,7 @@ Its available tuning options remain:
 
 Install the mod normally through Gen1Recomp's mod system.
 
-No Voxel mod is required. Dramatic Shape, Battle Art, Dramaless and PotatoVoxel are optional integrations.
+No Voxel mod is required. Dramatic Shape and PotatoVoxel are optional integrations.
 
 ## Notes
 
