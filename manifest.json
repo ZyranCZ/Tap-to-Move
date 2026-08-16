@@ -1,13 +1,14 @@
 {
   "id": "tap_to_move",
   "name": "Tap to Move",
-  "version": "2.2.0",
+  "version": "2.3.3",
   "entry": "main.lua",
   "api": 2,
   "category": "GAMEPLAY",
   "priority": 100,
   "dependencies": [],
   "optional_dependencies": [
+    "BATTLE_ART_VOXEL_FORK",
     "DRAMATIC_SHAPE",
     "potato_voxel"
   ],

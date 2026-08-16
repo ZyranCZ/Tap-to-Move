@@ -1,9 +1,38 @@
 # Tap to Move
 
-**Tap to Move** adds modern touch and mouse navigation to **Pokémon Gen1Recomp**, with full support for **Red / Blue / Yellow / Gold** in v2.2.0.
+**Tap to Move** adds modern touch and mouse navigation to **Pokémon Gen1Recomp**, with full support for **Red / Blue / Yellow / Gold** in v2.3.3.
 
 Tap a destination in the overworld and the player walks there using collision-aware A* pathfinding. The mod drives normal Gen1Recomp movement input rather than rewriting player coordinates, so collisions, encounters, ledges, scripts, trainers and movement timing remain controlled by the game. On Gold it uses Gold's native collision, field-move and overworld rules rather than forcing Gen 1 map mechanics onto Gen 2.
 
+
+## v2.3.3
+
+- Replaces the overlapping **Battle Touch Controls** and **Menu Touch Controls** settings with one unified **UI Touch Controls** switch. It covers direct hit-testing for supported battle UI, Party, Bag/Pack, Options and other native menu surfaces.
+- **UI Touch Controls defaults to OFF** on fresh installs because third-party UI mods can move or reshape native UI elements and require their own compatibility layer before direct hit-testing is safe.
+- Uses the new `ui_touch_controls` option key, so an upgrade does **not** inherit a previously saved ON value from either legacy touch setting. Players explicitly opt in after updating.
+- **Touch Confirmations** remains immediately after UI Touch Controls and still defaults to **Two Clicks**. Directional Swipes remains separate and enabled by default.
+- Battle Art 1.9.0 compatibility from v2.3.2 and the v2.3.1 native-menu alignment fix are unchanged.
+
+## v2.3.2
+
+- Adds an explicit **Battle Art 1.9.0 compatibility provider** under its real manifest id `BATTLE_ART_VOXEL_FORK`.
+- Battle Art 1.9.0 exports the same `exports.lib` VoxelState/Voxel3D scene contract as the Dramatic family, but does not identify itself as `DRAMATIC_SHAPE`; older Tap to Move builds therefore saw Battle Art's 3D `worldOverride` while failing to discover any Voxel provider and overworld taps ended in `no_view`.
+- Battle Art is now an optional dependency so its exported 3D scene API is available before Tap to Move performs provider discovery.
+- Existing Dramatic Shape, Potato Voxel, vanilla, Gold, battle touch and menu touch paths are unchanged.
+
+## v2.3.1
+
+- Fixes **Menu Touch Controls alignment**, especially in Gold/Gen 2 PARTY, PACK and OPTION screens. Two-line rows now keep their second line (HP / quantity / option value) inside the same tappable item instead of incorrectly selecting the following row.
+- Captures the exact UI scale/origin from the rendered frame before pointer input, preventing drift when zoom/DYNAMIC UI or display scaling changes the visible menu transform.
+- Battle touch and overworld Tap to Move logic are intentionally unchanged.
+
+## v2.3.0
+
+- Adds **Menu Touch Controls** (default ON) for direct taps on standard UI choices outside battle.
+- Party Pokémon, Bag/Pack items, Options rows, Start-menu entries, generic list/menu rows, submenus and YES/NO prompts can be selected by touching the visible item.
+- **Touch Confirmations** now applies to both battle and menu direct touch: with **Two Clicks**, the first tap only moves the native cursor/highlight and the second tap on the same item confirms it.
+- Keeps normal engine input semantics: direct touch selects the engine's own cursor/index, then confirms through the regular A input instead of bypassing menu logic.
+- Preserves Gen 1 + Gold support and the existing Battle Touch / Directional Swipe behavior.
 
 ## v2.2.0
 
@@ -71,8 +100,8 @@ Tap a destination in the overworld and the player walks there using collision-aw
 - **Manual controls always take priority** over automatic movement.
 - **Performance tuning** — `PERFORMANCE BUDGET` limits A* node expansion, connected-map seam/nearest-target work and initial Smart Exit warp scoring. On bounded profiles, an over-budget click into a connected map gracefully becomes movement toward the nearest reachable edge point on the current map instead of being ignored. It exposes only VERY LOW / MEDIUM / FULL, with FULL as the default. VERY LOW and MEDIUM are intentionally aggressive low-CPU profiles. FULL preserves the original search scope; lower profiles trade difficult-route coverage for lower CPU cost. `HOLD RETARGET RATE` separately controls how often Hold to Steer recalculates its target. Voxel Path Preview reprojection is fixed at a conservative 0.25/s to protect weaker devices. Flat 2D Path Preview shares one camera transform per draw instead of rebuilding it for every marker. Map transitions flush map-sensitive runtime caches and wait for the new map authorities to agree before replanning.
 - **Resume After Wild Encounter** is enabled by default on fresh installs.
-- Mobile **Directional Swipes** and **Battle Touch Controls** are enabled by default.
-- **Touch Confirmations** defaults to **Two Clicks** for safer small-screen battle selection.
+- Mobile **Directional Swipes** is enabled by default. **UI Touch Controls** defaults to **OFF** so UI mods cannot silently invalidate direct hitboxes.
+- **Touch Confirmations** defaults to **Two Clicks** whenever UI Touch Controls is enabled.
 - **START/SELECT touch control** defaults to **Hold Player Sprite**.
 - Desktop mouse walk, LMB/RMB, wheel and side-button shortcuts are enabled by default.
 
@@ -81,9 +110,10 @@ Tap a destination in the overworld and the player walks there using collision-aw
 Tap to Move supports full 3D navigation with:
 
 - **Dramatic Shape Voxel Mod**
+- **Battle Art Voxel Fork 1.9.0+**
 - **PotatoVoxel**
 
-Both use the same Tap to Move navigation engine through a shared **Voxel Provider Adapter**. The adapter reads the active renderer's exported camera and scene capabilities, so 3D ray picking, NPC targeting, doors, hidden-event fixtures, Smart Exits, connected maps, avatar hit testing and Path Preview use the actual Voxel scene.
+Dramatic Shape, Battle Art and PotatoVoxel use the same Tap to Move navigation engine through a shared **Voxel Provider Adapter**. The adapter reads the active renderer's exported camera and scene capabilities, so 3D ray picking, NPC targeting, doors, hidden-event fixtures, Smart Exits, connected maps, avatar hit testing and Path Preview use the actual Voxel scene.
 
 PotatoVoxel's HIGH, MEDIUM, LOW and POTATO render scales are handled from the renderer's live internal canvas dimensions rather than hardcoded scale values.
 

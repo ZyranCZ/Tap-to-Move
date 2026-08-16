@@ -1,4 +1,4 @@
--- Tap to Move v2.2.0
+-- Tap to Move v2.3.3
 -- Mobile-first collision-aware shortest-path navigation for Gen1Recomp.
 --
 -- Design rule: this mod never writes player coordinates or invents warp
@@ -9,7 +9,7 @@
 
 local mod = ...
 
-local VERSION = "2.2.0"
+local VERSION = "2.3.3"
 local TILE_SIZE = 16
 local FIXED_TICKS_PER_SECOND = 60
 local DEFAULT_HOLD_STEER_DELAY_MS = 150 -- 1X base; scaled by live overworld logic speed
@@ -169,8 +169,11 @@ mod.options:define({
     } },
   { key = "directional_swipes", label = "Directional Swipes",
     type = "toggle", default = true },
-  { key = "battle_touch_controls", label = "Battle Touch Controls",
-    type = "toggle", default = true },
+  -- One direct-hit-test switch for every supported native UI surface. Use a
+  -- fresh key rather than inheriting the old battle/menu toggles: UI layout
+  -- mods can move controls independently, so upgrades must opt in explicitly.
+  { key = "ui_touch_controls", label = "UI Touch Controls",
+    type = "toggle", default = false },
   { key = "touch_confirmations", label = "Touch Confirmations",
     type = "choice", default = "two_clicks",
     choices = {
@@ -272,7 +275,7 @@ local state = {
   nativeZoomSuppression = nil,
   dialogTouches = {},
   battleTouches = {},
-  battleTouchPendingConfirm = nil,
+  touchPendingConfirm = nil,
   battleCameraOwnedTouches = {},
   playerHoldTouches = {},
   systemEdgeTouches = {},
@@ -735,6 +738,67 @@ local function captureView(ctx)
     worldOverride = ctx.worldOverride and true or false,
     generation = tonumber(ctx.generation),
   }
+
+  -- Snapshot the UI transform WHILE render.compose is running.  Renderer:endFrame
+  -- clears worldActive after the frame is presented, but uiScale() uses that flag
+  -- when DYNAMIC UI follows a zoomed overworld.  Recomputing uiScale later from
+  -- input.pointer could therefore invert a different scale than the one the user
+  -- actually tapped.  Keep the exact visible frame's UI scale/origin here.
+  do
+    local r = ctx.renderer
+    local uiw, uih = tonumber(ctx.uiw) or 160, tonumber(ctx.uih) or 144
+    local ww, wh = tonumber(state.frame.ww), tonumber(state.frame.wh)
+    local up
+
+    if tonumber(ctx.generation) == 2 and ctx.worldActive == true
+        and r and r.world and type(r.world.fitScale) == "function" then
+      -- Gold overlays over the live world are blitted with World:fitScale(),
+      -- which can differ from Game2:frameFit() under faithful-ratio/display
+      -- constraints.  Capture the scale drawScene actually used.
+      local okScale, value = pcall(r.world.fitScale, r.world)
+      if okScale then up = tonumber(value) end
+    elseif r and type(r.uiScale) == "function" then
+      local okScale, value = pcall(r.uiScale, r)
+      if okScale then up = tonumber(value) end
+    end
+
+    if (not up or up <= 0) and tonumber(ctx.generation) == 2 then
+      up = tonumber(ctx.scale)
+    end
+    if (not up or up <= 0) and r and type(r.fitScale) == "function" then
+      local okScale, value = pcall(r.fitScale, r)
+      if okScale then up = tonumber(value) end
+    end
+    if (not up or up <= 0) then up = tonumber(ctx.scale) end
+
+    if up and up > 1e-6 and ww and wh and pw and ph then
+      if r and r.uiFill then up = math.min(ph / uih, pw / uiw) end
+      local sx, sy
+      if tonumber(ctx.generation) == 2 then
+        -- Gold's Chrome.fitScale is already expressed in LOVE window units.
+        sx, sy = up, up
+      else
+        -- Gen 1 computes the crisp fit in framebuffer pixels, then divides by
+        -- each axis DPI when blitting into LOVE window units.
+        sx, sy = up / dpiX, up / dpiY
+      end
+      local ox, oy
+      if tonumber(ctx.generation) == 2 then
+        ox = math.floor((ww - uiw * sx) / 2)
+        oy = math.floor((wh - uih * sy) / 2)
+      else
+        -- Renderer:endFrame floors in framebuffer pixels BEFORE dividing back
+        -- to LOVE units. Preserve that order exactly on asymmetric/HiDPI axes.
+        ox = math.floor((pw - uiw * up) / 2) / dpiX
+        oy = math.floor((ph - uih * up) / 2) / dpiY
+      end
+      state.frame.ui = {
+        ww = ww, wh = wh, uiw = uiw, uih = uih,
+        up = up, ux = sx, uy = sy, ox = ox, oy = oy,
+        generation = tonumber(ctx.generation),
+      }
+    end
+  end
 
   -- Gold's camera is advanced inside World:draw(), before render.compose is
   -- raised.  Snapshot the exact camera/zoom/perspective geometry that produced
@@ -3693,6 +3757,13 @@ end
 -- a dozen additional locals just to name adapter helpers.
 local VoxelAdapter = {
   providers = {
+    -- Battle Art is a fork of the Dramatic voxel renderer, but it ships under
+    -- its own manifest id.  Older Battle Art releases (notably 1.9.0) expose
+    -- the same companion `exports.lib` / VoxelState / Voxel3D scene contract
+    -- without aliasing themselves as DRAMATIC_SHAPE.  Treat it as a first-class
+    -- provider so a 3D worldOverride never falls through to the flat no_view
+    -- path just because the fork has a different id.
+    { id = "BATTLE_ART_VOXEL_FORK", kind = "battle_art", short = "BATTLEART" },
     { id = "DRAMATIC_SHAPE", kind = "dramatic_shape", short = "DS" },
     { id = "potato_voxel", kind = "potato_voxel", short = "POTATO" },
   },
@@ -9338,7 +9409,7 @@ end
 -- It is the mobile fallback controller for every game UI/state except the two
 -- contexts that already have their own touch semantics:
 --   * free overworld -> Tap to Move / Hold to Steer
---   * any BattleState in the stack -> Battle Touch Controls / native battle touch
+--   * any BattleState in the stack -> UI Touch Controls / native battle touch
 -- This fail-open coverage means newly added menus, choice screens and overlays
 -- automatically inherit release-A + swipe D-pad without needing a hard-coded
 -- state-name allowlist.
@@ -9379,10 +9450,21 @@ function ControlsFree.directionalSwipesEnabled()
   return option("directional_swipes", true) == true
 end
 
-function ControlsFree.dialogTouchFeatureEnabled(game)
-  return ControlsFree.directionalSwipesEnabled()
+function ControlsFree.uiTouchControlsOptionEnabled()
+  return option("ui_touch_controls", false) == true
+end
+
+function ControlsFree.uiTouchControlsEnabled(game)
+  return ControlsFree.uiTouchControlsOptionEnabled()
       and ControlsFree.mobileHost()
       and ControlsFree.dialogTouchSurfaceActive(game)
+end
+
+function ControlsFree.dialogTouchFeatureEnabled(game)
+  return ControlsFree.mobileHost()
+      and ControlsFree.dialogTouchSurfaceActive(game)
+      and (ControlsFree.directionalSwipesEnabled()
+        or ControlsFree.uiTouchControlsOptionEnabled())
 end
 
 
@@ -9407,7 +9489,7 @@ function ControlsFree.battleActive(game)
 end
 
 function ControlsFree.battleTouchControlsEnabled(game)
-  return option("battle_touch_controls", true) == true
+  return ControlsFree.uiTouchControlsOptionEnabled()
       and ControlsFree.mobileHost()
       and ControlsFree.battleActive(game)
 end
@@ -9420,9 +9502,16 @@ end
 
 -- The raw battle touch bridge owns a contact whenever EITHER battle-specific
 -- direct selection or the shared Directional Swipes layer needs it.
+function ControlsFree.uiTouchControlsInBattleEnabled(game)
+  return ControlsFree.uiTouchControlsOptionEnabled()
+      and ControlsFree.mobileHost()
+      and ControlsFree.battleActive(game)
+end
+
 function ControlsFree.battleTouchFeatureEnabled(game)
   return ControlsFree.battleTouchControlsEnabled(game)
       or ControlsFree.battleDirectionalSwipesEnabled(game)
+      or ControlsFree.uiTouchControlsInBattleEnabled(game)
 end
 
 function ControlsFree.touchConfirmationMode()
@@ -9430,8 +9519,38 @@ function ControlsFree.touchConfirmationMode()
   return mode == "one_click" and "one_click" or "two_clicks"
 end
 
+function ControlsFree.clearTouchConfirmation()
+  state.touchPendingConfirm = nil
+end
+
+-- Backward-named helper kept internally because the battle bridge still calls
+-- it in several lifecycle paths. Both battle and ordinary menu direct touch
+-- now share one pending confirmation, so moving to another UI surface can
+-- never accidentally complete an old two-click selection.
 function ControlsFree.clearBattleTouchConfirmation()
-  state.battleTouchPendingConfirm = nil
+  ControlsFree.clearTouchConfirmation()
+end
+
+function ControlsFree.confirmTouchTarget(game, owner, phase, kind, index, confirmationMode)
+  local mode = confirmationMode or ControlsFree.touchConfirmationMode()
+  if mode == "two_clicks" then
+    local pending = state.touchPendingConfirm
+    local same = pending
+      and pending.owner == owner
+      and pending.phase == phase
+      and pending.kind == kind
+      and pending.index == index
+    if not same then
+      state.touchPendingConfirm = {
+        owner = owner, phase = phase, kind = kind, index = index,
+        selectedTick = state.tick,
+      }
+      return false, true
+    end
+  end
+  ControlsFree.clearTouchConfirmation()
+  mod.input:tap(game, "a")
+  return true, false
 end
 
 -- Direct battle UI targeting -------------------------------------------------
@@ -9606,17 +9725,28 @@ end
 function ControlsFree.directBattleTap(game, x, y, confirmationMode)
   local battle = ControlsFree.topBattleState(game)
   if not battle then
-    ControlsFree.clearBattleTouchConfirmation()
+    -- A Party/Bag/Choice overlay can sit above an active battle and owns the
+    -- same shared two-click confirmation state. Do not erase that menu target
+    -- merely because this battle-specific adapter declined the top screen;
+    -- the caller will try directUITap next and clear on a true miss.
     return false
   end
-  local ux, uy, uiw = ControlsFree.battleWindowToUI(game, x, y)
+  local gen2 = battle.screenId == "Gen2BattleState"
+  -- Gold owns its own full-window compositor and has no Gen 1 Renderer
+  -- instance. Its frameFit is the authoritative native-160x144 transform;
+  -- Gen 1 keeps using Renderer UI inversion (including WIDE/FILL/high-DPI).
+  local ux, uy, uiw
+  if gen2 and type(ControlsFree.goldFrameWindowToUI) == "function" then
+    ux, uy, uiw = ControlsFree.goldFrameWindowToUI(game, x, y)
+  else
+    ux, uy, uiw = ControlsFree.battleWindowToUI(game, x, y)
+  end
   if not ux then
     ControlsFree.clearBattleTouchConfirmation()
     state.stats.battleDirectMisses = (state.stats.battleDirectMisses or 0) + 1
     return false
   end
 
-  local gen2 = battle.screenId == "Gen2BattleState"
   local phase = tostring(battle.phase or "")
   local index, kind
   if phase == "menu" then
@@ -9639,40 +9769,546 @@ function ControlsFree.directBattleTap(game, x, y, confirmationMode)
     return false
   end
 
-  local mode = confirmationMode or ControlsFree.touchConfirmationMode()
-  if mode == "two_clicks" then
-    local pending = state.battleTouchPendingConfirm
-    local same = pending
-      and pending.battle == battle
-      and pending.phase == phase
-      and pending.kind == kind
-      and pending.index == index
-    if not same then
-      -- First click only moves the engine's own cursor. The next draw therefore
-      -- highlights the touched FIGHT/PKMN/ITEM/RUN or move slot exactly as if
-      -- the player had navigated there with the D-pad.
-      state.battleTouchPendingConfirm = {
-        battle = battle, phase = phase, kind = kind, index = index,
-        selectedTick = state.tick,
-      }
-      state.stats.battleDirectSelections =
-        (state.stats.battleDirectSelections or 0) + 1
-      return true, kind, index, false
-    end
-    ControlsFree.clearBattleTouchConfirmation()
+  local confirmed, selectedOnly = ControlsFree.confirmTouchTarget(
+    game, battle, phase, kind, index, confirmationMode)
+  if selectedOnly then
+    -- First click only moves the engine's own cursor. The next draw therefore
+    -- highlights the touched FIGHT/PKMN/ITEM/RUN or move slot exactly as if
+    -- the player had navigated there with the D-pad.
+    state.stats.battleDirectSelections =
+      (state.stats.battleDirectSelections or 0) + 1
+    return true, kind, index, false
+  end
+  if confirmed and (confirmationMode or ControlsFree.touchConfirmationMode()) == "two_clicks" then
     state.stats.battleDirectSecondConfirms =
       (state.stats.battleDirectSecondConfirms or 0) + 1
-  else
-    ControlsFree.clearBattleTouchConfirmation()
   end
 
-  mod.input:tap(game, "a")
   if kind == "menu" then
     state.stats.battleDirectMenuTaps = (state.stats.battleDirectMenuTaps or 0) + 1
   else
     state.stats.battleDirectMoveTaps = (state.stats.battleDirectMoveTaps or 0) + 1
   end
   return true, kind, index, true
+end
+
+-- Direct ordinary UI targeting ---------------------------------------------
+--
+-- Battle direct touch proved that the safest pointer model is not to call a
+-- menu action from the mod.  The engine already owns the authoritative cursor
+-- and A-handler, so ordinary UI follows the same rule: hit-test the visible
+-- row, move the native cursor/index, then let Touch Confirmations decide when
+-- the normal A input is emitted.  This keeps item restrictions, party rules,
+-- option side effects, injected mod rows and every screen-specific callback in
+-- the engine instead of duplicating them here.
+ControlsFree.uiClassCache = ControlsFree.uiClassCache or {}
+ControlsFree.UI_CLASS_PATHS = ControlsFree.UI_CLASS_PATHS or {
+  menu = "src.ui.Menu",
+  list = "src.ui.ListMenu",
+  choice = "src.ui.ChoiceBox",
+  party1 = "src.ui.PartyMenu",
+  options1 = "src.ui.OptionsMenu",
+  party2 = "src.ui.gen2.PartyMenu",
+  pack2 = "src.ui.gen2.PackMenu",
+  options2 = "src.ui.gen2.OptionsMenu",
+  start2 = "src.ui.gen2.StartMenu",
+}
+
+function ControlsFree.uiClass(key)
+  local cached = ControlsFree.uiClassCache[key]
+  if cached ~= nil then return cached or nil end
+  local path = ControlsFree.UI_CLASS_PATHS[key]
+  if not path then
+    ControlsFree.uiClassCache[key] = false
+    return nil
+  end
+  local ok, cls = pcall(require, path)
+  ControlsFree.uiClassCache[key] = ok and cls or false
+  return ok and cls or nil
+end
+
+function ControlsFree.uiInstance(st, key)
+  if type(st) ~= "table" then return false end
+  local cls = ControlsFree.uiClass(key)
+  if not cls then return false end
+  local ok, mt = pcall(getmetatable, st)
+  return ok and mt == cls
+end
+
+function ControlsFree.topUIState(game)
+  local stack = game and game.stack
+  if not stack or type(stack.top) ~= "function" then return nil end
+  local ok, top = pcall(stack.top, stack)
+  return ok and top or nil
+end
+
+-- Return window metrics in the same units Renderer:endFrame uses for its UI
+-- blit.  This is intentionally a sibling of battleWindowToUI instead of a
+-- rewrite of that battle-tested function, so v2.1/v2.2 battle hit testing does
+-- not regress while ordinary anchored menus gain the same DPI correctness.
+function ControlsFree.uiWindowMetrics(game)
+  local r = game and game.renderer
+  local frame = state.frame or {}
+  local ww, wh = tonumber(frame.ww), tonumber(frame.wh)
+  if (not ww or not wh) and love and love.graphics
+      and type(love.graphics.getDimensions) == "function" then
+    local ok, w, h = pcall(love.graphics.getDimensions)
+    if ok then ww, wh = tonumber(w), tonumber(h) end
+  end
+  if not (ww and wh and ww > 0 and wh > 0) then return nil end
+
+  -- Prefer the transform captured from the frame the player actually saw.
+  -- This avoids reading Renderer:uiScale() after endFrame has already reset
+  -- worldActive, which was the source of zoom/DYNAMIC-menu drift.
+  local captured = frame.ui
+  if type(captured) == "table"
+      and math.abs((tonumber(captured.ww) or -1) - ww) < 0.5
+      and math.abs((tonumber(captured.wh) or -1) - wh) < 0.5
+      and tonumber(captured.ux) and tonumber(captured.uy)
+      and tonumber(captured.ox) and tonumber(captured.oy) then
+    return {
+      -- Gold has no Gen 1 Renderer instance.  Its ordinary stack is centered,
+      -- so a tiny inert renderer-shape lets the shared Menu/Choice adapters use
+      -- the captured frame without inventing edge docking that Gold never did.
+      r = r or { uiCentered = true, uiAnchorHold = true }, ww = ww, wh = wh,
+      pw = tonumber(frame.pw), ph = tonumber(frame.ph),
+      dpiX = tonumber(frame.dpiX) or 1, dpiY = tonumber(frame.dpiY) or 1,
+      uiw = tonumber(captured.uiw) or 160,
+      uih = tonumber(captured.uih) or 144,
+      up = tonumber(captured.up),
+      ux = tonumber(captured.ux), uy = tonumber(captured.uy),
+      ox = tonumber(captured.ox), oy = tonumber(captured.oy),
+      captured = true,
+    }
+  end
+
+  if not r then return nil end
+
+  local pw, ph = tonumber(frame.pw), tonumber(frame.ph)
+  if (not pw or not ph) and love and love.graphics
+      and type(love.graphics.getPixelDimensions) == "function" then
+    local ok, w, h = pcall(love.graphics.getPixelDimensions)
+    if ok then pw, ph = tonumber(w), tonumber(h) end
+  end
+  local dpiX, dpiY = tonumber(frame.dpiX), tonumber(frame.dpiY)
+  if not dpiX or dpiX <= 1e-6 then dpiX = (pw and pw > 0) and pw / ww or 1 end
+  if not dpiY or dpiY <= 1e-6 then dpiY = (ph and ph > 0) and ph / wh or 1 end
+  if dpiX <= 1e-6 then dpiX = 1 end
+  if dpiY <= 1e-6 then dpiY = 1 end
+  pw, ph = pw or ww * dpiX, ph or wh * dpiY
+
+  local uiw, uih = 160, 144
+  if type(r.uiSize) == "function" then
+    local ok, w, h = pcall(r.uiSize, r)
+    if ok and tonumber(w) and tonumber(h) then uiw, uih = tonumber(w), tonumber(h) end
+  end
+  local up
+  if type(r.uiScale) == "function" then
+    local ok, value = pcall(r.uiScale, r)
+    if ok then up = tonumber(value) end
+  end
+  if (not up or up <= 0) and type(r.fitScale) == "function" then
+    local ok, value = pcall(r.fitScale, r)
+    if ok then up = tonumber(value) end
+  end
+  if not up or up <= 0 then return nil end
+  if r.uiFill then up = math.min(ph / uih, pw / uiw) end
+  if up <= 1e-6 then return nil end
+
+  local ux, uy = up / dpiX, up / dpiY
+  local ox = math.floor((pw - uiw * up) / 2) / dpiX
+  local oy = math.floor((ph - uih * up) / 2) / dpiY
+  return {
+    r = r, ww = ww, wh = wh, pw = pw, ph = ph,
+    dpiX = dpiX, dpiY = dpiY, uiw = uiw, uih = uih,
+    up = up, ux = ux, uy = uy, ox = ox, oy = oy,
+  }
+end
+
+-- Invert one edge-anchored UI rectangle.  Renderer currently docks BOTTOM and
+-- TOPRIGHT regions when UI LAYOUT=DYNAMIC; centered mode falls back to the
+-- ordinary whole-canvas inversion.  Returning native coordinates means every
+-- adapter below can be authored from the same tile coordinates as its engine
+-- draw function rather than from one particular phone resolution.
+function ControlsFree.anchoredWindowToUI(game, x, y, rect, anchor)
+  if type(rect) ~= "table" then return nil end
+  local m = ControlsFree.uiWindowMetrics(game)
+  if not m then return nil end
+  local bx, by = tonumber(rect[1]), tonumber(rect[2])
+  local bw, bh = tonumber(rect[3]), tonumber(rect[4])
+  if not (bx and by and bw and bh and bw > 0 and bh > 0) then return nil end
+
+  if not anchor or m.r.uiCentered or m.r.uiAnchorHold then
+    return ControlsFree.battleWindowToUI(game, x, y)
+  end
+
+  local dw, dh = bw * m.ux, bh * m.uy
+  local gapR = (m.uiw - (bx + bw)) * m.ux
+  local gapB = (m.uih - (by + bh)) * m.uy
+  local dx, dy
+  if anchor == "bottom" then
+    dx = m.ox + bx * m.ux
+    dy = m.wh - gapB - dh
+  elseif anchor == "topright" then
+    dx = m.ww - gapR - dw
+    dy = by * m.uy
+  else
+    return ControlsFree.battleWindowToUI(game, x, y)
+  end
+  if x < dx or y < dy or x >= dx + dw or y >= dy + dh then return nil end
+  return bx + (x - dx) / m.ux, by + (y - dy) / m.uy, m.uiw, m.uih
+end
+
+-- Gold's Gen2StartMenu is composed through Game2:frameFit rather than the
+-- ordinary 160x144 UI anchor path.  Its own source defines a right-half menu;
+-- invert that exact fitted frame so direct rows line up on arbitrary windows.
+function ControlsFree.goldFrameWindowToUI(game, x, y)
+  local frame = state.frame or {}
+  local captured = frame.ui
+  if type(captured) == "table" and tonumber(captured.generation) == 2 then
+    local sx, sy = tonumber(captured.ux), tonumber(captured.uy)
+    local ox, oy = tonumber(captured.ox), tonumber(captured.oy)
+    local uiw, uih = tonumber(captured.uiw) or 160, tonumber(captured.uih) or 144
+    if sx and sy and sx > 1e-6 and sy > 1e-6 and ox and oy then
+      local ux, uy = (x - ox) / sx, (y - oy) / sy
+      if ux >= 0 and uy >= 0 and ux < uiw and uy < uih then
+        return ux, uy, uiw, uih
+      end
+      return nil
+    end
+  end
+  local ww, wh = tonumber(frame.ww), tonumber(frame.wh)
+  if (not ww or not wh) and love and love.graphics
+      and type(love.graphics.getDimensions) == "function" then
+    local ok, w, h = pcall(love.graphics.getDimensions)
+    if ok then ww, wh = tonumber(w), tonumber(h) end
+  end
+  if not (ww and wh and type(game and game.frameFit) == "function") then return nil end
+  local ok, scale, ox, oy = pcall(game.frameFit, game, ww, wh)
+  scale, ox, oy = ok and tonumber(scale) or nil, tonumber(ox) or 0, tonumber(oy) or 0
+  if not scale or scale <= 1e-6 then return nil end
+  local ux, uy = (x - ox) / scale, (y - oy) / scale
+  if ux < 0 or uy < 0 or ux >= 160 or uy >= 144 then return nil end
+  return ux, uy, 160, 144
+end
+
+function ControlsFree.directUIConfirm(game, owner, phase, kind, index, confirmationMode)
+  local confirmed, selectedOnly = ControlsFree.confirmTouchTarget(
+    game, owner, phase, kind, index, confirmationMode)
+  if selectedOnly then
+    state.stats.menuDirectSelections = (state.stats.menuDirectSelections or 0) + 1
+    return true, kind, index, false
+  end
+  state.stats.menuDirectConfirms = (state.stats.menuDirectConfirms or 0) + 1
+  return true, kind, index, confirmed and true or false
+end
+
+function ControlsFree.hitSpacedRows(uy, firstCenter, spacing, count)
+  if not (uy and count and count > 0) then return nil end
+  local half = spacing / 2
+  if uy < firstCenter - half or uy >= firstCenter + (count - 1) * spacing + half then
+    return nil
+  end
+  local row = math.floor((uy - (firstCenter - half)) / spacing) + 1
+  return row >= 1 and row <= count and row or nil
+end
+
+-- Hit rows whose semantic item occupies the full block beginning at firstTop.
+-- Gold PARTY/PACK/OPTION rows are two tile lines tall: the label is on line 1
+-- and HP/count/value lives on line 2.  Treating the label as the row CENTER
+-- shifted the hit boundary upward by 8px and made the lower half select the
+-- next item. leadingPad is only for art that visibly protrudes above row 1
+-- (Gold party icons); it still resolves to row 1 rather than a phantom row 0.
+function ControlsFree.hitBlockRows(uy, firstTop, height, count, leadingPad)
+  if not (uy and firstTop and height and height > 0 and count and count > 0) then
+    return nil
+  end
+  local pad = math.max(0, tonumber(leadingPad) or 0)
+  if uy < firstTop - pad or uy >= firstTop + count * height then return nil end
+  if uy < firstTop then return 1 end
+  local row = math.floor((uy - firstTop) / height) + 1
+  return row >= 1 and row <= count and row or nil
+end
+
+function ControlsFree.directChoiceBoxTap(game, top, x, y, confirmationMode)
+  if top.pending ~= nil then return false end
+  local tx, ty, tw, th = tonumber(top.tx), tonumber(top.ty), tonumber(top.tw), tonumber(top.th)
+  if not (tx and ty and tw and th) then return false end
+  local ux, uy = ControlsFree.anchoredWindowToUI(
+    game, x, y, { tx * 8, ty * 8, tw * 8, th * 8 }, top.anchor)
+  if not ux then return false end
+  if ux < tx * 8 or ux >= (tx + tw) * 8 then return false end
+  local yesY, noY = (ty + 1) * 8, (ty + 3) * 8
+  local index = math.abs(uy - yesY) <= 8 and 1
+    or (math.abs(uy - noY) <= 8 and 2 or nil)
+  if not index then return false end
+  top.index = index
+  return ControlsFree.directUIConfirm(game, top, "choice", "yesno", index, confirmationMode)
+end
+
+function ControlsFree.directGen1PartyTap(game, top, x, y, confirmationMode)
+  local ux, uy = ControlsFree.battleWindowToUI(game, x, y)
+  if not ux then return false end
+  if top.submenu and type(top.subItems) == "table" then
+    local n = #top.subItems
+    local y0 = (17 - n * 2) * 8
+    if ux < 72 or ux >= 160 then return false end
+    local row = ControlsFree.hitSpacedRows(uy, y0, 16, n)
+    if not row then return false end
+    top.subIndex = row
+    return ControlsFree.directUIConfirm(game, top, "party_submenu", "party_action", row,
+      confirmationMode)
+  end
+  local party = top.party or (game and game.save and game.save.party) or {}
+  local count = #party
+  if count < 1 or uy < 0 or uy >= count * 16 then return false end
+  local index = math.floor(uy / 16) + 1
+  top.index = index
+  return ControlsFree.directUIConfirm(game, top, "party", "pokemon", index, confirmationMode)
+end
+
+function ControlsFree.directGen2PartyTap(game, top, x, y, confirmationMode)
+  local ux, uy = ControlsFree.goldFrameWindowToUI(game, x, y)
+  if not ux then return false end
+  local menu = top.submenu
+  if type(menu) == "table" and type(menu.items) == "table" then
+    local n = #menu.items
+    local left, firstY
+    if menu.battle then
+      left, firstY = 11 * 8, 12 * 8
+    else
+      local topTile = 1 + 17 - 2 * (n + 1)
+      left, firstY = 6 * 8, (topTile + 2) * 8
+    end
+    if ux < left or ux >= 160 then return false end
+    local row = ControlsFree.hitSpacedRows(uy, firstY, 16, n)
+    if not row then return false end
+    menu.index = row
+    return ControlsFree.directUIConfirm(game, top, "gen2_party_submenu", "party_action", row,
+      confirmationMode)
+  end
+  local total
+  if type(top.count) == "function" then
+    local ok, n = pcall(top.count, top)
+    if ok then total = tonumber(n) end
+  end
+  total = total or #(top.party or {})
+  if total < 1 then return false end
+  -- Each Gold party member owns TWO tile rows: nickname/gender, then level/HP.
+  -- The icon begins slightly above the first text line, so give only row 1 an
+  -- 8px leading pad without moving any later row boundary.
+  local row = ControlsFree.hitBlockRows(uy, 8, 16, total, 8)
+  if not row then return false end
+  top.index = row
+  return ControlsFree.directUIConfirm(game, top, "gen2_party", "pokemon", row, confirmationMode)
+end
+
+function ControlsFree.directGen2PackTap(game, top, x, y, confirmationMode)
+  local ux, uy = ControlsFree.goldFrameWindowToUI(game, x, y)
+  if not ux then return false end
+
+  if type(top.confirm) == "table" then
+    if ux < 14 * 8 or ux >= 160 then return false end
+    local index = math.abs(uy - 8 * 8) <= 8 and 1
+      or (math.abs(uy - 10 * 8) <= 8 and 2 or nil)
+    if not index then return false end
+    top.confirm.choice = index
+    return ControlsFree.directUIConfirm(game, top, "gen2_pack_yesno", "yesno", index,
+      confirmationMode)
+  end
+
+  local menu = top.submenu
+  if type(menu) == "table" and type(menu.rows) == "table" then
+    local n = #menu.rows
+    local bottom = n >= 5 and 12 or 11
+    local topTile = bottom - n * 2
+    if ux < 0 or ux >= 7 * 8 then return false end
+    local row = ControlsFree.hitSpacedRows(uy, (topTile + 1) * 8, 16, n)
+    if not row then return false end
+    menu.index = row
+    return ControlsFree.directUIConfirm(game, top, "gen2_pack_submenu", "item_action", row,
+      confirmationMode)
+  end
+
+  -- Quantity pickers need left/right arithmetic rather than row selection and
+  -- remain swipe-controlled for now; a tap on their number must not accidentally
+  -- A-confirm a value the player did not intend.
+  if top.qtyState or top.message then return false end
+
+  if ux < 7 * 8 or ux >= 160 then return false end
+  -- PACK rows are two tile lines: item name, then quantity/TM move.  The whole
+  -- 16px block belongs to that item; y=24 is still row 1, not row 2.
+  local row = ControlsFree.hitBlockRows(uy, 2 * 8, 16, 5)
+  if not row then return false end
+  local index = (tonumber(top.scroll) or 0) + row
+  local total = #(top.rows or {}) + 1
+  if index < 1 or index > total then return false end
+  top.index = index
+  return ControlsFree.directUIConfirm(game, top, "gen2_pack", "item", index, confirmationMode)
+end
+
+function ControlsFree.directGen1OptionsTap(game, top, x, y, confirmationMode)
+  local ux, uy = ControlsFree.battleWindowToUI(game, x, y)
+  if not ux then return false end
+  local rows = top.rows or {}
+  local index
+  if uy >= 128 and uy < 144 then
+    index = #rows + 1 -- fixed CANCEL line
+  elseif uy >= 0 and uy < 128 then
+    local slot = math.floor(uy / 32) + 1
+    if slot >= 1 and slot <= 4 then
+      index = (tonumber(top.scroll) or 0) + slot
+      if index > #rows then index = nil end
+    end
+  end
+  if not index then return false end
+  top.index = index
+  return ControlsFree.directUIConfirm(game, top, "options1", "option", index, confirmationMode)
+end
+
+function ControlsFree.directGen2OptionsTap(game, top, x, y, confirmationMode)
+  local ux, uy = ControlsFree.goldFrameWindowToUI(game, x, y)
+  if not ux then return false end
+  local rows = top.rows or {}
+  -- Gold OPTION rows are label + value, two tile lines per setting.  Hit the
+  -- complete 16px block from label line through value line.
+  local row = ControlsFree.hitBlockRows(uy, 2 * 8, 16, math.min(7, #rows))
+  if not row then return false end
+  local index = (tonumber(top.scroll) or 0) + row
+  if index < 1 or index > #rows then return false end
+  top.index = index
+  return ControlsFree.directUIConfirm(game, top, "options2", "option", index, confirmationMode)
+end
+
+function ControlsFree.directManagerOptionsTap(game, top, x, y, confirmationMode)
+  if top.screen ~= "options" or top.overlay then return false end
+  local ux, uy = ControlsFree.battleWindowToUI(game, x, y)
+  if not ux then return false end
+  local rows = top.optionRows or {}
+  if #rows < 1 or uy < 0 or uy >= 128 then return false end
+  local slot = math.floor(uy / 32) + 1
+  if slot < 1 or slot > 4 then return false end
+  local index = (tonumber(top.scroll) or 0) + slot
+  if index < 1 or index > #rows then return false end
+  top.cursor = index
+  return ControlsFree.directUIConfirm(game, top, "manager_options", "mod_option", index,
+    confirmationMode)
+end
+
+function ControlsFree.directGen2StartTap(game, top, x, y, confirmationMode)
+  local ux, uy = ControlsFree.goldFrameWindowToUI(game, x, y)
+  if not ux then return false end
+  if top.phase == "confirm" then
+    if ux < 0 or ux >= 6 * 8 then return false end
+    local index = math.abs(uy - 8 * 8) <= 8 and 1
+      or (math.abs(uy - 10 * 8) <= 8 and 2 or nil)
+    if not index then return false end
+    top.confirmChoice = index
+    return ControlsFree.directUIConfirm(game, top, "gen2_start_yesno", "yesno", index,
+      confirmationMode)
+  end
+  local list = top.list
+  if type(list) ~= "table" or type(list.items) ~= "table" then return false end
+  if ux < 10 * 8 or ux >= 160 then return false end
+  local visible = math.min(tonumber(list.rows) or #list.items, #list.items)
+  local row = ControlsFree.hitSpacedRows(uy, 2 * 8, 16, visible)
+  if not row then return false end
+  local index = (tonumber(list.scroll) or 0) + row
+  if index < 1 or index > #list.items then return false end
+  list.index = index
+  return ControlsFree.directUIConfirm(game, top, "gen2_start", "start_item", index,
+    confirmationMode)
+end
+
+function ControlsFree.directListMenuTap(game, top, x, y, confirmationMode)
+  local ux, uy = ControlsFree.battleWindowToUI(game, x, y)
+  if not ux then return false end
+  local items = top.items or {}
+  local visible = math.min(tonumber(top.rows) or 7, #items)
+  local row = ControlsFree.hitSpacedRows(uy, 24, 16, visible)
+  if not row then return false end
+  local index = (tonumber(top.scroll) or 0) + row
+  if index < 1 or index > #items then return false end
+  top.index = index
+  return ControlsFree.directUIConfirm(game, top, "list", "list_item", index, confirmationMode)
+end
+
+function ControlsFree.directMenuTap(game, top, x, y, confirmationMode)
+  local items = top.items or {}
+  if #items < 1 then return false end
+  local tx, ty, tw, th = tonumber(top.tx), tonumber(top.ty), tonumber(top.tw), tonumber(top.th)
+  if not (tx and ty and tw and th) then return false end
+  local ux, uy = ControlsFree.anchoredWindowToUI(
+    game, x, y, { tx * 8, ty * 8, tw * 8, th * 8 }, top.anchor)
+  if not ux then return false end
+  if ux < tx * 8 or ux >= (tx + tw) * 8 then return false end
+  local visible = math.min(tonumber(top.maxVisible) or #items, #items)
+  local scroll = tonumber(top.scroll) or 0
+  local step = math.max(1, tonumber(top.rowStep) or 2)
+  local hit
+  for row = 1, visible do
+    local cy = (ty + th - 2 - (visible - row) * step) * 8
+    if math.abs(uy - cy) <= step * 4 then hit = row break end
+  end
+  if not hit then return false end
+  local index = scroll + hit
+  if index < 1 or index > #items then return false end
+  top.index = index
+  return ControlsFree.directUIConfirm(game, top, "menu", "menu_item", index, confirmationMode)
+end
+
+-- Exact row selection for the common native UI families.  It deliberately
+-- declines unknown/specialized screens instead of guessing; the legacy tap=A
+-- fallback remains available when Directional Swipes is enabled.  Because
+-- Menu/ListMenu are the engine's reusable widgets, this already covers Bag,
+-- shops, PC/list flows and mod-created screens which use the public widget kit.
+function ControlsFree.directUITap(game, x, y, confirmationMode)
+  local top = ControlsFree.topUIState(game)
+  if type(top) ~= "table" or ControlsFree.stateIsBattle(top) then
+    ControlsFree.clearTouchConfirmation()
+    return false
+  end
+
+  local handled, kind, index, confirmed
+  if top.screenId == "ManagerState" and top.screen == "options" then
+    handled, kind, index, confirmed = ControlsFree.directManagerOptionsTap(
+      game, top, x, y, confirmationMode)
+  elseif WorldBackend.isGold(game) and ControlsFree.uiInstance(top, "start2") then
+    handled, kind, index, confirmed = ControlsFree.directGen2StartTap(
+      game, top, x, y, confirmationMode)
+  elseif WorldBackend.isGold(game) and ControlsFree.uiInstance(top, "party2") then
+    handled, kind, index, confirmed = ControlsFree.directGen2PartyTap(
+      game, top, x, y, confirmationMode)
+  elseif WorldBackend.isGold(game) and ControlsFree.uiInstance(top, "pack2") then
+    handled, kind, index, confirmed = ControlsFree.directGen2PackTap(
+      game, top, x, y, confirmationMode)
+  elseif WorldBackend.isGold(game) and ControlsFree.uiInstance(top, "options2") then
+    handled, kind, index, confirmed = ControlsFree.directGen2OptionsTap(
+      game, top, x, y, confirmationMode)
+  elseif ControlsFree.uiInstance(top, "choice") then
+    handled, kind, index, confirmed = ControlsFree.directChoiceBoxTap(
+      game, top, x, y, confirmationMode)
+  elseif ControlsFree.uiInstance(top, "party1") then
+    handled, kind, index, confirmed = ControlsFree.directGen1PartyTap(
+      game, top, x, y, confirmationMode)
+  elseif ControlsFree.uiInstance(top, "options1") then
+    handled, kind, index, confirmed = ControlsFree.directGen1OptionsTap(
+      game, top, x, y, confirmationMode)
+  elseif ControlsFree.uiInstance(top, "list") then
+    handled, kind, index, confirmed = ControlsFree.directListMenuTap(
+      game, top, x, y, confirmationMode)
+  elseif ControlsFree.uiInstance(top, "menu") then
+    handled, kind, index, confirmed = ControlsFree.directMenuTap(
+      game, top, x, y, confirmationMode)
+  end
+
+  if handled then
+    state.stats.menuDirectTaps = (state.stats.menuDirectTaps or 0) + 1
+    return true, kind, index, confirmed
+  end
+  ControlsFree.clearTouchConfirmation()
+  state.stats.menuDirectMisses = (state.stats.menuDirectMisses or 0) + 1
+  return false
 end
 
 local function voxelCanvasToWindow(voxel3d, p)
@@ -9968,24 +10604,56 @@ function ControlsFree.finishDialogTouch(game, id, x, y, cancelled)
     t.swipeDirection = dialogSwipeDirection(dx, dy)
   end
   if t.swipeDirection then
-    local btn = t.swipeDirection
-    mod.input:tap(game, btn)
-    state.stats.dialogSwipes = (state.stats.dialogSwipes or 0) + 1
-    local statKey = "dialogSwipe" .. btn:sub(1, 1):upper() .. btn:sub(2)
-    state.stats[statKey] = (state.stats[statKey] or 0) + 1
+    -- A directional gesture changes the user's intent, so a previously
+    -- highlighted TWO CLICKS target may never survive it.
+    ControlsFree.clearTouchConfirmation()
+    if ControlsFree.directionalSwipesEnabled() then
+      local btn = t.swipeDirection
+      mod.input:tap(game, btn)
+      state.stats.dialogSwipes = (state.stats.dialogSwipes or 0) + 1
+      local statKey = "dialogSwipe" .. btn:sub(1, 1):upper() .. btn:sub(2)
+      state.stats[statKey] = (state.stats[statKey] or 0) + 1
+    end
     return true
   end
 
+  -- UI Touch Controls owns exact visible rows. Like battle direct touch, it
+  -- only moves the native cursor/index and lets Touch Confirmations decide
+  -- when the ordinary A path is emitted. Unknown/special screens deliberately
+  -- fall through rather than guessing a target.
+  if ControlsFree.uiTouchControlsOptionEnabled() then
+    local handled, _, _, confirmed = ControlsFree.directUITap(
+      game, t.startX, t.startY, ControlsFree.touchConfirmationMode())
+    if handled then
+      if confirmed then
+        state.stats.dialogATaps = (state.stats.dialogATaps or 0) + 1
+      end
+      return true
+    end
+  else
+    ControlsFree.clearTouchConfirmation()
+  end
+
+  -- Preserve the useful START-menu outside-tap = B behavior even if the user
+  -- turns Directional Swipes off but leaves UI Touch Controls on.
   local insideStartMenu = ControlsFree.startMenuTapInside(game, t.startX, t.startY)
   if insideStartMenu == false then
+    ControlsFree.clearTouchConfirmation()
     mod.input:tap(game, "b")
     state.stats.startMenuOutsideBTaps = (state.stats.startMenuOutsideBTaps or 0) + 1
     return true
   end
-  mod.input:tap(game, "a")
-  state.stats.dialogATaps = (state.stats.dialogATaps or 0) + 1
-  if insideStartMenu == true then
-    state.stats.startMenuInsideATaps = (state.stats.startMenuInsideATaps or 0) + 1
+
+  -- Legacy generic tap=A belongs to Directional Swipes. With only direct menu
+  -- touch enabled, a miss is consumed silently so tapping blank space cannot
+  -- accidentally activate whatever row happened to be highlighted before.
+  if ControlsFree.directionalSwipesEnabled() then
+    ControlsFree.clearTouchConfirmation()
+    mod.input:tap(game, "a")
+    state.stats.dialogATaps = (state.stats.dialogATaps or 0) + 1
+    if insideStartMenu == true then
+      state.stats.startMenuInsideATaps = (state.stats.startMenuInsideATaps or 0) + 1
+    end
   end
   return true
 end
@@ -10055,7 +10723,7 @@ function ControlsFree.finishBattleTouch(game, id, x, y, cancelled)
     return true
   end
 
-  -- Battle Touch Controls owns exact visible commands/moves. With TWO CLICKS,
+  -- UI Touch Controls owns exact visible battle commands/moves. With TWO CLICKS,
   -- the first tap only highlights the target by moving the native cursor; the
   -- same target must be tapped again before A is emitted.
   if ControlsFree.battleTouchControlsEnabled(game) then
@@ -10067,13 +10735,29 @@ function ControlsFree.finishBattleTouch(game, id, x, y, cancelled)
       end
       return true
     end
+  end
+
+  -- Party / Bag / ChoiceBox screens pushed over an active battle are not the
+  -- BattleState itself, but the battle bridge owns their physical contact so
+  -- the 3D scene cannot see it too. Route those overlays through the same
+  -- ordinary direct-UI layer before considering the legacy blind-A fallback.
+  if ControlsFree.uiTouchControlsInBattleEnabled(game) then
+    local handled, _, _, confirmed = ControlsFree.directUITap(
+      game, t.startX, t.startY, ControlsFree.touchConfirmationMode())
+    if handled then
+      if confirmed then
+        state.stats.battleATaps = (state.stats.battleATaps or 0) + 1
+      end
+      return true
+    end
   else
-    ControlsFree.clearBattleTouchConfirmation()
+    ControlsFree.clearTouchConfirmation()
   end
 
   -- Preserve the legacy generic battle tap=A fallback under Directional Swipes
-  -- for message/choice/overlay phases which have no direct battle hit target.
+  -- for message/unsupported-overlay phases which have no direct hit target.
   if ControlsFree.battleDirectionalSwipesEnabled(game) then
+    ControlsFree.clearTouchConfirmation()
     mod.input:tap(game, "a")
     state.stats.battleATaps = (state.stats.battleATaps or 0) + 1
   end
@@ -10089,7 +10773,9 @@ function ControlsFree.fireHoldBForTouches(game, touches, active, statKey)
       if not active(game) or state.twoFingerGesture then
         t.holdBCancelled = true
       elseif state.tick - (t.startedTick or state.tick) + 1 >= ControlsFree.TOUCH_HOLD_B_TICKS then
-        if touches == state.battleTouches then ControlsFree.clearBattleTouchConfirmation() end
+        -- A hold-B is an explicit different action; it always invalidates a
+        -- pending two-click selection in either ordinary UI or battle UI.
+        ControlsFree.clearTouchConfirmation()
         mod.input:tap(game, "b")
         t.bFired = true
         state.stats[statKey] = (state.stats[statKey] or 0) + 1
@@ -10102,7 +10788,7 @@ function ControlsFree.holdBTouchTick(game)
   ControlsFree.fireHoldBForTouches(game, state.dialogTouches,
     ControlsFree.dialogTouchFeatureEnabled, "dialogBHoldTriggers")
   ControlsFree.fireHoldBForTouches(game, state.battleTouches,
-    ControlsFree.battleDirectionalSwipesEnabled, "battleBHoldTriggers")
+    ControlsFree.battleTouchFeatureEnabled, "battleBHoldTriggers")
 end
 
 function ControlsFree.beginPlayerHoldTouch(game, id, x, y)
@@ -11007,7 +11693,7 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
     local stack = game and game.stack
     local top = stack and type(stack.top) == "function" and stack:top() or nil
     if top and top ~= game.overworld then
-      if option("battle_touch_controls", true) == true and ControlsFree.battleActive(game) then
+      if ControlsFree.uiTouchControlsOptionEnabled() and ControlsFree.battleActive(game) then
         local handled, _, _, confirmed = ControlsFree.directBattleTap(
           game, ev.x, ev.y, ControlsFree.touchConfirmationMode())
         if handled then
@@ -11018,9 +11704,22 @@ mod.hooks:wrap("input.pointer", function(nextFn, game, ev)
           end
           return true
         end
-      else
-        ControlsFree.clearBattleTouchConfirmation()
       end
+      if ControlsFree.uiTouchControlsOptionEnabled() then
+        local handled, _, _, confirmed = ControlsFree.directUITap(
+          game, ev.x, ev.y, ControlsFree.touchConfirmationMode())
+        if handled then
+          if confirmed then
+            state.stats.desktopATaps = (state.stats.desktopATaps or 0) + 1
+            state.stats.desktopMenuDirectTaps =
+              (state.stats.desktopMenuDirectTaps or 0) + 1
+          end
+          return true
+        end
+      end
+      -- Keep the historical LMB=A behavior for UI types that do not yet have
+      -- a safe direct adapter. Clear any first-click selection before doing so.
+      ControlsFree.clearTouchConfirmation()
       mod.input:tap(game, "a")
       state.stats.desktopATaps = (state.stats.desktopATaps or 0) + 1
       return true
@@ -11735,7 +12434,7 @@ mod.events:on("save.loading", function()
   state.rawZoomTouches = {}
   state.dialogTouches = {}
   state.battleTouches = {}
-  state.battleTouchPendingConfirm = nil
+  state.touchPendingConfirm = nil
   state.battleCameraOwnedTouches = {}
   state.playerHoldTouches = {}
   state.systemEdgeTouches = {}
@@ -12325,23 +13024,28 @@ local function diagnostics()
     nativeControlsVisible = ControlsFree.nativeControlsVisible(state.game),
     controlsFree = {
       directionalSwipes = ControlsFree.directionalSwipesEnabled(),
-      battleTouchControls = option("battle_touch_controls", true) == true,
+      uiTouchControls = ControlsFree.uiTouchControlsOptionEnabled(),
+      -- Deprecated diagnostic aliases retained for companion tools that still
+      -- read the v2.3.2 keys; both now reflect the single UI Touch Controls.
+      battleTouchControls = ControlsFree.uiTouchControlsOptionEnabled(),
+      menuTouchControls = ControlsFree.uiTouchControlsOptionEnabled(),
       touchConfirmations = ControlsFree.touchConfirmationMode(),
       startSelectTouchControl = startSelectTouchMode(),
-      dialogue = ControlsFree.directionalSwipesEnabled(),
+      dialogue = ControlsFree.directionalSwipesEnabled()
+        or ControlsFree.uiTouchControlsOptionEnabled(),
       dialogueSwipe = ControlsFree.directionalSwipesEnabled(),
-      battle = option("battle_touch_controls", true) == true,
+      battle = ControlsFree.uiTouchControlsOptionEnabled(),
       battleSwipe = ControlsFree.directionalSwipesEnabled(),
-      battleCameraTouchSuppression = option("battle_touch_controls", true) == true
+      battleCameraTouchSuppression = ControlsFree.uiTouchControlsOptionEnabled()
         or ControlsFree.directionalSwipesEnabled(),
       holdPlayerStart = startSelectTouchMode() == "hold_player_sprite",
       pinchSpreadStartSelect = startSelectTouchMode() == "pinch_or_spread",
       pinchFirstTouchGraceTicks = ControlsFree.PINCH_FIRST_TOUCH_GRACE_TICKS,
-      mouseWalk = option("mouse", false) == true,
-      desktopMouseAB = option("desktop_mouse_ab", false) == true,
-      mouseWheelControl = tostring(option("mouse_wheel_control", "off") or "off"),
-      mouseWheelTilt = tostring(option("mouse_wheel_tilt", "off") or "off"),
-      mouseSideButtons = tostring(option("mouse_side_buttons", "off") or "off"),
+      mouseWalk = option("mouse", true) == true,
+      desktopMouseAB = option("desktop_mouse_ab", true) == true,
+      mouseWheelControl = tostring(option("mouse_wheel_control", "on") or "on"),
+      mouseWheelTilt = tostring(option("mouse_wheel_tilt", "on") or "on"),
+      mouseSideButtons = tostring(option("mouse_side_buttons", "on") or "on"),
     },
     stats = copyFlat(state.stats),
     lastStop = state.lastStop and copyFlat(state.lastStop) or nil,
